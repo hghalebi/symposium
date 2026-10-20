@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::env;
+use std::io::Write;
 use std::process::ExitCode;
 
 use symposium::cli::{Cli, Commands, PluginCommand};
@@ -15,14 +16,6 @@ use symposium::subcommand_dispatch::dispatch_external;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let mut sym = match config::Symposium::try_from_environment() {
-        Ok(sym) => sym,
-        Err(error) => {
-            eprintln!("cargo agents: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-
     // When invoked as `cargo agents`, cargo passes "agents" as the first arg.
     // Strip it so clap sees the real arguments.
     let args: Vec<_> = std::env::args_os().collect();
@@ -34,14 +27,6 @@ async fn main() -> ExitCode {
         args
     };
 
-    let cwd = match env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(error) => {
-            eprintln!("cargo agents: failed to get current directory: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-
     // Parse without exiting on error: a help request on a built-in with required args
     // (`crate-info --help`, `plugin --help`) surfaces a parse error that `help_text` recovers.
     // `args_str` feeds the subcommand-name walk.
@@ -50,6 +35,22 @@ async fn main() -> ExitCode {
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     let parse = Cli::try_parse_from(filtered);
+
+    // Parse the hook identity before fallible startup so permission failures can deny natively.
+    let startup_hook = parse.as_ref().ok().and_then(|cli| match &cli.command {
+        Some(Commands::Hook { agent, event }) => Some((*agent, *event)),
+        _ => None,
+    });
+    let mut sym = match config::Symposium::try_from_environment() {
+        Ok(sym) => sym,
+        Err(error) => return startup_failure(startup_hook, &error),
+    };
+    let cwd = match env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(source) => {
+            return startup_failure(startup_hook, &hook::HookError::CurrentDirectory { source });
+        }
+    };
 
     // `--help` / `-h` / `help` / no subcommand -> audience-grouped top-level help (or clap's
     // per-command help for `<built-in> --help`).
@@ -86,8 +87,7 @@ async fn main() -> ExitCode {
     // the log file; `-v` prints them to stderr when debugging a hook by hand.
     let report_layer = (!is_hook || cli.verbose).then_some(report_layer);
     if let Err(error) = sym.try_init_logging(report_layer) {
-        eprintln!("cargo agents: {error}");
-        return ExitCode::FAILURE;
+        return startup_failure(startup_hook, &error);
     }
 
     // Log the command being invoked
@@ -210,6 +210,22 @@ async fn main() -> ExitCode {
             }
         },
     }
+}
+
+fn startup_failure(
+    request: Option<(hook::HookAgent, hook::HookEvent)>,
+    error: &impl std::fmt::Display,
+) -> ExitCode {
+    // Deliver the protocol decision before best-effort diagnostics; stderr can be closed.
+    let code = match request {
+        Some((agent, event)) => hook::respond_to_failure(agent, event),
+        None => ExitCode::FAILURE,
+    };
+    if let Err(source) = std::io::stderr().write_all(format!("cargo agents: {error}\n").as_bytes())
+    {
+        tracing::warn!(error_kind = ?source.kind(), "failed to write startup diagnostic");
+    }
+    code
 }
 
 async fn handle_plugin_command(sym: &config::Symposium, command: PluginCommand) -> ExitCode {

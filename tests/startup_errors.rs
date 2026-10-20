@@ -7,8 +7,12 @@ use symposium::config::{LoggingError, Symposium};
 
 #[cfg(unix)]
 fn assert_startup_failure(output: std::process::Output, expected: &str) {
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty(), "hook stdout must remain empty");
+    assert!(
+        output.status.success(),
+        "Claude reads its native JSON denial"
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["hookSpecificOutput"]["permissionDecision"], "deny");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(expected), "stderr: {stderr}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr}");

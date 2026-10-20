@@ -20,11 +20,46 @@ impl Agent for Codex {
 }
 
 macro_rules! codex_event {
-    ($event:ident, $input:ident, $output:ident) => {
+    ($event:ident, $input:ident, $output:ident, $variant:ident) => {
         pub struct $event;
         impl AgentHookEvent for $event {
             type Input = $input;
             type Output = $output;
+
+            fn try_parse_input(
+                &self,
+                payload: &str,
+            ) -> Result<Self::Input, super::HookSchemaError> {
+                Self::Input::try_parse_input(payload)
+            }
+            fn try_parse_output(
+                &self,
+                output: &[u8],
+            ) -> Result<Self::Output, super::HookSchemaError> {
+                Self::Output::try_parse_output(output)
+            }
+            fn try_translate_input(
+                &self,
+                input: &symposium::InputEvent,
+            ) -> Result<Self::Input, super::HookSchemaError> {
+                super::validate_input_event(input, super::HookEvent::$variant)?;
+                Ok(Self::Input::from_symposium(input))
+            }
+            fn try_translate_output(
+                &self,
+                output: &symposium::OutputEvent,
+            ) -> Result<Self::Output, super::HookSchemaError> {
+                super::validate_output_event(output, super::HookEvent::$variant)?;
+                Ok(Self::Output::from_symposium(output))
+            }
+            fn try_respond(
+                &self,
+                output: &serde_json::Value,
+            ) -> Result<super::HookResponse, super::HookSchemaError> {
+                serde_json::to_vec(output)
+                    .map(super::HookResponse::success)
+                    .map_err(super::HookSchemaError::OutputSerialization)
+            }
         }
     };
 }
@@ -32,32 +67,38 @@ macro_rules! codex_event {
 codex_event!(
     CodexPreToolUseEvent,
     CodexPreToolUseInput,
-    CodexPreToolUseOutput
+    CodexPreToolUseOutput,
+    PreToolUse
 );
 codex_event!(
     CodexPostToolUseEvent,
     CodexPostToolUseInput,
-    CodexPostToolUseOutput
+    CodexPostToolUseOutput,
+    PostToolUse
 );
 codex_event!(
     CodexUserPromptSubmitEvent,
     CodexUserPromptSubmitInput,
-    CodexUserPromptSubmitOutput
+    CodexUserPromptSubmitOutput,
+    UserPromptSubmit
 );
 codex_event!(
     CodexSessionStartEvent,
     CodexSessionStartInput,
-    CodexSessionStartOutput
+    CodexSessionStartOutput,
+    SessionStart
 );
 
 fn codex_hook_output_from_symposium(
     event_name: &str,
     event: &symposium::OutputEvent,
-) -> Option<serde_json::Value> {
-    let ctx = event.additional_context()?;
-    Some(
-        serde_json::json!({ "hookSpecificOutput": { "hookEventName": event_name, "additionalContext": ctx } }),
-    )
+) -> Option<CodexHookSpecificOutput> {
+    let context = event.additional_context()?;
+    Some(CodexHookSpecificOutput {
+        hook_event_name: event_name.into(),
+        additional_context: Some(context.into()),
+        ..CodexHookSpecificOutput::default()
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -127,6 +168,19 @@ pub struct CodexPreToolUseOutput {
 }
 
 impl AgentHookInput for CodexPreToolUseInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        let input: Self =
+            serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)?;
+        super::validate_native_event(
+            &input.hook_event_name,
+            super::HookEvent::PreToolUse,
+            "PreToolUse",
+        )?;
+        Ok(input)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -163,6 +217,36 @@ impl AgentHookInput for CodexPreToolUseInput {
 }
 
 impl AgentHookOutput for CodexPreToolUseOutput {
+    fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+        serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+    }
+    fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+        if output.is_empty() {
+            return Ok(Self::default());
+        }
+        let parsed: Self =
+            serde_json::from_slice(output).map_err(super::HookSchemaError::OutputParse)?;
+        super::validate_decision(
+            parsed.decision.as_deref(),
+            &["allow", "block", "deny"],
+            "decision",
+        )?;
+        if let Some(hook) = &parsed.hook_specific_output {
+            if !hook.hook_event_name.is_empty() {
+                super::validate_native_event(
+                    &hook.hook_event_name,
+                    super::HookEvent::PreToolUse,
+                    "PreToolUse",
+                )?;
+            }
+            super::validate_decision(
+                hook.permission_decision.as_deref(),
+                &["allow", "deny"],
+                "hookSpecificOutput.permissionDecision",
+            )?;
+        }
+        Ok(parsed)
+    }
     fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
         if output.is_empty() {
             return Ok(Self::default());
@@ -183,7 +267,10 @@ impl AgentHookOutput for CodexPreToolUseOutput {
         }
         if !matches!(o.decision, symposium_sdk::hook::Decision::Deny) {
             return codex_hook_output_from_symposium("PreToolUse", event)
-                .map(|v| serde_json::from_value(v).unwrap())
+                .map(|hook_specific_output| Self {
+                    hook_specific_output: Some(hook_specific_output),
+                    ..Self::default()
+                })
                 .unwrap_or_default();
         }
         Self {
@@ -264,6 +351,19 @@ pub struct CodexPostToolUseOutput {
 }
 
 impl AgentHookInput for CodexPostToolUseInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        let input: Self =
+            serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)?;
+        super::validate_native_event(
+            &input.hook_event_name,
+            super::HookEvent::PostToolUse,
+            "PostToolUse",
+        )?;
+        Ok(input)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -302,6 +402,26 @@ impl AgentHookInput for CodexPostToolUseInput {
 }
 
 impl AgentHookOutput for CodexPostToolUseOutput {
+    fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+        serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+    }
+    fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+        if output.is_empty() {
+            return Ok(Self::default());
+        }
+        let parsed: Self =
+            serde_json::from_slice(output).map_err(super::HookSchemaError::OutputParse)?;
+        if let Some(hook) = &parsed.hook_specific_output
+            && !hook.hook_event_name.is_empty()
+        {
+            super::validate_native_event(
+                &hook.hook_event_name,
+                super::HookEvent::PostToolUse,
+                "PostToolUse",
+            )?;
+        }
+        Ok(parsed)
+    }
     fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
         if output.is_empty() {
             return Ok(Self::default());
@@ -310,7 +430,10 @@ impl AgentHookOutput for CodexPostToolUseOutput {
     }
     fn from_symposium(event: &symposium::OutputEvent) -> Self {
         codex_hook_output_from_symposium("PostToolUse", event)
-            .map(|v| serde_json::from_value(v).unwrap())
+            .map(|hook_specific_output| Self {
+                hook_specific_output: Some(hook_specific_output),
+                ..Self::default()
+            })
             .unwrap_or_default()
     }
     fn to_symposium(&self) -> symposium::OutputEvent {
@@ -358,6 +481,19 @@ pub struct CodexUserPromptSubmitOutput {
 }
 
 impl AgentHookInput for CodexUserPromptSubmitInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        let input: Self =
+            serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)?;
+        super::validate_native_event(
+            &input.hook_event_name,
+            super::HookEvent::UserPromptSubmit,
+            "UserPromptSubmit",
+        )?;
+        Ok(input)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -391,6 +527,26 @@ impl AgentHookInput for CodexUserPromptSubmitInput {
 }
 
 impl AgentHookOutput for CodexUserPromptSubmitOutput {
+    fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+        serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+    }
+    fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+        if output.is_empty() {
+            return Ok(Self::default());
+        }
+        let parsed: Self =
+            serde_json::from_slice(output).map_err(super::HookSchemaError::OutputParse)?;
+        if let Some(hook) = &parsed.hook_specific_output
+            && !hook.hook_event_name.is_empty()
+        {
+            super::validate_native_event(
+                &hook.hook_event_name,
+                super::HookEvent::UserPromptSubmit,
+                "UserPromptSubmit",
+            )?;
+        }
+        Ok(parsed)
+    }
     fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
         if output.is_empty() {
             return Ok(Self::default());
@@ -399,7 +555,10 @@ impl AgentHookOutput for CodexUserPromptSubmitOutput {
     }
     fn from_symposium(event: &symposium::OutputEvent) -> Self {
         codex_hook_output_from_symposium("UserPromptSubmit", event)
-            .map(|v| serde_json::from_value(v).unwrap())
+            .map(|hook_specific_output| Self {
+                hook_specific_output: Some(hook_specific_output),
+                ..Self::default()
+            })
             .unwrap_or_default()
     }
     fn to_symposium(&self) -> symposium::OutputEvent {
@@ -443,6 +602,19 @@ pub struct CodexSessionStartOutput {
 }
 
 impl AgentHookInput for CodexSessionStartInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        let input: Self =
+            serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)?;
+        super::validate_native_event(
+            &input.hook_event_name,
+            super::HookEvent::SessionStart,
+            "SessionStart",
+        )?;
+        Ok(input)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -473,6 +645,26 @@ impl AgentHookInput for CodexSessionStartInput {
 }
 
 impl AgentHookOutput for CodexSessionStartOutput {
+    fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+        serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+    }
+    fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+        if output.is_empty() {
+            return Ok(Self::default());
+        }
+        let parsed: Self =
+            serde_json::from_slice(output).map_err(super::HookSchemaError::OutputParse)?;
+        if let Some(hook) = &parsed.hook_specific_output
+            && !hook.hook_event_name.is_empty()
+        {
+            super::validate_native_event(
+                &hook.hook_event_name,
+                super::HookEvent::SessionStart,
+                "SessionStart",
+            )?;
+        }
+        Ok(parsed)
+    }
     fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
         if output.is_empty() {
             return Ok(Self::default());
@@ -481,7 +673,10 @@ impl AgentHookOutput for CodexSessionStartOutput {
     }
     fn from_symposium(event: &symposium::OutputEvent) -> Self {
         codex_hook_output_from_symposium("SessionStart", event)
-            .map(|v| serde_json::from_value(v).unwrap())
+            .map(|hook_specific_output| Self {
+                hook_specific_output: Some(hook_specific_output),
+                ..Self::default()
+            })
             .unwrap_or_default()
     }
     fn to_symposium(&self) -> symposium::OutputEvent {

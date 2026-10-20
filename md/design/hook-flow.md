@@ -4,7 +4,14 @@ Entry point invoked by the agent's hook system on session events.
 
 ## Flow
 
-The payload is parsed first, and the agent's parser can declare it not an occurrence of the symposium event (`AgentHookInput::should_dispatch`; false for an Antigravity `PreInvocation` after the first of a turn). Such a payload is answered with the agent's neutral output and skips every step below.
+The CLI parses the hook identity before fallible environment, working-directory,
+and logging initialization. A recognized supported `PreToolUse` that cannot
+initialize returns the same host-native denial as an execution failure; it does
+not rely on exit status alone. Other startup failures retain failure status and
+clean stdout. Diagnostics are written after the protocol decision and cannot
+panic merely because stderr is closed.
+
+The payload is then parsed, and the agent's parser can declare it not an occurrence of the symposium event (`AgentHookInput::should_dispatch`; false for an Antigravity `PreInvocation` after the first of a turn). Such a payload is answered with the agent's neutral output and skips every step below.
 
 1. **Auto-sync** (if enabled) — when `auto-sync = true` in the user config, runs [`cargo agents sync`](./sync-agent-flow.md) to ensure skills are current. The workspace root is resolved from the payload's `cwd` field; if the payload does not include a working directory, the process's current working directory is used as a fallback. Runs quietly and non-fatally — failures are logged but don't block hook dispatch.
 
@@ -29,13 +36,50 @@ The payload is parsed first, and the agent's parser can declare it not an occurr
        - Run the installation's `install_commands` (post-source) before invoking the runnable.
        - Spawn `path args…` directly for `Exec`, or `sh path args…` for `Script`.
      - Pass the event JSON (in the selected format) on stdin to the plugin's hook.
-     - Collect output from each handler.
-     - Convert output back to the agent's wire format.
+       Input writing and stdout/stderr collection run concurrently: a plugin may
+       produce more than a pipe buffer before reading its input. Close the input
+       handle after writing and collect every spawned child even if writing fails.
+     - Collect output from each handler. An explicit exit 2 or signal/no exit code
+       is a block, taking precedence over a simultaneous stdin write failure.
+       Without that block, incomplete input or failed process collection is a
+       typed transport failure, not an empty contribution.
+     - Convert output back to the agent's wire format. A recognized canonical
+       event envelope must parse and match the selected event; malformed envelopes
+       never fall back to the native parser. Legacy untagged host JSON remains
+       accepted through the native parser, with unknown fields preserved and its
+       canonical denial checked before later hooks run. Kiro's native output is
+       plain text, so untagged JSON there is parsed as text context rather than
+       trusted as an internal decision object.
      - Merge results (e.g., allow/block decisions, output text) across all handlers. `merge` lets a later value replace an earlier one, so on `SessionStart`, `UserPromptSubmit` and `PostToolUse` a `JoinedContext` keeps every source's context (the builtin fragments first, then each hook) and writes the joined text back after each merge. `PreToolUse` and `Stop` are left out: there some agents keep context in the field that holds the decision.
      - Return the merged result to the agent.
    - **A hook that exits 2 blocks**: dispatch stops, and `blocked_response` turns its stderr into the reason. On `PreToolUse` that is a canonical deny, translated like any other so each agent receives it in the form it honors (Antigravity ignores exit codes, Copilot drops the reason of a failing hook). On other events the process exits 2 with the reason on stderr.
 
-4. **Respond**: the agent's handler renders the final output as a `HookResponse` (stdout, stderr, exit code). Most agents read everything from stdout; Kiro, whose stdout is plain context, is told to deny a tool through exit 2.
+4. **Respond**: the agent's handler renders the final output as a `HookResponse`
+   (stdout, stderr, exit code). Most agents read everything from stdout; Kiro,
+   whose stdout is plain context, is told to deny a tool through exit 2. Each
+   nonempty response stream is written and flushed; both streams are attempted
+   even if one fails. A delivery error remains typed, and an existing exit 2 is
+   preserved. A failed stdout pipe cannot prove that an agent received a JSON
+   denial, regardless of the process exit status.
+
+## Failure boundaries and compatibility
+
+`try_execute_hook` returns a typed `HookError` whose display is safe for normal
+diagnostics and whose structured sources remain inspectable. It separates an
+explicit plugin block from preparation, parsing, translation and transport
+failures. The CLI renders a fixed native denial on a supported `PreToolUse`
+failure: Claude, Codex, Copilot and Antigravity receive denial JSON with their
+normal success exit; Kiro receives a fixed reason with exit 2. Other event
+failures return failure status. Raw parser or I/O source text never becomes the
+failure reason sent to the model or persistent diagnostics.
+
+The existing `execute_hook` and byte-error `dispatch_plugin_hooks` signatures
+remain root-0.5 compatibility adapters until the root-0.6 transition. Maintained
+runtime and test-library callers use the typed path. Valid native payloads,
+context ordering, final denials and unknown native extension fields retain their
+existing behavior. A plugin's ordinary nonzero exit other than 2 continues to be
+a visible best-effort failure; requirement refresh/acquisition keeps its existing
+separate best-effort policy.
 
 Plugin hooks can respond to agent-specific events (e.g., `pre-tool-use`, `post-tool-use`, `user-prompt-submit` for Claude Code). The available events depend on which agent is in use.
 
@@ -51,14 +95,17 @@ names, prompts, tool arguments/results, plugin output/stderr, or denial reasons.
 Other subsystems retain their own diagnostic contracts; this is not a blanket
 claim about arbitrary identifiers elsewhere in the application.
 
-When `SYMPOSIUM_HOOK_TRACE` names a file, successful dispatch appends one JSONL
-record with this shape:
+When `SYMPOSIUM_HOOK_TRACE` names a file, a prepared response after stdin was
+read appends one metadata JSONL record with this shape:
 
 ```json
 {"event":"PreToolUse","agent":"claude","input":{"byte_len":120},"output":{"byte_len":2},"exit_code":0,"stderr_len":0}
 ```
 
-The numeric lengths describe the actual UTF-8 request and response bytes. The
+The numeric lengths describe the UTF-8 request and prepared response bytes.
+The trace is written before final stream delivery: its `exit_code` and lengths
+are not a receipt proving that bytes reached the agent or the process exited
+with that status. Stream failures are reported separately. The
 `input` and `output` keys remain objects for trace consumers, but contain only
 sizes; raw input/output and the previous raw `stderr` field are not persisted.
 There is no raw-payload tracing option. This trace can verify which events
@@ -84,3 +131,10 @@ underlying TOML parser would display the canary, and verifies that the CLI does
 not print it or rewrite the original file. Windows uses a known-folder API for
 home discovery, so that home-mutating process check is Unix-only; isolated
 adapter tests still cover configuration validation independently.
+
+The runtime regressions cover malformed and wrong-event permission requests,
+legacy native denials followed by a later rewrite, failing and buffering stream
+writers, child input/block precedence, and bounded bidirectional pipe pressure.
+Startup regressions cover configuration/logging failures for all five registered
+hook agents, including a closed diagnostic stream. These tests use synthetic
+input and local child processes; they do not qualify live-agent behavior.

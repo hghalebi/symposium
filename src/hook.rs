@@ -2,10 +2,12 @@ use crate::predicate::PredicateEval;
 use std::{
     io::{Read, Write},
     path::PathBuf,
-    process::{Command, ExitCode, Stdio},
+    process::{ExitCode, Stdio},
 };
 
 use symposium_install::Runnable;
+use thiserror::Error;
+use tokio::{io::AsyncWriteExt, process::Command};
 
 use crate::installation::{
     AcquiredInstallation, AcquiredRunnable, acquire_installation, refresh_installation_if_present,
@@ -15,7 +17,7 @@ use crate::plugins::{HookFormat, Installation};
 use crate::pm::WorkspaceDeps;
 use crate::{
     config::Symposium,
-    hook_schema::{AgentHookInput, symposium},
+    hook_schema::{AgentHookInput, ErasedAgentHookEvent, HookSchemaError, symposium},
     plugins::Plugin,
 };
 use crate::{
@@ -191,7 +193,7 @@ async fn build_spawn_spec(sym: &Symposium, hook: &ResolvedHook) -> anyhow::Resul
     })
 }
 
-fn spawn_from_spec(spec: SpawnSpec) -> std::io::Result<std::process::Child> {
+fn spawn_from_spec(spec: SpawnSpec) -> std::io::Result<tokio::process::Child> {
     match spec {
         SpawnSpec::Script { path, args, env } => {
             let mut cmd = Command::new("sh");
@@ -202,6 +204,7 @@ fn spawn_from_spec(spec: SpawnSpec) -> std::io::Result<std::process::Child> {
             cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
+                .kill_on_drop(true)
                 .spawn()
         }
         SpawnSpec::Exec { path, args, env } => {
@@ -213,6 +216,7 @@ fn spawn_from_spec(spec: SpawnSpec) -> std::io::Result<std::process::Child> {
             cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
+                .kill_on_drop(true)
                 .spawn()
         }
     }
@@ -220,102 +224,173 @@ fn spawn_from_spec(spec: SpawnSpec) -> std::io::Result<std::process::Child> {
 
 // Re-export hook schema types for convenience.
 pub use crate::hook_schema::{HookAgent, HookEvent, HookResponse};
-/// Core hook pipeline: sync → parse → builtin → plugins → serialize.
+/// A hook execution failure with content-free diagnostics and inspectable sources.
 ///
-/// Takes the raw agent wire-format input, returns the agent wire-format
-/// response. Called by both `run()` (CLI) and the test harness.
+/// Never recursively format its sources or its `Debug` representation in logs:
+/// parser, plugin, and I/O sources can carry private request or configuration data.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum HookError {
+    /// An agent does not support the selected event.
+    #[error("agent {agent:?} does not support hook event {event:?}")]
+    UnsupportedEvent { agent: HookAgent, event: HookEvent },
+    /// Parsing, conversion, or serialization failed at the typed schema boundary.
+    #[error(transparent)]
+    Schema(#[from] HookSchemaError),
+    /// No payload working directory was supplied and the process directory failed.
+    #[error("failed to get current directory for hook")]
+    CurrentDirectory {
+        #[source]
+        source: std::io::Error,
+    },
+    /// The incoming agent stream could not be read.
+    #[error("failed to read hook stdin")]
+    ReadInput {
+        #[source]
+        source: std::io::Error,
+    },
+    /// The response could not be delivered on stdout.
+    #[error("failed to write hook stdout")]
+    WriteStdout {
+        #[source]
+        source: std::io::Error,
+        /// A simultaneous stderr failure, retained without formatting it.
+        stderr_source: Option<std::io::Error>,
+    },
+    /// The response could not be delivered on stderr.
+    #[error("failed to write hook stderr")]
+    WriteStderr {
+        #[source]
+        source: std::io::Error,
+    },
+    /// A hook command could not be acquired or resolved.
+    #[error("failed to prepare plugin hook command")]
+    PluginPreparation {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// A plugin process could not be started.
+    #[error("failed to spawn plugin hook")]
+    PluginSpawn {
+        #[source]
+        source: std::io::Error,
+    },
+    /// A plugin did not receive its complete input.
+    #[error("failed to write plugin hook stdin")]
+    PluginInput {
+        #[source]
+        source: std::io::Error,
+    },
+    /// A plugin process could not be collected.
+    #[error("failed to wait for plugin hook")]
+    PluginWait {
+        #[source]
+        source: std::io::Error,
+        /// An input delivery failure observed before process collection failed.
+        input_source: Option<std::io::Error>,
+    },
+    /// Portable plugin output was not valid JSON.
+    #[error("failed to parse plugin hook JSON")]
+    PluginOutput {
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Portable or legacy JSON did not contain an object.
+    #[error("plugin hook output must be a JSON object")]
+    PluginOutputShape,
+}
+
+/// Execute the hook pipeline with typed parsing, transport and conversion errors.
+///
+/// # Errors
+/// Returns [`HookError`] on unsupported events, invalid input/output, command
+/// preparation, or transport failure. Explicit plugin denials remain responses.
+/// CLI callers must render a native denial on a `PreToolUse` error; [`run`] does so.
+pub async fn try_execute_hook(
+    sym: &Symposium,
+    agent: HookAgent,
+    event: HookEvent,
+    input: &str,
+) -> Result<HookResponse, HookError> {
+    let handler = crate::hook_schema::agent_event(agent, event)
+        .ok_or(HookError::UnsupportedEvent { agent, event })?;
+    let payload = handler.try_parse_input(input)?;
+    if !payload.should_dispatch() {
+        tracing::debug!(
+            ?agent,
+            ?event,
+            "payload is not an occurrence of the event, skipping"
+        );
+        let neutral = handler.try_translate_output(&OutputEvent::empty_for(event))?;
+        return Ok(handler.try_respond(&neutral.try_to_hook_output()?)?);
+    }
+    let sym_input = payload.to_symposium();
+    if sym_input.event() != event {
+        return Err(HookSchemaError::EventMismatch {
+            expected: event,
+            actual: Some(sym_input.event()),
+        }
+        .into());
+    }
+    let cwd = match sym_input.cwd() {
+        Some(cwd) => PathBuf::from(cwd),
+        None => std::env::current_dir().map_err(|source| HookError::CurrentDirectory { source })?,
+    };
+    let deps = sym.workspace_deps(&cwd);
+    let session_start = event == HookEvent::SessionStart;
+    let notify_about_possible_new_plugins = run_auto_sync(sym, &deps, session_start).await;
+    if session_start && sym.config.auto_sync {
+        prewarm_hook_sources(sym, &deps).await;
+    }
+    let builtin = dispatch_builtin(sym, &sym_input, &deps, notify_about_possible_new_plugins).await;
+    let prior = handler
+        .try_translate_output(&builtin)?
+        .try_to_hook_output()?;
+    let response = match try_dispatch_plugin_hooks(
+        sym,
+        agent,
+        event,
+        &sym_input,
+        payload.as_ref(),
+        prior,
+        builtin.additional_context().map(String::from),
+        &deps,
+    )
+    .await
+    {
+        Ok(output) => handler.try_respond(&output)?,
+        Err(HookDispatchError::Blocked(stderr)) => {
+            blocked_response(handler.as_ref(), event, &stderr)?
+        }
+        Err(HookDispatchError::Failed(error)) => return Err(error),
+    };
+    tracing::trace!(
+        stdout_len = response.stdout.len(),
+        exit_code = response.exit_code,
+        "hook response ready"
+    );
+    Ok(response)
+}
+
+/// Compatible root-0.5 adapter for [`try_execute_hook`].
+///
+/// # Errors
+/// Wraps the same typed [`HookError`] without formatting or losing its source.
+/// Root 0.6 will use the typed signature directly.
 pub async fn execute_hook(
     sym: &Symposium,
     agent: HookAgent,
     event: HookEvent,
     input: &str,
 ) -> anyhow::Result<HookResponse> {
-    let event_handler = crate::hook_schema::agent_event(agent, event);
-
-    if let Some(handler) = event_handler {
-        let payload = handler.parse_input(input)?;
-
-        // The agent's native event can fire more often than the symposium
-        // event it maps to; a payload that is not an occurrence of it gets the
-        // agent's neutral output and reaches neither sync nor any hook.
-        if !payload.should_dispatch() {
-            tracing::debug!(
-                ?agent,
-                ?event,
-                "payload is not an occurrence of the event, skipping"
-            );
-            let neutral = handler.translate_output(&symposium::OutputEvent::empty_for(event));
-            return Ok(handler.respond(&neutral.to_hook_output()));
-        }
-
-        let sym_input = payload.to_symposium();
-
-        // Create a shared WorkspaceDeps for the entire hook invocation.
-        // Auto-sync populates it if it runs; later stages reuse the cached result.
-        let fallback_cwd = std::env::current_dir().unwrap_or_default();
-        let cwd = match sym_input.cwd() {
-            Some(s) => PathBuf::from(s),
-            None => fallback_cwd,
-        };
-        let deps = sym.workspace_deps(&cwd);
-
-        // Auto-sync: install applicable skills into agent dirs (non-fatal).
-        // SessionStart refreshes source caches and syncs unconditionally.
-        let session_start = event == HookEvent::SessionStart;
-        let notify_about_possible_new_plugins = run_auto_sync(sym, &deps, session_start).await;
-
-        // SessionStart (once per session) also refreshes every hook's already-
-        // cached source, so later events dispatch fresh binaries without per-
-        // event network cost. Best-effort; gated by `auto-sync`.
-        if session_start && sym.config.auto_sync {
-            prewarm_hook_sources(sym, &deps).await;
-        }
-
-        // Builtin dispatch → symposium output → host agent output as Value
-        let builtin_sym_output =
-            dispatch_builtin(sym, &sym_input, &deps, notify_about_possible_new_plugins).await;
-        let builtin_agent_output = handler.translate_output(&builtin_sym_output);
-        let prior_output = builtin_agent_output.to_hook_output();
-
-        // Plugin dispatch with format routing
-        let response = match dispatch_plugin_hooks(
-            sym,
-            agent,
-            event,
-            &sym_input,
-            payload.as_ref(),
-            prior_output,
-            builtin_sym_output.additional_context().map(String::from),
-            &deps,
-        )
-        .await
-        {
-            Ok(final_output) => handler.respond(&final_output),
-            Err(stderr) => blocked_response(handler.as_ref(), event, &stderr),
-        };
-        tracing::trace!(
-            stdout_len = response.stdout.len(),
-            exit_code = response.exit_code,
-            "hook response ready"
-        );
-        Ok(response)
-    } else {
-        // Agent doesn't support this event
-        anyhow::bail!("agent {agent:?} does not support hook event {event:?}")
-    }
+    Ok(try_execute_hook(sym, agent, event, input).await?)
 }
 
-/// The response for a plugin hook that exited 2, which the plugin contract
-/// defines as "block, with stderr as the reason". A tool call is denied
-/// through the canonical decision, so each agent receives the denial in the
-/// form it honors (Antigravity ignores exit codes, Copilot drops the reason
-/// on a non-zero exit). Every other event passes exit 2 and the reason
-/// through, for the agent to apply its own blocking semantics.
 fn blocked_response(
-    handler: &dyn crate::hook_schema::ErasedAgentHookEvent,
+    handler: &dyn ErasedAgentHookEvent,
     event: HookEvent,
     stderr: &[u8],
-) -> HookResponse {
+) -> Result<HookResponse, HookError> {
     let reason = String::from_utf8_lossy(stderr).trim().to_string();
     let reason = if reason.is_empty() {
         "blocked by a plugin hook".to_string()
@@ -323,47 +398,131 @@ fn blocked_response(
         reason
     };
     tracing::info!(?event, reason_len = reason.len(), "plugin hook blocked");
-
     if event == HookEvent::PreToolUse {
         let deny = OutputEvent::PreToolUse(symposium::PreToolUseOutput::deny(reason));
-        handler.respond(&handler.translate_output(&deny).to_hook_output())
+        let output = handler.try_translate_output(&deny)?.try_to_hook_output()?;
+        Ok(handler.try_respond(&output)?)
     } else {
-        HookResponse::blocked(&reason)
+        Ok(HookResponse::blocked(&reason))
     }
 }
 
-/// CLI entry point: read payload from stdin, dispatch, print output.
-pub async fn run(sym: &Symposium, agent: HookAgent, event: HookEvent) -> ExitCode {
-    tracing::debug!("Running hook listener for agent {agent:?} and event {event:?}");
-
-    let mut input = String::new();
-    if let Err(e) = std::io::stdin().read_to_string(&mut input) {
-        tracing::warn!(?event, error_kind = ?e.kind(), "failed to read hook stdin");
-        return ExitCode::SUCCESS;
+/// Render a fixed host-native denial when a supported `PreToolUse` cannot run.
+///
+/// # Errors
+/// Returns an unsupported-event or typed schema error if no native denial can
+/// be rendered. Error details are never included in the protocol response.
+pub fn failure_response(agent: HookAgent, event: HookEvent) -> Result<HookResponse, HookError> {
+    if event != HookEvent::PreToolUse {
+        return Err(HookError::UnsupportedEvent { agent, event });
     }
+    let handler = crate::hook_schema::agent_event(agent, event)
+        .ok_or(HookError::UnsupportedEvent { agent, event })?;
+    blocked_response(
+        handler.as_ref(),
+        event,
+        b"Symposium could not process this hook safely; tool execution is blocked.",
+    )
+}
+
+/// Deliver a native denial after startup failure, preserving the host's exit policy.
+///
+/// Unsupported events and failed delivery return failure. A failed stream cannot
+/// prove that an agent received the denial, even when an exit code is nonzero.
+pub fn respond_to_failure(agent: HookAgent, event: HookEvent) -> ExitCode {
+    match failure_response(agent, event) {
+        Ok(response) => deliver_response(&response),
+        Err(error) => {
+            tracing::warn!(?agent, ?event, error = %error, "could not render hook failure");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn read_hook_input(reader: &mut impl Read) -> Result<String, HookError> {
+    let mut input = String::new();
+    reader
+        .read_to_string(&mut input)
+        .map_err(|source| HookError::ReadInput { source })?;
+    Ok(input)
+}
+
+fn write_hook_response(
+    response: &HookResponse,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> Result<(), HookError> {
+    let stdout_result = if response.stdout.is_empty() {
+        Ok(())
+    } else {
+        stdout
+            .write_all(&response.stdout)
+            .and_then(|()| stdout.flush())
+    };
+    let stderr_result = if response.stderr.is_empty() {
+        Ok(())
+    } else {
+        stderr
+            .write_all(&response.stderr)
+            .and_then(|()| stderr.flush())
+    };
+    if let Err(source) = stdout_result {
+        return Err(HookError::WriteStdout {
+            source,
+            stderr_source: stderr_result.err(),
+        });
+    }
+    stderr_result.map_err(|source| HookError::WriteStderr { source })?;
+    Ok(())
+}
+
+fn failed_delivery_exit(response: &HookResponse) -> u8 {
+    if response.exit_code == 2 { 2 } else { 1 }
+}
+
+fn deliver_response(response: &HookResponse) -> ExitCode {
+    match write_hook_response(response, &mut std::io::stdout(), &mut std::io::stderr()) {
+        Ok(()) => ExitCode::from(response.exit_code),
+        Err(error) => {
+            tracing::warn!(error = %error, "hook response delivery failed");
+            ExitCode::from(failed_delivery_exit(response))
+        }
+    }
+}
+
+/// CLI entry point: read input, execute, and deliver the host's protocol response.
+/// A supported `PreToolUse` boundary failure is a native denial, including on
+/// agents that ignore exit status. Other failures return a nonzero status.
+pub async fn run(sym: &Symposium, agent: HookAgent, event: HookEvent) -> ExitCode {
+    tracing::debug!(?agent, ?event, "running hook listener");
+    let input = match read_hook_input(&mut std::io::stdin()) {
+        Ok(input) => input,
+        Err(error) => {
+            tracing::warn!(?agent, ?event, error = %error, "hook input failed");
+            return respond_to_failure(agent, event);
+        }
+    };
     tracing::trace!(
         ?agent,
         ?event,
         input_len = input.len(),
         "hook stdin received"
     );
-
-    match execute_hook(sym, agent, event, &input).await {
-        Ok(response) => {
-            write_hook_trace(agent, event, &input, &response);
-            if !response.stdout.is_empty() {
-                std::io::stdout().write_all(&response.stdout).unwrap();
+    let response = match try_execute_hook(sym, agent, event, &input).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(?agent, ?event, error = %error, "hook failed");
+            match failure_response(agent, event) {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(?agent, ?event, error = %error, "could not render hook failure");
+                    return ExitCode::FAILURE;
+                }
             }
-            if !response.stderr.is_empty() {
-                std::io::stderr().write_all(&response.stderr).unwrap();
-            }
-            ExitCode::from(response.exit_code)
         }
-        Err(_error) => {
-            tracing::warn!(?agent, ?event, input_len = input.len(), "hook failed");
-            ExitCode::FAILURE
-        }
-    }
+    };
+    write_hook_trace(agent, event, &input, &response);
+    deliver_response(&response)
 }
 
 /// Append metadata-only JSONL when `SYMPOSIUM_HOOK_TRACE` names a file.
@@ -385,7 +544,13 @@ fn write_hook_trace(agent: HookAgent, event: HookEvent, input: &str, response: &
     use std::fs::OpenOptions;
     match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(mut f) => {
-            let mut line = serde_json::to_string(&entry).unwrap();
+            let mut line = match serde_json::to_string(&entry) {
+                Ok(line) => line,
+                Err(_error) => {
+                    tracing::warn!("failed to serialize hook trace metadata");
+                    return;
+                }
+            };
             line.push('\n');
             if let Err(e) = f.write_all(line.as_bytes()) {
                 tracing::warn!(error_kind = ?e.kind(), "failed to write hook trace");
@@ -560,7 +725,8 @@ pub async fn dispatch_builtin(
         symposium::InputEvent::SessionStart(session) => {
             handle_session_start(sym, session, deps).await
         }
-        _ => symposium::OutputEvent::empty_for(HookEvent::PreToolUse),
+        symposium::InputEvent::Stop(_) => symposium::OutputEvent::empty_for(HookEvent::Stop),
+        _ => symposium::OutputEvent::empty_for(input.event()),
     }
 }
 
@@ -699,15 +865,10 @@ pub enum PluginHookOutput {
     Failure(Vec<u8>),
 }
 
-/// Dispatch plugin hooks with format routing.
+/// Compatible root-0.5 dispatch adapter; prefer [`try_execute_hook`] for typed failures.
 ///
-/// Accumulates output as `serde_json::Value` in the host agent's wire format.
-/// When a plugin's format matches the host agent, input/output pass through directly.
-/// When formats differ, conversion goes through symposium canonical types.
-/// `prior_context` is the context already in `prior_output`; every hook's
-/// context is added to it (see [`JoinedContext`]).
-///
-/// Returns `Ok(json)` on success, `Err(stderr)` on exit code 2.
+/// Successful output and explicit plugin-block reasons retain their wire form.
+/// Operational failures use a content-free reason in this legacy byte channel.
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_plugin_hooks(
     sym: &Symposium,
@@ -719,6 +880,158 @@ pub async fn dispatch_plugin_hooks(
     prior_context: Option<String>,
     deps: &Arc<WorkspaceDeps>,
 ) -> Result<serde_json::Value, Vec<u8>> {
+    try_dispatch_plugin_hooks(
+        sym,
+        host_agent,
+        event,
+        sym_input,
+        original_input,
+        prior_output,
+        prior_context,
+        deps,
+    )
+    .await
+    .map_err(|failure| match failure {
+        HookDispatchError::Blocked(stderr) => stderr,
+        HookDispatchError::Failed(error) => error.to_string().into_bytes(),
+    })
+}
+
+#[derive(Debug)]
+enum HookDispatchError {
+    Blocked(Vec<u8>),
+    Failed(HookError),
+}
+
+impl From<HookError> for HookDispatchError {
+    fn from(error: HookError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ChildDisposition {
+    Blocked,
+    Ready,
+}
+
+fn classify_child_outcome(
+    exit_code: Option<i32>,
+    input: std::io::Result<()>,
+) -> Result<ChildDisposition, HookError> {
+    if matches!(exit_code, None | Some(2)) {
+        if let Err(error) = input {
+            tracing::warn!(error_kind = ?error.kind(), "plugin block takes precedence over input delivery failure");
+        }
+        return Ok(ChildDisposition::Blocked);
+    }
+    input.map_err(|source| HookError::PluginInput { source })?;
+    Ok(ChildDisposition::Ready)
+}
+
+async fn collect_plugin_output(
+    mut child: tokio::process::Child,
+    input: &[u8],
+) -> Result<std::process::Output, HookDispatchError> {
+    let stdin = child.stdin.take();
+    // Write and drain concurrently: a plugin may fill stdout before reading stdin.
+    let (input_result, output_result) = tokio::join!(
+        async move {
+            match stdin {
+                Some(mut stdin) => stdin.write_all(input).await,
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "plugin stdin was not piped",
+                )),
+            }
+        },
+        child.wait_with_output()
+    );
+    let output = match output_result {
+        Ok(output) => output,
+        Err(source) => {
+            return Err(HookError::PluginWait {
+                source,
+                input_source: input_result.err(),
+            }
+            .into());
+        }
+    };
+    match classify_child_outcome(output.status.code(), input_result)? {
+        ChildDisposition::Blocked => Err(HookDispatchError::Blocked(output.stderr)),
+        ChildDisposition::Ready => Ok(output),
+    }
+}
+
+fn selected_native_output(
+    output: &dyn crate::hook_schema::AgentHookOutput,
+    agent: HookAgent,
+    event: HookEvent,
+) -> OutputEvent {
+    let canonical = output.to_symposium();
+    // Antigravity reuses one context-only output type for both lifecycle events.
+    if agent == HookAgent::Antigravity && event == HookEvent::UserPromptSubmit {
+        match canonical.additional_context() {
+            Some(context) => OutputEvent::with_context(event, context.to_string()),
+            None => OutputEvent::empty_for(event),
+        }
+    } else {
+        canonical
+    }
+}
+
+fn decode_plugin_output(
+    handler: &dyn ErasedAgentHookEvent,
+    agent: HookAgent,
+    event: HookEvent,
+    native: bool,
+    bytes: &[u8],
+) -> Result<(serde_json::Value, OutputEvent), HookError> {
+    if native {
+        let output = handler.try_parse_output(bytes)?;
+        let canonical = selected_native_output(output.as_ref(), agent, event);
+        handler.try_translate_output(&canonical)?;
+        return Ok((output.try_to_hook_output()?, canonical));
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|source| HookError::PluginOutput { source })?;
+    let object = value.as_object().ok_or(HookError::PluginOutputShape)?;
+    if object.keys().any(|key| {
+        matches!(
+            key.as_str(),
+            "PreToolUse" | "PostToolUse" | "UserPromptSubmit" | "SessionStart" | "Stop"
+        )
+    }) {
+        let canonical: OutputEvent =
+            serde_json::from_value(value).map_err(|source| HookError::PluginOutput { source })?;
+        let output = handler
+            .try_translate_output(&canonical)?
+            .try_to_hook_output()?;
+        return Ok((output, canonical));
+    }
+    // Legacy untagged host JSON remains valid, but its native decision is checked.
+    let parsed = handler.try_parse_output(bytes)?;
+    let canonical = selected_native_output(parsed.as_ref(), agent, event);
+    handler.try_translate_output(&canonical)?;
+    let output = if agent == HookAgent::Kiro {
+        parsed.try_to_hook_output()?
+    } else {
+        value
+    };
+    Ok((output, canonical))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_dispatch_plugin_hooks(
+    sym: &Symposium,
+    host_agent: HookAgent,
+    event: HookEvent,
+    sym_input: &symposium::InputEvent,
+    original_input: &dyn AgentHookInput,
+    prior_output: serde_json::Value,
+    prior_context: Option<String>,
+    deps: &Arc<WorkspaceDeps>,
+) -> Result<serde_json::Value, HookDispatchError> {
     let workspace = deps.load().cloned();
     let registry = crate::plugins::load_registry_with_workspace(sym, workspace.as_deref()).await;
 
@@ -750,123 +1063,61 @@ pub async fn dispatch_plugin_hooks(
     .await;
     let hooks = dispatched_hooks_for_payload(&plugins, sym_input, host_agent, &mut ctx);
 
+    let handler =
+        crate::hook_schema::agent_event(host_agent, event).ok_or(HookError::UnsupportedEvent {
+            agent: host_agent,
+            event,
+        })?;
     let mut output = prior_output;
     let mut context = JoinedContext::new(event, prior_context);
-
     for hook in hooks {
         tracing::info!(?event, format = ?hook.format, "running plugin hook");
-
-        // Determine stdin for the plugin based on its declared format.
-        // After format selection, the only two cases are:
-        // - native (matches host agent) → pass through original input
-        // - symposium → deliver canonical format
-        let hook_agent = hook.format.as_agent();
-        let hook_input: &dyn AgentHookInput = if hook_agent == Some(host_agent) {
-            original_input
-        } else {
-            sym_input
-        };
-        let stdin_str = match hook_input.to_string() {
-            Ok(s) => s,
-            Err(_error) => {
-                tracing::error!(?event, "failed to serialize hook input");
-                continue;
-            }
-        };
-
-        let spawn_res = match build_spawn_spec(sym, &hook).await {
-            Ok(spec) => spawn_from_spec(spec),
-            Err(_error) => {
-                tracing::warn!(?event, "failed to prepare hook command");
-                continue;
-            }
-        };
-
-        match spawn_res {
-            Ok(mut child) => {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(stdin_str.as_bytes());
+        let native = hook.format.as_agent() == Some(host_agent);
+        let input: &dyn AgentHookInput = if native { original_input } else { sym_input };
+        let stdin = input.try_to_string().map_err(HookError::from)?;
+        let spec =
+            build_spawn_spec(sym, &hook)
+                .await
+                .map_err(|source| HookError::PluginPreparation {
+                    source: source.into_boxed_dyn_error(),
+                })?;
+        let child = spawn_from_spec(spec).map_err(|source| HookError::PluginSpawn { source })?;
+        let child_output = collect_plugin_output(child, stdin.as_bytes()).await?;
+        let exit_code = child_output.status.code();
+        tracing::trace!(
+            ?event,
+            stdout_len = child_output.stdout.len(),
+            stderr_len = child_output.stderr.len(),
+            exit_code,
+            "hook finished"
+        );
+        match exit_code {
+            Some(0) if child_output.stdout.is_empty() => continue,
+            Some(0) => {
+                let (host_json, canonical) = decode_plugin_output(
+                    handler.as_ref(),
+                    host_agent,
+                    event,
+                    native,
+                    &child_output.stdout,
+                )?;
+                merge(&mut output, host_json);
+                if denies(&canonical) {
+                    tracing::info!(
+                        ?event,
+                        "plugin hook denied the tool call; later hooks do not run"
+                    );
+                    return Ok(output);
                 }
-
-                let child_out = match child.wait_with_output() {
-                    Ok(o) => o,
-                    Err(e) => {
-                        tracing::warn!(?event, error_kind = ?e.kind(), "failed waiting for hook process");
-                        continue;
-                    }
-                };
-
-                tracing::trace!(
-                    ?event,
-                    stdout_len = child_out.stdout.len(),
-                    stderr_len = child_out.stderr.len(),
-                    "hook finished"
-                );
-
-                let exit_code = child_out.status.code();
-                tracing::debug!(?event, exit_code, "plugin hook dispatched");
-                match exit_code {
-                    None | Some(2) => return Err(child_out.stderr),
-                    Some(0) if child_out.stdout.is_empty() => continue,
-                    Some(0) => {
-                        // Parse output and convert to host agent format.
-                        // Two cases: native (same as host) or symposium.
-                        let host_handler = crate::hook_schema::agent_event(host_agent, event);
-                        let Some(host_h) = host_handler else { continue };
-
-                        let (host_json, hook_output) = if hook_agent == Some(host_agent) {
-                            // Native format — parse as host agent output
-                            match host_h.parse_output(&child_out.stdout) {
-                                Ok(o) => (o.to_hook_output(), Some(o.to_symposium())),
-                                Err(_error) => {
-                                    tracing::warn!(?event, "failed to parse hook output");
-                                    continue;
-                                }
-                            }
-                        } else {
-                            // Symposium format — parse and convert to host agent
-                            match serde_json::from_slice::<serde_json::Value>(&child_out.stdout) {
-                                Ok(v) => {
-                                    if let Ok(sym_out) =
-                                        serde_json::from_value::<symposium::OutputEvent>(v.clone())
-                                    {
-                                        let host_out = host_h.translate_output(&sym_out);
-                                        (host_out.to_hook_output(), Some(sym_out))
-                                    } else {
-                                        (v, None)
-                                    }
-                                }
-                                Err(_error) => {
-                                    tracing::warn!(?event, "failed to parse hook output");
-                                    continue;
-                                }
-                            }
-                        };
-
-                        merge(&mut output, host_json);
-                        if hook_output.as_ref().is_some_and(denies) {
-                            tracing::info!(
-                                ?event,
-                                "plugin hook denied the tool call; later hooks do not run"
-                            );
-                            return Ok(output);
-                        }
-                        context.add(hook_output.as_ref(), &mut output, host_h.as_ref());
-                    }
-                    Some(code) => {
-                        tracing::warn!(
-                            exit_code = code,
-                            "plugin hook exited with non-zero (continuing)"
-                        );
-                    }
-                }
+                context.add(Some(&canonical), &mut output, handler.as_ref())?;
             }
-            Err(e) => {
-                tracing::warn!(?event, error_kind = ?e.kind(), "failed to spawn hook command");
-            }
+            Some(code) => tracing::warn!(
+                exit_code = code,
+                "plugin hook exited with non-zero (continuing)"
+            ),
+            None => return Err(HookDispatchError::Blocked(child_output.stderr)),
         }
     }
-
     Ok(output)
 }
 
@@ -896,12 +1147,12 @@ impl JoinedContext {
         hook_output: Option<&symposium::OutputEvent>,
         output: &mut serde_json::Value,
         handler: &dyn crate::hook_schema::ErasedAgentHookEvent,
-    ) {
+    ) -> Result<(), HookError> {
         if !matches!(
             self.event,
             HookEvent::SessionStart | HookEvent::UserPromptSubmit | HookEvent::PostToolUse
         ) {
-            return;
+            return Ok(());
         }
         if let Some(more) = hook_output.and_then(|o| o.additional_context()) {
             self.text = Some(match self.text.take() {
@@ -911,8 +1162,14 @@ impl JoinedContext {
         }
         if let Some(text) = &self.text {
             let joined = OutputEvent::with_context(self.event, text.clone());
-            merge(output, handler.translate_output(&joined).to_hook_output());
+            merge(
+                output,
+                handler
+                    .try_translate_output(&joined)?
+                    .try_to_hook_output()?,
+            );
         }
+        Ok(())
     }
 }
 
@@ -1034,6 +1291,162 @@ mod tests {
     use crate::pm::{ANY_VERSION, PackageId};
 
     use super::*;
+
+    const STREAM_CANARY: &str = "HOOK_STREAM_PRIVATE_CANARY";
+
+    struct FailingReader;
+    impl Read for FailingReader {
+        fn read(&mut self, _bytes: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                STREAM_CANARY,
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct TestWriter {
+        bytes: Vec<u8>,
+        fail_write: bool,
+        fail_flush: bool,
+        flushes: usize,
+    }
+    impl Write for TestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    STREAM_CANARY,
+                ));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            if self.fail_flush {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    STREAM_CANARY,
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn hook_stream_failures_preserve_sources_and_attempt_both_streams() {
+        use std::error::Error as _;
+        let error = read_hook_input(&mut FailingReader).unwrap_err();
+        assert!(matches!(error, HookError::ReadInput { .. }));
+        assert_eq!(error.source().unwrap().to_string(), STREAM_CANARY);
+        assert!(!error.to_string().contains(STREAM_CANARY));
+        let response = HookResponse {
+            stdout: b"output".to_vec(),
+            stderr: b"reason".to_vec(),
+            exit_code: 2,
+        };
+        let mut stdout = TestWriter {
+            fail_write: true,
+            ..Default::default()
+        };
+        let mut stderr = TestWriter {
+            fail_flush: true,
+            ..Default::default()
+        };
+        let error = write_hook_response(&response, &mut stdout, &mut stderr).unwrap_err();
+        assert!(matches!(
+            error,
+            HookError::WriteStdout {
+                stderr_source: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(error.source().unwrap().to_string(), STREAM_CANARY);
+        assert!(!error.to_string().contains(STREAM_CANARY));
+        assert_eq!(stderr.bytes, b"reason");
+        assert_eq!(stderr.flushes, 1);
+        assert_eq!(failed_delivery_exit(&response), 2);
+    }
+
+    #[test]
+    fn response_flush_failures_are_not_reported_as_delivery() {
+        let response = HookResponse {
+            stdout: b"{}".to_vec(),
+            stderr: b"reason".to_vec(),
+            exit_code: 0,
+        };
+        let mut stdout = TestWriter {
+            fail_flush: true,
+            ..Default::default()
+        };
+        let mut stderr = TestWriter::default();
+        let error = write_hook_response(&response, &mut stdout, &mut stderr).unwrap_err();
+        assert!(matches!(error, HookError::WriteStdout { .. }));
+        assert_eq!(stdout.bytes, b"{}");
+        assert_eq!(stdout.flushes, 1);
+        assert_eq!(stderr.bytes, b"reason");
+        assert_eq!(stderr.flushes, 1);
+        assert_eq!(failed_delivery_exit(&response), 1);
+
+        let mut stdout = TestWriter::default();
+        let mut stderr = TestWriter {
+            fail_write: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            write_hook_response(&response, &mut stdout, &mut stderr),
+            Err(HookError::WriteStderr { .. })
+        ));
+        assert_eq!(stdout.flushes, 1);
+    }
+
+    #[test]
+    fn explicit_child_block_precedes_input_failure() {
+        use std::error::Error as _;
+        for exit in [None, Some(2)] {
+            let input = Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                STREAM_CANARY,
+            ));
+            assert_eq!(
+                classify_child_outcome(exit, input).unwrap(),
+                ChildDisposition::Blocked
+            );
+        }
+        for exit in [Some(0), Some(1)] {
+            let input = Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                STREAM_CANARY,
+            ));
+            let error = classify_child_outcome(exit, input).unwrap_err();
+            assert!(matches!(error, HookError::PluginInput { .. }));
+            assert_eq!(error.source().unwrap().to_string(), STREAM_CANARY);
+            assert!(!error.to_string().contains(STREAM_CANARY));
+            assert_eq!(
+                classify_child_outcome(exit, Ok(())).unwrap(),
+                ChildDisposition::Ready
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn early_child_block_is_reaped_even_when_it_does_not_read_input() {
+        let child = Command::new("sh")
+            .args(["-c", "printf '%s' 'explicit block' >&2; exit 2"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let input = vec![b'x'; 2 * 1024 * 1024];
+        match collect_plugin_output(child, &input).await {
+            Err(HookDispatchError::Blocked(reason)) => assert_eq!(reason, b"explicit block"),
+            result => panic!("expected explicit block, got {result:?}"),
+        }
+    }
 
     #[test]
     fn env_safe_sanitizes_punctuation() {

@@ -60,6 +60,14 @@ A listing that swallows read errors returns the same empty list for "nothing the
 
 ## Windows portability (tests)
 
+Use the exact `Symposium.toml` manifest filename in generated fixtures. A
+lowercase `symposium.toml` can appear to work on a case-insensitive macOS or
+Windows filesystem while Linux discovers no plugin and returns a neutral hook
+response. Check the fixture filename before changing dispatch when only Linux
+loses plugin context. The diagnostic process tests assert that the plugin ran
+and its expected content reached the protocol, so an undiscovered fixture
+cannot produce a false privacy pass.
+
 The test suite runs on `windows-latest`, where CI passes `--no-fail-fast` so that one failing test binary does not hide the failures in every binary cargo would otherwise skip. A few patterns recur when writing tests that touch paths or scripts:
 
 - **Paths in TOML/JSON string literals.** A Windows path like `C:\Users\...` is invalid inside a TOML or JSON string (the backslashes read as escapes). When substituting a real path into fixture text, convert to forward slashes first; Windows accepts `/` in paths. See `setup_fixture` in `symposium-testlib`.

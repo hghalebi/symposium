@@ -413,6 +413,9 @@ const BUILTIN_RECOMMENDATIONS_URL: &str = "https://github.com/symposium-dev/reco
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConfigError {
+    /// A required warning could not be delivered before selecting defaults.
+    #[error("failed to write configuration warning")]
+    Warning(#[source] std::io::Error),
     /// A required directory could not be resolved.
     #[error(transparent)]
     Directory(#[from] crate::dirs::DirectoryError),
@@ -440,6 +443,9 @@ pub enum ConfigError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LoggingError {
+    /// The warning about an invalid logging level could not be delivered.
+    #[error("failed to write logging warning")]
+    Warning(#[source] std::io::Error),
     /// The log directory could not be created.
     #[error("failed to create log directory {}: {source}", path.display())]
     CreateDirectory {
@@ -678,7 +684,10 @@ impl Symposium {
             .open(&log_path)
             .expect("failed to open log file");
 
-        let level = self.log_level();
+        let level = self.log_level().unwrap_or_else(|source| {
+            tracing::warn!(error_kind = ?source.kind(), "failed to write legacy logging warning");
+            Level::INFO
+        });
         let file_filter = EnvFilter::new(level.as_str());
 
         let file_layer = tracing_subscriber::fmt::layer()
@@ -723,7 +732,7 @@ impl Symposium {
             .to_string();
         let log_path = logs.join(filename);
         let file = open_log_file(&log_path)?;
-        let level = self.log_level();
+        let level = self.log_level().map_err(LoggingError::Warning)?;
         let file_layer = tracing_subscriber::fmt::layer()
             .with_writer(file)
             .with_ansi(false)
@@ -857,18 +866,20 @@ impl Symposium {
         Ok(dir)
     }
 
-    fn log_level(&self) -> Level {
-        match self.config.logging.level.to_lowercase().as_str() {
+    fn log_level(&self) -> std::io::Result<Level> {
+        Ok(match self.config.logging.level.to_lowercase().as_str() {
             "trace" => Level::TRACE,
             "debug" => Level::DEBUG,
             "info" => Level::INFO,
             "warn" => Level::WARN,
             "error" => Level::ERROR,
             _ => {
-                eprintln!("warning: unknown log level, defaulting to info");
+                write_config_warning(format_args!(
+                    "warning: unknown log level, defaulting to info"
+                ))?;
                 Level::INFO
             }
-        }
+        })
     }
 }
 
@@ -908,10 +919,11 @@ fn try_load_config_from(config_dir: &Path) -> Result<Config, ConfigError> {
     let raw = match toml::from_str::<RawConfig>(&contents) {
         Ok(raw) => raw,
         Err(_) => {
-            eprintln!(
+            write_config_warning(format_args!(
                 "warning: failed to parse {}: invalid TOML; using defaults",
                 path.display()
-            );
+            ))
+            .map_err(ConfigError::Warning)?;
             RawConfig::default()
         }
     };
@@ -924,15 +936,24 @@ fn load_config_from(config_dir: &Path) -> Config {
     match fs::read_to_string(&path) {
         Ok(contents) => toml::from_str::<RawConfig>(&contents)
             .unwrap_or_else(|_error| {
-                eprintln!(
+                if let Err(source) = write_config_warning(format_args!(
                     "warning: failed to parse {}: invalid TOML; using defaults",
                     path.display()
-                );
+                )) {
+                    tracing::warn!(error_kind = ?source.kind(), "failed to write legacy configuration warning");
+                }
                 RawConfig::default()
             })
             .validate(),
         Err(_) => Config::default(),
     }
+}
+
+fn write_config_warning(message: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut stderr = std::io::stderr().lock();
+    writeln!(stderr, "{message}")?;
+    stderr.flush()
 }
 
 fn default_true() -> bool {

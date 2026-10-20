@@ -25,6 +25,42 @@ For each agent, `cargo agents` needs to know how to:
 
 Where these files go depends on whether the agent is configured at the user level or the project level (see [`sync --agent`](./sync-agent-flow.md)).
 
+## Typed hook protocol boundary
+
+The runtime uses the `try_*` methods on `AgentHookInput`, `AgentHookOutput`,
+`AgentHookEvent`, and `ErasedAgentHookEvent`. `HookSchemaError` distinguishes
+input/output parsing, serialization, and event mismatches while preserving the
+original error as its source. Its displayed diagnostic omits payload contents;
+the source or debug representation can still contain parser input and must not
+be logged.
+
+Built-in handlers check the selected event before translating canonical enums.
+Claude, Codex, and Kiro also check their native event discriminators when parsing;
+an explicit mismatched output discriminator is rejected. Protocols without a
+discriminator do not acquire a made-up field. Typed parsers also reject unknown
+access-control decision strings without echoing the value; documented native
+forms such as Claude's `defer`, Copilot's `ask`, and Antigravity's
+`deny_unless_prior_grant` remain accepted. Serialization is fallible, and
+canonical-to-native construction uses ordinary structs instead of serializing
+and reparsing an internally built JSON object.
+
+Native response semantics remain part of that boundary: Kiro sends context as
+plain text and denies through exit 2; Antigravity's neutral `PreToolUse` response
+must explicitly serialize `decision = "allow"`. Other agents retain their
+existing JSON shapes, including Claude's permission prompt and Codex's rewrite
+restriction.
+
+Existing required trait methods remain source compatible until the root crate's
+0.6 breaking release. New defaulted typed methods adapt custom legacy parsers
+and responders without adding serialization traits or runtime bounds to their
+implementers. Built-ins override those defaults with typed implementations.
+External legacy implementations retain their own failure behavior until they
+adopt the typed methods; the adapter does not catch their panics.
+
+The useful invariant is that the selected event and its payload agree before
+conversion. A new error channel cannot repair a decision already discarded by
+an infallible conversion returning the wrong event's neutral output.
+
 ## Extension locations
 
 When installing skills, `cargo agents` prefers vendor-neutral paths where possible:

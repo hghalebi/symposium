@@ -277,14 +277,12 @@ fn malformed_typed_input_is_rejected_without_logging_parser_source_text() {
     let fixture = Fixture::new();
     let input = serde_json::to_string(MALFORMED_INPUT).unwrap();
     let output = fixture.hook("pre-tool-use", &input);
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    assert_no_canaries(&String::from_utf8(output.stderr).unwrap());
+    assert!(output.status.success());
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert_no_canaries(&String::from_utf8_lossy(&output.stderr));
     fixture.assert_private_diagnostics();
-    assert!(
-        !fixture.trace.exists(),
-        "failed dispatch emits no response trace"
-    );
+    fixture.assert_trace(HookEvent::PreToolUse, &input, &output);
 }
 
 #[test]
@@ -306,7 +304,12 @@ fn malformed_native_plugin_output_is_not_formatted_into_diagnostics() {
     assert!(output.status.success());
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-        json!({})
+        serde_json::from_slice::<Value>(
+            &symposium::hook::failure_response(HookAgent::Claude, HookEvent::PreToolUse)
+                .unwrap()
+                .stdout
+        )
+        .unwrap()
     );
     fixture.assert_private_diagnostics();
     fixture.assert_trace(HookEvent::PreToolUse, &input, &output);

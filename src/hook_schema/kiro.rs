@@ -21,11 +21,44 @@ impl Agent for Kiro {
 }
 
 macro_rules! kiro_event {
-    ($event:ident, $input:ident, $output:ident) => {
+    ($event:ident, $input:ident, $output:ident, $variant:ident) => {
         pub struct $event;
         impl AgentHookEvent for $event {
             type Input = $input;
             type Output = $output;
+
+            fn try_parse_input(
+                &self,
+                payload: &str,
+            ) -> Result<Self::Input, super::HookSchemaError> {
+                Self::Input::try_parse_input(payload)
+            }
+            fn try_parse_output(
+                &self,
+                output: &[u8],
+            ) -> Result<Self::Output, super::HookSchemaError> {
+                Self::Output::try_parse_output(output)
+            }
+            fn try_translate_input(
+                &self,
+                input: &symposium::InputEvent,
+            ) -> Result<Self::Input, super::HookSchemaError> {
+                super::validate_input_event(input, super::HookEvent::$variant)?;
+                Ok(Self::Input::from_symposium(input))
+            }
+            fn try_translate_output(
+                &self,
+                output: &symposium::OutputEvent,
+            ) -> Result<Self::Output, super::HookSchemaError> {
+                super::validate_output_event(output, super::HookEvent::$variant)?;
+                Ok(Self::Output::from_symposium(output))
+            }
+            fn try_respond(
+                &self,
+                output: &serde_json::Value,
+            ) -> Result<HookResponse, super::HookSchemaError> {
+                Ok(self.respond(output))
+            }
             fn serialize_output(&self, output: &serde_json::Value) -> Vec<u8> {
                 // Kiro emits plain text (stdout captured as context), not JSON.
                 output
@@ -53,28 +86,46 @@ macro_rules! kiro_event {
 kiro_event!(
     KiroPreToolUseEvent,
     KiroPreToolUseInput,
-    KiroPreToolUseOutput
+    KiroPreToolUseOutput,
+    PreToolUse
 );
 kiro_event!(
     KiroPostToolUseEvent,
     KiroPostToolUseInput,
-    KiroPostToolUseOutput
+    KiroPostToolUseOutput,
+    PostToolUse
 );
 kiro_event!(
     KiroUserPromptSubmitEvent,
     KiroUserPromptSubmitInput,
-    KiroUserPromptSubmitOutput
+    KiroUserPromptSubmitOutput,
+    UserPromptSubmit
 );
 kiro_event!(
     KiroSessionStartEvent,
     KiroSessionStartInput,
-    KiroSessionStartOutput
+    KiroSessionStartOutput,
+    SessionStart
 );
 
 // Kiro output: plain text stdout → additionalContext
 macro_rules! kiro_output_impl {
     ($ty:ident, PreToolUse, PreToolUseOutput { $($extra:tt)* }) => {
         impl AgentHookOutput for $ty {
+            fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+                serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+            }
+            fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+                if output.is_empty() {
+                    return Ok(Self::default());
+                }
+                let text = String::from_utf8_lossy(output);
+                Ok(Self {
+                    additional_context: Some(text.into_owned()),
+                    decision: None,
+                    rest: serde_json::Map::new(),
+                })
+            }
             fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
                 if output.is_empty() {
                     return Ok(Self::default());
@@ -123,6 +174,19 @@ macro_rules! kiro_output_impl {
     };
     ($ty:ident, $variant:ident, $struct:ident { }) => {
         impl AgentHookOutput for $ty {
+            fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+                serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+            }
+            fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+                if output.is_empty() {
+                    return Ok(Self::default());
+                }
+                let text = String::from_utf8_lossy(output);
+                Ok(Self {
+                    additional_context: Some(text.into_owned()),
+                    rest: serde_json::Map::new(),
+                })
+            }
             fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
                 if output.is_empty() {
                     return Ok(Self::default());
@@ -183,6 +247,19 @@ pub struct KiroPreToolUseOutput {
 }
 
 impl AgentHookInput for KiroPreToolUseInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        let input: Self =
+            serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)?;
+        super::validate_native_event(
+            &input.hook_event_name,
+            super::HookEvent::PreToolUse,
+            "preToolUse",
+        )?;
+        Ok(input)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -250,6 +327,19 @@ pub struct KiroPostToolUseOutput {
 }
 
 impl AgentHookInput for KiroPostToolUseInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        let input: Self =
+            serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)?;
+        super::validate_native_event(
+            &input.hook_event_name,
+            super::HookEvent::PostToolUse,
+            "postToolUse",
+        )?;
+        Ok(input)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -310,6 +400,19 @@ pub struct KiroUserPromptSubmitOutput {
 }
 
 impl AgentHookInput for KiroUserPromptSubmitInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        let input: Self =
+            serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)?;
+        super::validate_native_event(
+            &input.hook_event_name,
+            super::HookEvent::UserPromptSubmit,
+            "userPromptSubmit",
+        )?;
+        Ok(input)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -368,6 +471,19 @@ pub struct KiroSessionStartOutput {
 }
 
 impl AgentHookInput for KiroSessionStartInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        let input: Self =
+            serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)?;
+        super::validate_native_event(
+            &input.hook_event_name,
+            super::HookEvent::SessionStart,
+            "agentSpawn",
+        )?;
+        Ok(input)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }

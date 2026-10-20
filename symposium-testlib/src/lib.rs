@@ -76,7 +76,7 @@ pub fn is_agent_mode() -> bool {
 }
 
 /// A single step in a hook scenario. Used by simulation mode to drive
-/// `execute_hook`; ignored in agent mode (the real agent produces its own hooks).
+/// `try_execute_hook`; ignored in agent mode (the real agent produces its own hooks).
 pub enum HookStep {
     SessionStart,
     UserPromptSubmit {
@@ -303,13 +303,13 @@ impl TestContext {
         payload: &impl Serialize,
     ) -> anyhow::Result<hook::HookResponse> {
         let input = serde_json::to_string(payload)?;
-        hook::execute_hook(&self.sym, agent, event, &input).await
+        Ok(hook::try_execute_hook(&self.sym, agent, event, &input).await?)
     }
 
     /// Submit a scenario as a sequence of hook steps.
     ///
     /// In simulation mode (default): converts each step to the agent wire format,
-    /// calls `execute_hook`, and collects results.
+    /// calls `try_execute_hook`, and collects results.
     ///
     /// In agent mode (`SYMPOSIUM_TEST_AGENT=claude-sdk`): sends the prompt to a real
     /// agent via the Python harness and reads the JSONL hook trace file.
@@ -390,10 +390,10 @@ impl TestContext {
 
             let handler = symposium::hook_schema::agent_event(agent, event)
                 .ok_or_else(|| anyhow::anyhow!("agent {agent:?} does not support {event:?}"))?;
-            let agent_input = handler.translate_input(&sym_input);
-            let input_str = agent_input.to_string()?;
+            let agent_input = handler.try_translate_input(&sym_input)?;
+            let input_str = agent_input.try_to_string()?;
 
-            let output_bytes = hook::execute_hook(&self.sym, agent, event, &input_str)
+            let output_bytes = hook::try_execute_hook(&self.sym, agent, event, &input_str)
                 .await?
                 .stdout;
 

@@ -34,10 +34,19 @@ already installed by the embedding application is a reported conflict, rather
 than a panic. The log file is opened before subscriber installation; a conflict
 can therefore leave an empty log file.
 
-The binary reports construction, current-directory, and logging failures on
-stderr and returns a failure exit status. Startup diagnostics never use hook
-stdout. Keep the report layer disabled for ordinary hooks, because agents own
-their stdout protocol.
+The canonical startup path also checks warning writes and flushes. If stderr
+cannot receive a malformed-config or unknown-log-level warning, it returns a
+typed warning-delivery error rather than panicking or silently selecting defaults.
+The legacy infallible APIs retain best-effort warnings until their removal boundary.
+
+For a recognized, supported `PreToolUse`, construction, current-directory, or
+logging failure produces a fixed native denial before the diagnostic is attempted.
+Kiro denies through exit 2; JSON-based agents receive their own denial format and
+exit 0 so they read it. Other startup failures return a failure exit status.
+Diagnostic prose stays on stderr; hook stdout carries only the native protocol.
+Keep the report layer disabled for ordinary hooks, because agents own stdout.
+If response delivery itself fails, a nonzero status cannot prove that an agent
+which ignores exit codes received the denial.
 
 The infallible `Symposium::from_environment`, `Symposium::from_dir`,
 `Symposium::init_logging`, and `SymposiumDirs::from_environment` signatures are

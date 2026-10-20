@@ -234,7 +234,16 @@ or package version was changed.
 
 ### Step 3: Validate agent config mutations and safe diagnostics
 
-Status: completed locally; hosted checkpoint pending.
+Status: completed locally; hosted correction checkpoint pending.
+
+The first hosted run at `fe10ede6` found four Linux fixture failures: the new
+diagnostic fixtures used lowercase `symposium.toml` instead of the documented
+`Symposium.toml`. Case-insensitive macOS/Windows filesystems hid the mistake.
+Checkpoint `40c68e92` corrects that filename; all eight diagnostic tests,
+formatting and diff checks pass against an isolated Step 3 checkout. The
+correction passes hosted tests on Ubuntu, macOS, Windows and musl. GitHub could
+not allocate the separate macOS compilation runner; that infrastructure failure
+is being retried at the same commit before the full hosted checkpoint is closed.
 
 Validate JSON shapes at the shared boundary and each agent-specific nested
 container before editing. Preserve unknown valid settings and original bytes on
@@ -261,6 +270,8 @@ Original structured error sources remain available to library callers.
 
 ### Step 4: Make hook transport failures explicit
 
+Status: completed locally; checkpoint and hosted validation pending.
+
 Use typed parse, event/input mismatch, translation, serialization, and stream
 errors through the hook path. Handle stdin/stdout/stderr failures deliberately,
 including plugin-input writes. Do not turn a failed deny path into an allow.
@@ -270,8 +281,32 @@ identity, format routing, and existing per-agent deny/rewrite/exit behavior in
 `tests/hook_stdout.rs`, `hook_decisions.rs`, `hook_context.rs`, and related suites.
 Update hook-flow docs and active RFDs only where the implementation intersects.
 
-- [ ] Hook errors preserve sources and protocol-owned stdout remains clean.
-- [ ] Pure decisions and ordered I/O remain distinct and observable.
+- [x] Hook errors preserve sources and protocol-owned stdout remains clean.
+- [x] Pure decisions and ordered I/O remain distinct and observable.
+
+Observed: formatting, locked workspace/all-target compilation, warnings-denied
+Clippy, the full local workspace suite, orphan checking, rendered mdbook and
+diff checks pass. The native-schema table covers 22 supported agent/event pairs;
+external-style implementations still compile with only the original required
+trait methods and without serialization supertraits.
+
+Typed `try_*` schema methods and `try_execute_hook` are canonical; supported old
+signatures remain adapters until root 0.6. Native decision literals and valid
+extension fields are preserved, while unknown literals, mismatched events and
+malformed canonical envelopes return safe typed failures. Native JSON fallback
+now carries denial semantics, so a later hook cannot overwrite a denial.
+
+Real process regressions prove native permission denials after parse, command
+transport and startup failures, including agents that ignore nonzero exits.
+Stream writers check both writes and flushes, and preserve a blocking exit 2
+when stderr delivery fails. Concurrent plugin input/output collection removes a
+reproduced pipe deadlock; the bounded regression exchanges 2 MiB on each stream.
+Plugin execution order and context accumulation remain sequential.
+
+A warning-delivery experiment disproved the assumption that a closed descriptor
+must produce an I/O error: Rust intentionally treats that standard-stream case
+as a successful no-op. A real broken pipe instead verifies typed warning failure
+before state writes. Traces describe prepared responses, not delivery receipts.
 
 ### Step 5: Validate registry and installation alternatives once
 
