@@ -5,12 +5,138 @@
 //! directly. Local path dependencies short-circuit through the workspace's
 //! path overrides and never touch the registry.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::ExitStatus;
 
 use crate::pm::WorkspaceCrate;
-use anyhow::Result;
 
 mod probe;
+
+/// A crate source could not be resolved or fetched.
+///
+/// Display messages omit input and parser/subprocess output. Operation details
+/// and concrete sources remain available for structured inspection.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum CrateSourceError {
+    /// The blocking probe task did not complete.
+    #[error("cargo probe task failed")]
+    JoinProbe {
+        /// The task failure.
+        #[source]
+        source: tokio::task::JoinError,
+    },
+    /// The temporary probe directory could not be created.
+    #[error("failed to create the temporary cargo probe directory")]
+    CreateProbe {
+        /// The filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A file or directory needed by the probe could not be written.
+    #[error("failed to {operation} for the cargo probe")]
+    WriteProbe {
+        /// The attempted operation, selected by the implementation.
+        operation: &'static str,
+        /// The affected path.
+        path: PathBuf,
+        /// The filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Cargo's home directory could not be located.
+    #[error("failed to locate cargo home")]
+    LocateCargoHome {
+        /// The directory-resolution failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The configured Cargo executable could not be invoked.
+    #[error("failed to invoke cargo fetch")]
+    InvokeCargo {
+        /// The configured executable, preserved without lossy conversion.
+        executable: OsString,
+        /// The process-creation failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Cargo ran but failed to fetch the dependency.
+    #[error("cargo fetch failed ({status})")]
+    CargoFetchFailed {
+        /// The requested crate.
+        crate_name: String,
+        /// The requested version requirement.
+        version_req: String,
+        /// Cargo's unsuccessful exit status.
+        status: ExitStatus,
+    },
+    /// Cargo metadata could not be produced or decoded.
+    #[error("failed to read cargo metadata")]
+    CargoMetadata {
+        /// The concrete Cargo metadata failure.
+        #[source]
+        source: cargo_metadata::Error,
+    },
+    /// The manifest path returned by Cargo had no parent directory.
+    #[error("cargo metadata returned a manifest path without a parent")]
+    ManifestWithoutParent {
+        /// The manifest path returned by Cargo.
+        path: PathBuf,
+    },
+    /// The probe's lockfile could not be read.
+    #[error("failed to read the cargo probe lockfile")]
+    ReadLockfile {
+        /// The affected lockfile.
+        path: PathBuf,
+        /// The filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The probe's lockfile was malformed.
+    #[error("failed to parse the cargo probe lockfile")]
+    ParseLockfile {
+        /// The affected lockfile.
+        path: PathBuf,
+        /// The parser failure, which may contain source text.
+        #[source]
+        source: toml::de::Error,
+    },
+    /// Neither Cargo metadata nor the lockfile identified the requested crate.
+    #[error("requested crate was absent from cargo metadata and the probe lockfile")]
+    CrateNotLocked {
+        /// The requested crate.
+        crate_name: String,
+    },
+    /// Cargo's extracted-registry directory could not be read.
+    #[error("failed to read cargo registry sources")]
+    ReadRegistrySources {
+        /// The affected registry-source directory.
+        path: PathBuf,
+        /// The filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Reading an extracted-registry directory entry failed.
+    #[error("failed to read a cargo registry source entry")]
+    ReadRegistryEntry {
+        /// The registry-source directory being traversed.
+        path: PathBuf,
+        /// The filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The locked crate had no completed extraction in Cargo's source cache.
+    #[error("locked crate source was not found in the cargo registry cache")]
+    SourceNotFound {
+        /// The locked crate name.
+        name: String,
+        /// The locked crate version.
+        version: String,
+        /// The registry-source directory searched.
+        registry_root: PathBuf,
+    },
+}
 
 /// Normalize a crate name for hyphen/underscore-insensitive comparison.
 ///
@@ -65,7 +191,7 @@ impl<'a> RustCrateFetch<'a> {
     /// 2. Otherwise, run `cargo fetch` in a temporary dummy package to
     ///    populate cargo's registry cache, then read `cargo metadata` to get
     ///    the extracted source path under `~/.cargo/registry/src/`.
-    pub async fn fetch(self) -> Result<FetchResult> {
+    pub async fn fetch(self) -> Result<FetchResult, CrateSourceError> {
         // Serve a workspace dependency from its already-extracted source.
         if self.version_spec.is_none() {
             let normalized = normalize_crate_name(&self.crate_name);

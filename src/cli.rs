@@ -6,11 +6,13 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use std::io::Write;
+
 use clap::{Parser, Subcommand};
+use thiserror::Error;
 
 use crate::config::Symposium;
-use crate::crate_command::{self, DispatchResult};
+use crate::crate_command;
 use crate::discovery;
 use crate::hook;
 use crate::init::{self, InitOpts};
@@ -19,7 +21,7 @@ use crate::plugins::Audience;
 use crate::search_command;
 use crate::self_update;
 use crate::status_command;
-use crate::subcommand_dispatch::dispatch_external;
+use crate::subcommand_dispatch::try_dispatch_external;
 use crate::sync;
 use crate::use_command;
 
@@ -205,29 +207,83 @@ pub enum PluginCommand {
     },
 }
 
-/// Run a parsed CLI command.
+/// Typed initialization failures exposed through [`CliError`].
+pub use crate::init::InitError;
+
+/// A command failed before completing its requested operation.
 ///
-/// `cwd` is the working directory for commands that need it (sync, start, crate).
-/// The binary passes `std::env::current_dir()`; tests pass the fixture workspace root.
-/// `update` is the global `--update` level, threaded into `sync` so `--update
-/// fetch` forces a refresh of git skill sources as well as plugin repos.
-pub async fn run(
+/// Display is safe for diagnostics; source chains may contain private inputs.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum CliError {
+    /// Invalid registry alternatives.
+    #[error(transparent)]
+    Registry(#[from] crate::config::RegistryError),
+    /// Initialization could not complete.
+    #[error(transparent)]
+    Init(#[from] InitError),
+    /// Consent could not be recorded or requested.
+    #[error(transparent)]
+    Consent(#[from] discovery::ConsentError),
+    /// Synchronization failed.
+    #[error(transparent)]
+    Sync(#[from] sync::SyncError),
+    /// Plugin enablement failed.
+    #[error(transparent)]
+    Use(#[from] use_command::UseError),
+    /// Workspace status could not be obtained.
+    #[error(transparent)]
+    Status(#[from] status_command::StatusError),
+    /// An update could not complete.
+    #[error(transparent)]
+    Update(#[from] self_update::UpdateError),
+    /// Crate source lookup failed.
+    #[error(transparent)]
+    Crate(#[from] crate_command::CrateError),
+    /// A plugin subcommand could not execute.
+    #[error(transparent)]
+    Subcommand(#[from] crate::subcommand_dispatch::SubcommandError),
+    /// The plugin child completed unsuccessfully.
+    #[error("subcommand exited with status: {code}")]
+    SubcommandExit { code: u8 },
+    /// Configuration persistence failed.
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    /// Protocol or command output could not be delivered.
+    #[error("failed to deliver command output")]
+    Output {
+        #[source]
+        source: std::io::Error,
+    },
+    /// A telemetry event could not be encoded.
+    #[error("failed to encode telemetry output")]
+    TelemetryOutput {
+        #[source]
+        source: serde_json::Error,
+    },
+    /// This command requires the executable's direct I/O dispatch.
+    #[error("command not supported in library dispatch (use binary)")]
+    ExecutableOnly,
+}
+
+/// Run a parsed CLI command with concrete library error sources.
+///
+/// `cwd` is the working directory for workspace commands; `update` selects
+/// source refresh policy. Hook and plugin management require binary dispatch.
+///
+/// # Errors
+/// Returns [`CliError`] when validation, an operation, or output delivery fails.
+pub async fn try_run(
     sym: &mut Symposium,
     cmd: Commands,
     cwd: &Path,
     out: &Output,
     update: symposium_install::UpdateLevel,
-) -> Result<()> {
+) -> Result<(), CliError> {
     sym.try_registry_instances()?;
-
-    // Periodic update check (skipped for self-update, which always checks).
-    // In the binary, re-exec happens if auto-update = "on" succeeds.
-    // Here in the library we just run the warn check; the binary wraps
-    // this with re-exec logic.
     if !matches!(cmd, Commands::SelfUpdate) {
         self_update::maybe_warn_for_update(sym, out);
     }
-
     match cmd {
         Commands::Init {
             agents,
@@ -239,105 +295,129 @@ pub async fn run(
                 remove_agents,
                 hook_scope,
             };
-            init::init(sym, out, &opts).await
+            init::init(sym, out, &opts).await.map_err(Into::into)
         }
-
         Commands::Sync => {
             let deps = sym.workspace_deps(cwd);
-            // The consent prompt belongs to a human running `cargo agents
-            // sync`; it is inert unless `out` is interactive, and the
-            // hook-triggered auto-sync path calls `sync::sync` directly and
-            // never reaches here at all.
-            discovery::prompt_for_consent(sym, &deps, out).await?;
-            sync::sync(sym, &deps, update).await
+            discovery::try_prompt_for_consent(sym, &deps, out).await?;
+            sync::try_sync(sym, &deps, update).await.map_err(Into::into)
         }
-
-        Commands::Search { query } => search_command::search(sym, &query).await,
-
+        Commands::Search { query } => search_command::try_search(sym, &query)
+            .await
+            .map_err(Into::into),
         Commands::Use {
             name,
             global,
             remove,
-        } => {
-            if remove {
-                use_command::remove_plugin(sym, cwd, &name, global, update).await
-            } else {
-                use_command::use_plugin(sym, cwd, &name, global, update).await
-            }
+        } => if remove {
+            use_command::try_remove_plugin(sym, cwd, &name, global, update).await
+        } else {
+            use_command::try_use_plugin(sym, cwd, &name, global, update).await
         }
-
-        Commands::Status => status_command::status(sym, cwd).await,
-
-        Commands::SelfUpdate => self_update::self_update(sym, out),
-
+        .map_err(Into::into),
+        Commands::Status => status_command::try_status(sym, cwd)
+            .await
+            .map_err(Into::into),
+        Commands::SelfUpdate => self_update::try_self_update(sym, out).map_err(Into::into),
         Commands::CrateInfo { name, version } => {
-            match crate_command::dispatch_crate(sym, &name, version.as_deref(), cwd).await {
-                DispatchResult::Ok(output) => {
-                    print!("{output}");
-                    Ok(())
-                }
-                DispatchResult::Err(e) => {
-                    anyhow::bail!("{e}");
-                }
-            }
+            let output =
+                crate_command::try_dispatch_crate(sym, &name, version.as_deref(), cwd).await?;
+            write_command_output(&mut std::io::stdout(), output.as_bytes())
         }
-
         Commands::Telemetry { command } => {
             match command.unwrap_or(TelemetryCommand::Status) {
                 TelemetryCommand::Status => {
-                    print!(
-                        "{}",
-                        crate::telemetry::status_text(
-                            sym.config_dir(),
-                            sym.config.telemetry.enabled
-                        )
+                    let text = crate::telemetry::status_text(
+                        sym.config_dir(),
+                        sym.config.telemetry.enabled,
                     );
+                    write_command_output(&mut std::io::stdout(), text.as_bytes())?;
                 }
                 TelemetryCommand::Enable => {
                     sym.config.telemetry.enabled = true;
-                    sym.save_config()?;
+                    sym.try_save_config()?;
                     out.println(
                         "Telemetry enabled. Events are stored locally under the telemetry \
-                         directory and are never uploaded automatically — review them with \
-                         `cargo agents telemetry show`.",
+                        directory and are never uploaded automatically — review them with \
+                        `cargo agents telemetry show`.",
                     );
                 }
                 TelemetryCommand::Disable => {
                     sym.config.telemetry.enabled = false;
-                    sym.save_config()?;
+                    sym.try_save_config()?;
                     out.println("Telemetry disabled.");
                 }
                 TelemetryCommand::Show { count } => {
                     let events = crate::telemetry::recent_events(sym.config_dir(), count);
                     if events.is_empty() {
                         out.println("No telemetry events recorded.");
-                    } else {
-                        for event in &events {
-                            println!("{}", serde_json::to_string(event)?);
-                        }
+                    }
+                    for event in &events {
+                        let mut line = serde_json::to_vec(event)
+                            .map_err(|source| CliError::TelemetryOutput { source })?;
+                        line.push(b'\n');
+                        write_command_output(&mut std::io::stdout(), &line)?;
                     }
                 }
             }
             Ok(())
         }
-
         Commands::External(argv) => {
-            let result = dispatch_external(sym, cwd, argv).await?;
+            let result = try_dispatch_external(sym, cwd, argv).await?;
             if !result.stdout.is_empty() {
                 out.println(String::from_utf8_lossy(&result.stdout).trim_end());
             }
-            if !result.stderr.is_empty() {
-                eprint!("{}", String::from_utf8_lossy(&result.stderr));
-            }
+            write_command_output(&mut std::io::stderr(), &result.stderr)?;
             match result.exit_code {
                 0 => Ok(()),
-                code => bail!("subcommand exited with status: {code}"),
+                code => Err(CliError::SubcommandExit { code }),
             }
         }
-        // These commands can't easily be extracted since they do I/O
-        // (stdin/stdout for hooks). The binary handles them directly.
-        Commands::Hook { .. } | Commands::Plugin { .. } => {
-            anyhow::bail!("command not supported in library dispatch (use binary)")
+        Commands::Hook { .. } | Commands::Plugin { .. } => Err(CliError::ExecutableOnly),
+    }
+}
+
+fn write_command_output(writer: &mut impl Write, bytes: &[u8]) -> Result<(), CliError> {
+    writer
+        .write_all(bytes)
+        .and_then(|()| writer.flush())
+        .map_err(|source| CliError::Output { source })
+}
+
+/// Compatible root-0.5 dispatch adapter for [`try_run`], retained until root 0.6.
+///
+/// # Errors
+/// Returns the original typed [`CliError`] through the legacy error container.
+pub async fn run(
+    sym: &mut Symposium,
+    cmd: Commands,
+    cwd: &Path,
+    out: &Output,
+    update: symposium_install::UpdateLevel,
+) -> anyhow::Result<()> {
+    Ok(try_run(sym, cmd, cwd, out, update).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn output_delivery_preserves_source_without_rendering_it() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "CLI_PRIVATE_CANARY",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
+        let error = write_command_output(&mut Broken, b"result").unwrap_err();
+        assert!(!error.to_string().contains("CLI_PRIVATE_CANARY"));
+        use std::error::Error;
+        assert_eq!(error.source().unwrap().to_string(), "CLI_PRIVATE_CANARY");
     }
 }

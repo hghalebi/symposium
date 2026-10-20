@@ -361,6 +361,9 @@ use checked resolution, including help, search, consent, sync and hook paths.
 
 ### Step 6: Complete typed library and SDK error boundaries
 
+Status: completed locally. Step 5 checkpoint: `c2db89b`; exact-commit hosted
+qualification remains separate, including macOS runner availability.
+
 Inventory `anyhow` across the root library, installer, SDK and test tooling; move
 production library/domain failures to cohesive typed errors. Keep `anyhow` only
 at executable assembly boundaries. Preserve structured sources and documented
@@ -375,8 +378,38 @@ Tests: failing metadata emitters, runtime construction failure, library source
 chains, SDK example/consumer compilation, standalone default and `clap` features,
 and existing plugin protocol fixtures. State the public migration/version choice.
 
-- [ ] Published library APIs have an explicit compatible migration or version boundary.
-- [ ] Errors remain typed below application assembly; failures are not silently lost.
+- [x] Published library APIs have an explicit compatible migration or version boundary.
+- [x] Errors remain typed below application assembly; failures are not silently lost.
+
+Observed: formatting, locked workspace/all-target compilation, strict Clippy,
+1,255 local tests, orphan checking, rendered mdbook and diff checks pass. All
+12 SDK/installer minimal and `clap` compilation, Clippy and library-test gates
+also pass. One crates.io test is explicitly opt-in; real-agent tests remain off.
+External fixtures compile unchanged hook handlers and package managers, including
+borrowed, non-Send SDK handlers and errors without unnecessary lifetime bounds.
+
+Canonical errors preserve concrete parser, filesystem, transport and process
+sources. Rare large source variants are boxed without erasing their types.
+SDK `HookHandler<E = anyhow::Error>` retains the exact legacy generic arity;
+`try_run` and typed dispatch express plugin-defined error variation without
+requiring Send, Sync, Clone or static ownership. SDK watch emission now reports
+serialization, write and flush failures. A denial with no context is delivered.
+
+Package and skill collection retain both valid contributions and completion
+evidence. Legacy package managers preserve their contributions but cannot
+certify completeness until they implement the outcome API. Incomplete scans
+cannot authorize stale deletion. Actual filesystem regressions preserve
+installed skills after dependency, registry, manifest and skill failures.
+Selected command diagnostics remain actionable without echoing raw arguments;
+single-file validation reports success without printing manifest contents.
+
+Prediction versus observation: valid public consumers still compile and source
+chains remain inspectable. A new test initially assumed an unboxed node in a
+boxed recursive error chain; the concrete SemVer cause was present and the test
+now checks that actual shape. The integrated run also found a reporting adapter
+that bypassed user-facing warning events; the repair retains typed failure
+content and restores the warning. Actual OS runtime-allocation failure is not
+fault-injected; entered-runtime rejection and I/O failures are exercised.
 
 ### Step 7: Finish enum, visibility, and production-path alignment
 

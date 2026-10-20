@@ -5,17 +5,19 @@
 //!   | cargo run --example block_destructive
 //! ```
 
+use std::convert::Infallible;
+use std::io::Write as _;
 use std::process::ExitCode;
 
-use symposium_sdk::hook::{HookHandler, PreToolUseInput, PreToolUseOutput, run};
+use symposium_sdk::hook::{HookHandler, PreToolUseInput, PreToolUseOutput, try_run};
 
 /// Fragments that are never worth running, whatever the surrounding command.
 const DESTRUCTIVE: &[&str] = &["rm -rf /", "mkfs", "dd if=", ":(){ :|:& };:"];
 
 struct BlockDestructive;
 
-impl HookHandler for BlockDestructive {
-    async fn pre_tool_use(&self, event: &PreToolUseInput) -> anyhow::Result<PreToolUseOutput> {
+impl HookHandler<Infallible> for BlockDestructive {
+    async fn pre_tool_use(&self, event: &PreToolUseInput) -> Result<PreToolUseOutput, Infallible> {
         if event.tool_name != "Bash" {
             return Ok(PreToolUseOutput::default());
         }
@@ -36,5 +38,13 @@ impl HookHandler for BlockDestructive {
 }
 
 fn main() -> ExitCode {
-    run(BlockDestructive)
+    match try_run(BlockDestructive) {
+        Ok(exit) => exit,
+        Err(error) => {
+            if writeln!(std::io::stderr().lock(), "symposium-hook: {error}").is_err() {
+                return ExitCode::FAILURE;
+            }
+            ExitCode::FAILURE
+        }
+    }
 }

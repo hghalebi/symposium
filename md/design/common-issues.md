@@ -114,3 +114,29 @@ handlers individually, preserving other handlers in the same matcher group,
 unknown settings, and unknown events. A dedicated Copilot or Kiro file is deleted
 only when it contains generated defaults and no remaining foreign content;
 otherwise the edited file remains. This also makes repeated removal a no-op.
+
+
+## Typed errors and safe diagnostics carry different information
+
+A normal error message identifies an operation; its attached source keeps the
+original I/O or parser failure for structured inspection. Do not use alternate
+formatting (`{error:#}`) to print an entire chain at the CLI: TOML errors may
+contain a full input line, and request errors may contain private URLs.
+Use a typed `try_*` entry point and inspect its variant or `Error::source` in a
+test. Legacy adapters keep the old published signature through the documented
+root 0.6, SDK 0.2 or installer 0.2 boundary.
+
+Error wrappers and boxed recursive causes can have different source-chain
+shapes. Assert the concrete cause and intended context rather than assuming
+an arbitrary chain depth. Keep
+a private canary in the actual rejected input and verify that the top-level
+diagnostic excludes it while the source remains inspectable.
+
+## A failed scan does not prove a skill was removed
+
+Synchronization may continue with successfully loaded plugins when another
+source fails. That partial set cannot authorize deletion of previously installed
+skills. Registry, dependency, plugin and skill collection failures must reach
+the cleanup decision. Recovery is to repair the reported source, rerun sync,
+and check both the installed content and removal report. Do not delete caches
+or consent records to make an incomplete scan appear empty.

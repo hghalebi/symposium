@@ -7,32 +7,47 @@
 //! # Hooks
 //!
 //! ```no_run
+//! use std::convert::Infallible;
+//! use std::io::Write as _;
 //! use std::process::ExitCode;
-//! use symposium_sdk::hook::{HookHandler, PreToolUseInput, PreToolUseOutput, run};
+//! use symposium_sdk::hook::{HookHandler, PreToolUseInput, PreToolUseOutput, try_run};
 //!
 //! struct MyHook;
 //!
-//! impl HookHandler for MyHook {
+//! impl HookHandler<Infallible> for MyHook {
 //!     async fn pre_tool_use(
 //!         &self,
 //!         _event: &PreToolUseInput,
-//!     ) -> symposium_sdk::hook::anyhow::Result<PreToolUseOutput> {
+//!     ) -> Result<PreToolUseOutput, Infallible> {
 //!         Ok(PreToolUseOutput::default())
 //!     }
 //! }
 //!
 //! fn main() -> ExitCode {
-//!     run(MyHook)
+//!     match try_run(MyHook) {
+//!         Ok(exit) => exit,
+//!         Err(error) => {
+//!             if writeln!(std::io::stderr().lock(), "symposium-hook: {error}").is_err() {
+//!                 return ExitCode::FAILURE;
+//!             }
+//!             ExitCode::FAILURE
+//!         }
+//!     }
 //! }
 //! ```
+//!
+//! [`hook::try_run`] preserves typed handler and harness errors. Its `Display`
+//! messages omit input and error-source contents; inspect sources deliberately
+//! because they may contain private input. Existing handlers using the default
+//! `anyhow` error and [`hook::run`] remain supported until SDK 0.2.
 //!
 //! # Custom predicates
 //!
 //! A custom predicate binary receives its argument via CLI args and signals
 //! pass/fail via exit code. It may also stream [`CustomPredicateEvent`]s on
 //! stdout to describe the inputs whose changes should invalidate its cached
-//! result. Prefer the [`env::var`] and [`fs::read_to_string`] helpers, which
-//! report their inputs automatically.
+//! result. Prefer the [`env::try_var`] and [`fs::read_to_string`] helpers, which
+//! report their inputs automatically and propagate failures to report them.
 //!
 //! [`CustomPredicateEvent`]: predicate::CustomPredicateEvent
 //!

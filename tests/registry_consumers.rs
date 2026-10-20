@@ -79,7 +79,7 @@ async fn invalid_sources_prevent_enablement_and_removal_config_writes() {
     let original_used = sym.config.plugins.used.clone();
 
     let error = symposium::discovery::apply_consent(&mut sym, &["other".into()], &[]).unwrap_err();
-    assert!(error.downcast_ref::<RegistryError>().is_some());
+    assert!(error.chain().any(|cause| cause.is::<RegistryError>()));
     assert!(sym.config.plugins.auto_enable.is_empty());
     let error = symposium::use_command::use_plugin(
         &mut sym,
@@ -90,7 +90,7 @@ async fn invalid_sources_prevent_enablement_and_removal_config_writes() {
     )
     .await
     .unwrap_err();
-    assert!(error.downcast_ref::<RegistryError>().is_some());
+    assert!(error.chain().any(|cause| cause.is::<RegistryError>()));
     let error = symposium::use_command::remove_plugin(
         &mut sym,
         temp.path(),
@@ -100,7 +100,7 @@ async fn invalid_sources_prevent_enablement_and_removal_config_writes() {
     )
     .await
     .unwrap_err();
-    assert!(error.downcast_ref::<RegistryError>().is_some());
+    assert!(error.chain().any(|cause| cause.is::<RegistryError>()));
     assert_eq!(sym.config.plugins.used, original_used);
     assert_eq!(std::fs::read(config_path).unwrap(), original);
 }
@@ -117,11 +117,11 @@ async fn operational_dispatch_refuses_invalid_sources_before_resolving_commands(
     .await
     .err()
     .expect("invalid source must refuse dispatch");
-    assert!(error.downcast_ref::<RegistryError>().is_some());
+    assert!(error.chain().any(|cause| cause.is::<RegistryError>()));
     assert!(matches!(
         symposium::crate_command::dispatch_crate(&sym, "anything", None, temp.path()).await,
         symposium::crate_command::DispatchResult::Err(message)
-            if message.contains("ambiguous") && !message.contains("synthetic-secret-canary")
+            if message.contains("registr") && !message.contains("synthetic-secret-canary")
     ));
 }
 

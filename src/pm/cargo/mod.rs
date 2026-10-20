@@ -22,7 +22,8 @@ pub use workspace::{
 };
 
 use super::{
-    ANY_VERSION, CARGO_PM, FetchedPackage, PackageId, PackageManager, PluginInfo, UnvalidatedPlugin,
+    ANY_VERSION, CARGO_PM, FetchedPackage, PackageId, PackageManager, PackageManagerError,
+    PluginCollection, PluginInfo, UnvalidatedPlugin,
 };
 
 /// How many crates.io hits a search returns — enough to surface the crate a
@@ -52,42 +53,86 @@ impl CargoPm {
     /// Build the [`UnvalidatedPlugin`] for an already-fetched crate, layering its
     /// manifest sources: `[package.metadata.symposium]` in `Cargo.toml` and a
     /// `Symposium.toml` at the root: via
-    /// [`merge_crate_manifest`](crate::plugins::merge_crate_manifest).
+    /// [`merge_crate_manifest_outcome`](crate::plugins::merge_crate_manifest_outcome).
     ///
     /// A crate with no manifest sources still yields a plugin: an empty
     /// manifest, which validation turns into a plugin whose only content is the
     /// default `skills/` group.
-    fn plugin_from_fetched(&self, fetched: FetchedPackage) -> UnvalidatedPlugin {
+    /// Invalid layers are reported independently while valid layers survive.
+    fn plugin_from_fetched(&self, fetched: FetchedPackage) -> PluginCollection<UnvalidatedPlugin> {
+        let source = match std::fs::metadata(&fetched.root) {
+            Ok(metadata) if metadata.is_dir() => None,
+            Ok(_) => Some(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "package source must be a directory",
+            )),
+            Err(source) => Some(source),
+        };
+        if let Some(source) = source {
+            return PluginCollection::incomplete(
+                Vec::new(),
+                vec![PackageManagerError::PackageSource {
+                    path: fetched.root,
+                    source,
+                }],
+            );
+        }
         let name = &fetched.id.name;
-        let metadata = crate::crate_metadata::symposium_metadata(&fetched.root.join("Cargo.toml"))
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    crate_name = %name,
-                    error = %e,
-                    "failed to read crate Cargo.toml; ignoring [package.metadata.symposium]"
-                );
-                None
-            });
-
-        let manifest_path = fetched.root.join(crate::pm::layout::MANIFEST_FILE);
-        let file = if manifest_path.is_file() {
-            match std::fs::read_to_string(&manifest_path) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    tracing::warn!(
-                        path = %manifest_path.display(),
-                        error = %e,
-                        "failed to read crate Symposium.toml"
-                    );
+        let mut errors = Vec::new();
+        let metadata =
+            match crate::crate_metadata::symposium_metadata(&fetched.root.join("Cargo.toml")) {
+                Ok(metadata) => metadata,
+                // Source-only fixtures and non-Cargo packages can still embed skills.
+                Err(crate::crate_metadata::MetadataError::ReadManifest { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
                     None
                 }
+                Err(source) => {
+                    errors.push(PackageManagerError::PluginMetadata {
+                        id: fetched.id.clone(),
+                        source: Box::new(source),
+                    });
+                    None
+                }
+            };
+
+        let manifest_path = fetched.root.join(crate::pm::layout::MANIFEST_FILE);
+        let file = match std::fs::read_to_string(&manifest_path) {
+            Ok(content) => Some(content),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => {
+                errors.push(PackageManagerError::PluginLoad {
+                    id: fetched.id.clone(),
+                    source: Box::new(crate::plugins::PluginLoadError::Read {
+                        path: manifest_path,
+                        source,
+                    }),
+                });
+                None
             }
-        } else {
-            None
         };
 
-        let manifest = crate::plugins::merge_crate_manifest(metadata, file.as_deref(), name);
-        UnvalidatedPlugin::new(fetched.id, fetched.root, manifest)
+        let (manifest, layer_errors) = crate::plugins::merge_crate_manifest_outcome(
+            metadata,
+            file.as_deref(),
+            name,
+            &fetched.root,
+        );
+        errors.extend(
+            layer_errors
+                .into_iter()
+                .map(|source| PackageManagerError::PluginLoad {
+                    id: fetched.id.clone(),
+                    source: Box::new(source),
+                }),
+        );
+        let plugins = vec![UnvalidatedPlugin::new(fetched.id, fetched.root, manifest)];
+        if errors.is_empty() {
+            PluginCollection::complete(plugins)
+        } else {
+            PluginCollection::incomplete(plugins, errors)
+        }
     }
 }
 
@@ -99,11 +144,12 @@ fn embedded_plugin_kind(dir: &std::path::Path) -> Option<&'static str> {
     if dir.join(crate::pm::layout::MANIFEST_FILE).is_file() {
         return Some("plugin manifest (Symposium.toml)");
     }
-    if matches!(
-        crate::crate_metadata::symposium_metadata(&dir.join("Cargo.toml")),
-        Ok(Some(_))
-    ) {
-        return Some("embedded plugin ([package.metadata.symposium])");
+    match crate::crate_metadata::symposium_metadata(&dir.join("Cargo.toml")) {
+        Ok(Some(_)) => return Some("embedded plugin ([package.metadata.symposium])"),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to inspect crate plugin metadata");
+        }
     }
     contains_skill_md(&dir.join(crate::plugins::CRATE_DEFAULT_SKILLS_PATH))
         .then_some("embedded skills (skills/)")
@@ -116,24 +162,40 @@ fn contains_skill_md(dir: &std::path::Path) -> bool {
 }
 
 fn contains_skill_md_in(dir: &std::path::Path, ancestors: &mut crate::dir_walk::Ancestors) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(source) => {
+            if source.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %dir.display(), error_kind = ?source.kind(), "failed to inspect embedded skills");
+            }
+            return false;
+        }
     };
-    entries.flatten().any(|entry| {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(source) => {
+                tracing::warn!(path = %dir.display(), error_kind = ?source.kind(), "failed to read embedded skill directory entry");
+                continue;
+            }
+        };
         let path = entry.path();
         // `is_dir` follows symlinks, so a linked directory is searched — and
         // can name a directory this walk is already inside.
         if path.is_dir() {
             if !ancestors.enter(&path) {
-                return false;
+                continue;
             }
             let found = contains_skill_md_in(&path, ancestors);
             ancestors.leave();
-            found
-        } else {
-            path.file_name().is_some_and(|f| f == "SKILL.md")
+            if found {
+                return true;
+            }
+        } else if path.file_name().is_some_and(|f| f == "SKILL.md") {
+            return true;
         }
-    })
+    }
+    false
 }
 
 #[async_trait::async_trait]
@@ -159,18 +221,22 @@ impl PackageManager for CargoPm {
             // `fetch` treat it as an explicit `--version` and probe, bypassing
             // the workspace-source shortcut.
             let fetched = match self
-                .fetch(&Self::id_for(&id.name, None), UpdateLevel::None)
+                .try_fetch(&Self::id_for(&id.name, None), UpdateLevel::None)
                 .await
             {
                 Ok(f) => f,
                 Err(e) => {
-                    tracing::debug!(id = %id, error = %e, "cannot serve dependency source from cache; skipping");
+                    tracing::debug!(error = %e, "cannot serve dependency source from cache; skipping");
                     continue;
                 }
             };
             // Only surface dependencies that actually embed plugin content.
             if embedded_plugin_kind(&fetched.root).is_some() {
-                out.push(self.plugin_from_fetched(fetched));
+                let outcome = self.plugin_from_fetched(fetched);
+                for error in outcome.errors {
+                    tracing::warn!(%error, "crate plugin loading was incomplete");
+                }
+                out.extend(outcome.plugins);
             }
         }
         out
@@ -181,14 +247,31 @@ impl PackageManager for CargoPm {
     /// whatever it embeds — any fetchable crate yields at least the default
     /// `skills/` plugin. Fetched cache-only.
     async fn load_plugin(&self, id: &PackageId) -> Vec<UnvalidatedPlugin> {
-        let fetched = match self.fetch(id, UpdateLevel::None).await {
+        let outcome = self.load_plugin_outcome(id).await;
+        for error in outcome.errors {
+            tracing::warn!(%error, "crate plugin loading was incomplete");
+        }
+        outcome.plugins
+    }
+
+    async fn try_load_plugin(
+        &self,
+        id: &PackageId,
+    ) -> std::result::Result<Vec<UnvalidatedPlugin>, PackageManagerError> {
+        self.load_plugin_outcome(id).await.into_result()
+    }
+
+    async fn load_plugin_outcome(&self, id: &PackageId) -> PluginCollection<UnvalidatedPlugin> {
+        if id.pm != CARGO_PM {
+            return PluginCollection::complete(Vec::new());
+        }
+        let fetched = match self.try_fetch(id, UpdateLevel::None).await {
             Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(id = %id, error = %e, "failed to fetch crate for plugin");
-                return Vec::new();
+            Err(error) => {
+                return PluginCollection::incomplete(Vec::new(), vec![error]);
             }
         };
-        vec![self.plugin_from_fetched(fetched)]
+        self.plugin_from_fetched(fetched)
     }
 
     /// Search crates.io for crates matching `query`.
@@ -199,15 +282,29 @@ impl PackageManager for CargoPm {
     /// So this lets `cargo agents use <crate>` name a crate the workspace
     /// doesn't depend on; the fetch/load step decides what it contributes.
     async fn search(&self, query: &str) -> Result<Vec<PluginInfo>> {
-        let client = crates_io_api::AsyncClient::new(
-            "symposium (https://github.com/symposium-dev/symposium)",
+        Ok(self.try_search(query).await?)
+    }
+
+    async fn try_search(
+        &self,
+        query: &str,
+    ) -> std::result::Result<Vec<PluginInfo>, PackageManagerError> {
+        let http = reqwest::Client::builder()
+            .user_agent("symposium (https://github.com/symposium-dev/symposium)")
+            .build()
+            .map_err(|source| PackageManagerError::Client { source })?;
+        let client = crates_io_api::AsyncClient::with_http_client(
+            http,
             std::time::Duration::from_millis(1000),
-        )?;
+        );
         let cq = crates_io_api::CratesQuery::builder()
             .search(query)
             .page_size(SEARCH_PAGE_SIZE)
             .build();
-        let page = client.crates(cq).await?;
+        let page = client
+            .crates(cq)
+            .await
+            .map_err(|source| PackageManagerError::SearchCrates { source })?;
         Ok(page
             .crates
             .into_iter()
@@ -218,15 +315,34 @@ impl PackageManager for CargoPm {
             .collect())
     }
 
-    async fn fetch(&self, id: &PackageId, _update: UpdateLevel) -> Result<FetchedPackage> {
-        debug_assert_eq!(id.pm, CARGO_PM);
+    async fn fetch(&self, id: &PackageId, update: UpdateLevel) -> Result<FetchedPackage> {
+        Ok(self.try_fetch(id, update).await?)
+    }
+
+    async fn try_fetch(
+        &self,
+        id: &PackageId,
+        _update: UpdateLevel,
+    ) -> std::result::Result<FetchedPackage, PackageManagerError> {
+        if id.pm != CARGO_PM {
+            return Err(PackageManagerError::WrongManager {
+                expected: CARGO_PM.to_owned(),
+                actual: id.pm.clone(),
+            });
+        }
         // `crates()` drives the lazy `cargo metadata` resolution — the cargo PM
         // owns the call, resolving against its own workspace.
         let mut fetch = RustCrateFetch::new(&id.name, self.workspace.crates());
         if id.version != ANY_VERSION {
             fetch = fetch.version(&id.version);
         }
-        let result = fetch.fetch().await?;
+        let result = fetch
+            .fetch()
+            .await
+            .map_err(|source| PackageManagerError::FetchCrate {
+                id: id.clone(),
+                source: Box::new(source),
+            })?;
         Ok(FetchedPackage {
             id: PackageId::new(CARGO_PM, result.name, result.version),
             root: result.path,
@@ -234,12 +350,44 @@ impl PackageManager for CargoPm {
     }
 
     async fn list_deps(&self) -> Result<Vec<PackageId>> {
+        Ok(self.try_list_deps().await?)
+    }
+
+    async fn try_list_deps(&self) -> std::result::Result<Vec<PackageId>, PackageManagerError> {
         Ok(self
             .workspace
             .crates()
             .iter()
             .map(|c| PackageId::new(CARGO_PM, c.name.clone(), c.version.to_string()))
             .collect())
+    }
+
+    async fn registry_plugins(&self) -> Result<Vec<UnvalidatedPlugin>> {
+        Ok(self.try_registry_plugins().await?)
+    }
+
+    async fn try_registry_plugins(
+        &self,
+    ) -> std::result::Result<Vec<UnvalidatedPlugin>, PackageManagerError> {
+        self.registry_plugins_outcome().await?.into_result()
+    }
+
+    async fn registry_plugins_outcome(
+        &self,
+    ) -> std::result::Result<PluginCollection<UnvalidatedPlugin>, PackageManagerError> {
+        Ok(PluginCollection::complete(Vec::new()))
+    }
+
+    async fn refresh(&self, update: UpdateLevel, force: bool) -> Result<bool> {
+        Ok(self.try_refresh(update, force).await?)
+    }
+
+    async fn try_refresh(
+        &self,
+        _update: UpdateLevel,
+        _force: bool,
+    ) -> std::result::Result<bool, PackageManagerError> {
+        Ok(false)
     }
 }
 
@@ -259,6 +407,234 @@ mod tests {
     fn registry_dep(name: &str, source_dir: PathBuf) -> WorkspaceCrate {
         WorkspaceCrate::new(name.to_string(), semver::Version::new(1, 0, 0), None)
             .with_source_dir(Some(source_dir))
+    }
+
+    #[test]
+    fn missing_or_non_directory_package_sources_are_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing");
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "preserved source bytes").unwrap();
+        let pm = CargoPm::new(Arc::new(WorkspaceDeps::detached()));
+
+        for (root, expected_kind) in [
+            (missing, std::io::ErrorKind::NotFound),
+            (file.clone(), std::io::ErrorKind::NotADirectory),
+        ] {
+            let outcome = pm.plugin_from_fetched(FetchedPackage {
+                id: CargoPm::id_for("example", None),
+                root: root.clone(),
+            });
+            assert!(!outcome.is_complete);
+            assert!(outcome.plugins.is_empty());
+            assert!(matches!(
+                outcome.errors.as_slice(),
+                [PackageManagerError::PackageSource { path, source }]
+                    if *path == root && source.kind() == expected_kind
+            ));
+        }
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "preserved source bytes"
+        );
+    }
+
+    #[test]
+    fn malformed_manifest_layer_preserves_the_other_layer_and_source() {
+        for (cargo, symposium, expected_name, failed_manifest) in [
+            (
+                "[package.metadata.symposium]\nname = 'from-metadata'\n",
+                "name = [PRIVATE_CONTENT_CANARY",
+                "from-metadata",
+                "Symposium.toml",
+            ),
+            (
+                "[package.metadata.symposium]\nname = 42\n",
+                "name = 'from-file'\n",
+                "from-file",
+                "Cargo.toml",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("Cargo.toml"), cargo).unwrap();
+            std::fs::write(tmp.path().join("Symposium.toml"), symposium).unwrap();
+            let pm = CargoPm::new(Arc::new(WorkspaceDeps::detached()));
+
+            let outcome = pm.plugin_from_fetched(FetchedPackage {
+                id: CargoPm::id_for("example", None),
+                root: tmp.path().into(),
+            });
+
+            assert!(!outcome.is_complete);
+            assert_eq!(outcome.plugins.len(), 1);
+            assert_eq!(
+                outcome.plugins[0].manifest.name.as_deref(),
+                Some(expected_name)
+            );
+            assert_eq!(outcome.errors.len(), 1);
+            assert!(matches!(
+                &outcome.errors[0],
+                PackageManagerError::PluginLoad { source, .. }
+                    if matches!(source.as_ref(), crate::plugins::PluginLoadError::Parse { path, source }
+                        if *path == tmp.path().join(failed_manifest) && !source.message().is_empty())
+                        && std::error::Error::source(&outcome.errors[0]).is_some()
+            ));
+            assert!(
+                !outcome.errors[0]
+                    .to_string()
+                    .contains("PRIVATE_CONTENT_CANARY")
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
+                cargo
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("Symposium.toml")).unwrap(),
+                symposium
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_cargo_manifest_preserves_file_layer_and_metadata_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[PRIVATE_CONTENT_CANARY").unwrap();
+        std::fs::write(tmp.path().join("Symposium.toml"), "name = 'from-file'").unwrap();
+        let pm = CargoPm::new(Arc::new(WorkspaceDeps::detached()));
+
+        let outcome = pm.plugin_from_fetched(FetchedPackage {
+            id: CargoPm::id_for("example", None),
+            root: tmp.path().into(),
+        });
+
+        assert!(!outcome.is_complete);
+        assert_eq!(
+            outcome.plugins[0].manifest.name.as_deref(),
+            Some("from-file")
+        );
+        assert!(matches!(
+            outcome.errors.as_slice(),
+            [PackageManagerError::PluginMetadata { source, .. }]
+                if matches!(source.as_ref(), crate::crate_metadata::MetadataError::ParseManifest { path: Some(path), .. }
+                    if *path == tmp.path().join("Cargo.toml"))
+        ));
+        assert!(
+            !outcome.errors[0]
+                .to_string()
+                .contains("PRIVATE_CONTENT_CANARY")
+        );
+    }
+
+    #[test]
+    fn unreadable_manifest_is_incomplete_instead_of_optional_absence() {
+        for failed_manifest in ["Cargo.toml", "Symposium.toml"] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir(tmp.path().join(failed_manifest)).unwrap();
+            let pm = CargoPm::new(Arc::new(WorkspaceDeps::detached()));
+
+            let outcome = pm.plugin_from_fetched(FetchedPackage {
+                id: CargoPm::id_for("example", None),
+                root: tmp.path().into(),
+            });
+
+            assert!(!outcome.is_complete);
+            assert_eq!(outcome.plugins.len(), 1);
+            assert_eq!(outcome.errors.len(), 1);
+            match &outcome.errors[0] {
+                PackageManagerError::PluginMetadata { source, .. } => {
+                    let crate::crate_metadata::MetadataError::ReadManifest { path, source } =
+                        source.as_ref()
+                    else {
+                        panic!("expected manifest read failure");
+                    };
+                    assert_eq!(path, &tmp.path().join("Cargo.toml"));
+                    assert_ne!(source.kind(), std::io::ErrorKind::NotFound);
+                }
+                PackageManagerError::PluginLoad { source, .. } => {
+                    let crate::plugins::PluginLoadError::Read { path, source } = source.as_ref()
+                    else {
+                        panic!("expected plugin manifest read failure");
+                    };
+                    assert_eq!(path, &tmp.path().join("Symposium.toml"));
+                    assert_ne!(source.kind(), std::io::ErrorKind::NotFound);
+                }
+                error => panic!("unexpected failure category: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn optional_manifests_and_valid_layering_are_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pm = CargoPm::new(Arc::new(WorkspaceDeps::detached()));
+        let empty = pm.plugin_from_fetched(FetchedPackage {
+            id: CargoPm::id_for("example", None),
+            root: tmp.path().into(),
+        });
+        assert!(empty.is_complete);
+        assert!(empty.errors.is_empty());
+        assert_eq!(empty.plugins.len(), 1);
+        assert!(empty.plugins[0].manifest.name.is_none());
+
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package.metadata.symposium]\nname = 'base'\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("Symposium.toml"), "name = 'over'").unwrap();
+        let layered = pm.plugin_from_fetched(FetchedPackage {
+            id: CargoPm::id_for("example", None),
+            root: tmp.path().into(),
+        });
+        assert!(layered.is_complete);
+        assert!(layered.errors.is_empty());
+        assert_eq!(layered.plugins[0].manifest.name.as_deref(), Some("over"));
+    }
+
+    #[tokio::test]
+    async fn strict_loading_rejects_partial_content_while_legacy_and_active_loading_keep_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package.metadata.symposium]\nname = 42\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("Symposium.toml"), "name = 'from-file'").unwrap();
+        let pm = CargoPm::new(WorkspaceDeps::fixture(
+            tmp.path().to_path_buf(),
+            vec![path_dep("example", tmp.path().to_path_buf())],
+        ));
+        let id = CargoPm::id_for("example", None);
+
+        let outcome = pm.load_plugin_outcome(&id).await;
+        assert!(!outcome.is_complete);
+        assert_eq!(
+            outcome.plugins[0].manifest.name.as_deref(),
+            Some("from-file")
+        );
+        assert!(matches!(
+            pm.try_load_plugin(&id).await,
+            Err(PackageManagerError::PluginLoad { .. })
+        ));
+        let legacy = pm.load_plugin(&id).await;
+        assert_eq!(legacy[0].manifest.name.as_deref(), Some("from-file"));
+        let active = pm.active_plugins(&[id]).await;
+        assert_eq!(active[0].manifest.name.as_deref(), Some("from-file"));
+    }
+
+    #[tokio::test]
+    async fn foreign_ids_and_cargo_registry_are_complete_empty_results() {
+        let pm = CargoPm::new(Arc::new(WorkspaceDeps::detached()));
+        let foreign = PackageId::new("other", "PRIVATE_CONTENT_CANARY", ANY_VERSION);
+        let outcome = pm.load_plugin_outcome(&foreign).await;
+        assert!(outcome.is_complete);
+        assert!(outcome.plugins.is_empty());
+        assert!(outcome.errors.is_empty());
+        assert!(pm.try_load_plugin(&foreign).await.unwrap().is_empty());
+        let registry = pm.registry_plugins_outcome().await.unwrap();
+        assert!(registry.is_complete);
+        assert!(registry.plugins.is_empty());
+        assert!(registry.errors.is_empty());
     }
 
     #[tokio::test]
@@ -300,5 +676,52 @@ mod tests {
         // The plugin points at the crate source; the default `skills/` group is
         // added by validation, not by the PM.
         assert!(active[0].root.join("skills").is_dir());
+    }
+
+    #[tokio::test]
+    async fn typed_fetch_rejects_wrong_manager_before_source_resolution() {
+        let pm = CargoPm::new(Arc::new(WorkspaceDeps::detached()));
+        let id = PackageId::new("other", "irrelevant", ANY_VERSION);
+
+        assert!(matches!(
+            pm.try_fetch(&id, UpdateLevel::None).await,
+            Err(PackageManagerError::WrongManager { expected, actual })
+                if expected == CARGO_PM && actual == "other"
+        ));
+        let legacy = pm.fetch(&id, UpdateLevel::None).await.unwrap_err();
+        assert!(legacy.downcast_ref::<PackageManagerError>().is_some());
+    }
+
+    #[tokio::test]
+    async fn typed_fetch_uses_workspace_source_without_a_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("crate-source");
+        let pm = CargoPm::new(WorkspaceDeps::fixture(
+            tmp.path().to_path_buf(),
+            vec![path_dep("local_crate", source.clone())],
+        ));
+
+        let fetched = pm
+            .try_fetch(&CargoPm::id_for("local-crate", None), UpdateLevel::None)
+            .await
+            .unwrap();
+        assert_eq!(fetched.id, PackageId::new(CARGO_PM, "local_crate", "1.0.0"));
+        assert_eq!(fetched.root, source);
+        assert_eq!(
+            pm.try_list_deps().await.unwrap(),
+            vec![PackageId::new(CARGO_PM, "local_crate", "1.0.0")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embedded_skill_scan_preserves_cycle_guard_and_finds_nested_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("group/nested")).unwrap();
+        std::fs::write(tmp.path().join("group/nested/SKILL.md"), "").unwrap();
+        std::os::unix::fs::symlink("..", tmp.path().join("group/back")).unwrap();
+
+        assert!(contains_skill_md(tmp.path()));
+        assert!(!contains_skill_md(&tmp.path().join("missing")));
     }
 }

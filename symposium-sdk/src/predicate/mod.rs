@@ -22,8 +22,10 @@ use serde::{Deserialize, Serialize};
 pub mod syntax;
 
 pub use syntax::{
-    BUILTIN_PREDICATE_NAMES, DependsOnList, Predicate, PredicateSet, parse_comma_separated,
-    parse_dep_atom, parse_predicate, validate_custom_predicate_name,
+    BUILTIN_PREDICATE_NAMES, DependsOnList, Predicate, PredicateSet, PredicateSyntaxError,
+    parse_comma_separated, parse_dep_atom, parse_predicate, try_parse_comma_separated,
+    try_parse_dep_atom, try_parse_predicate, try_validate_custom_predicate_name,
+    validate_custom_predicate_name,
 };
 
 /// A record emitted by a custom predicate on stdout. Each event describes an
@@ -94,22 +96,26 @@ impl<'de> Deserialize<'de> for SelectedCrate {
 /// Emits predicate output records to stdout (or any writer) in JSON Lines format.
 ///
 /// Each call to a method like [`selected_crate`](PredicateEmitter::selected_crate)
-/// writes one line to the underlying writer.
+/// writes and flushes one line to the underlying writer.
 ///
 /// # Example
 ///
 /// ```no_run
 /// use symposium_sdk::predicate::PredicateEmitter;
 ///
+/// # fn main() -> std::io::Result<()> {
 /// PredicateEmitter::stdout()
-///     .selected_crate("serde", &semver::Version::new(1, 0, 217)).unwrap()
-///     .selected_crate("tokio", &semver::Version::new(1, 40, 0)).unwrap();
+///     .selected_crate("serde", &semver::Version::new(1, 0, 217))?
+///     .selected_crate("tokio", &semver::Version::new(1, 40, 0))?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct PredicateEmitter<W: Write> {
     writer: W,
 }
 
 impl PredicateEmitter<io::Stdout> {
+    /// Create an emitter that writes dependency records to standard output.
     pub fn stdout() -> Self {
         Self {
             writer: io::stdout(),
@@ -118,15 +124,21 @@ impl PredicateEmitter<io::Stdout> {
 }
 
 impl<W: Write> PredicateEmitter<W> {
+    /// Create an emitter using the supplied writer.
     pub fn new(writer: W) -> Self {
         Self { writer }
     }
 
-    /// Emit a raw [`CustomPredicateEvent`]. Prefer the typed helpers below.
+    /// Serialize, write, and flush one dependency record.
+    ///
+    /// # Errors
+    ///
+    /// Returns serialization, write, or flush failures. Serialization failures,
+    /// including non-Unicode paths, retain their original JSON error as a source.
     pub fn emit(&mut self, event: &CustomPredicateEvent) -> io::Result<&mut Self> {
-        let line = serde_json::to_string(event)
-            .expect("PredicateEmitter record serialization is infallible");
+        let line = serde_json::to_string(event).map_err(io::Error::other)?;
         writeln!(self.writer, "{line}")?;
+        self.writer.flush()?;
         Ok(self)
     }
 
@@ -160,5 +172,76 @@ impl<W: Write> PredicateEmitter<W> {
             crate_name: name.to_string(),
             version: version.clone(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod emitter_tests {
+    use super::*;
+
+    struct FailedWrite;
+    impl Write for FailedWrite {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "rejected record"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn emit_reports_write_failure() {
+        let error = PredicateEmitter::new(FailedWrite)
+            .watch_env("TEST_INPUT")
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    struct FailedFlush;
+    impl Write for FailedFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "unflushed record",
+            ))
+        }
+    }
+
+    #[test]
+    fn emit_reports_flush_failure() {
+        let error = PredicateEmitter::new(FailedFlush)
+            .watch_time(5)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn successful_records_keep_the_json_lines_contract() {
+        let mut bytes = Vec::new();
+        PredicateEmitter::new(&mut bytes)
+            .watch_env("TEST_INPUT")
+            .unwrap()
+            .watch_time(5)
+            .unwrap();
+        assert_eq!(bytes, b"{\"watchEnv\":\"TEST_INPUT\"}\n{\"watchTime\":5}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_path_is_an_error_before_any_protocol_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"input-\xff".to_vec()));
+        let mut bytes = Vec::new();
+        let error = PredicateEmitter::new(&mut bytes)
+            .watch_file(path)
+            .err()
+            .unwrap();
+        assert!(error.get_ref().unwrap().is::<serde_json::Error>());
+        assert!(bytes.is_empty());
     }
 }

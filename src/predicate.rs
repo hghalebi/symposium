@@ -17,15 +17,16 @@ use std::process::Command;
 
 use std::sync::Arc;
 
-use anyhow::Result;
 use symposium_sdk::predicate::CustomPredicateEvent;
-pub use symposium_sdk::predicate::syntax::{
-    DependsOnList, Predicate, PredicateSet, parse_dep_atom, validate_custom_predicate_name,
-};
+pub use symposium_sdk::predicate::syntax::{DependsOnList, Predicate, PredicateSet};
+
+#[cfg(test)]
+use symposium_sdk::predicate::syntax::{parse_dep_atom, validate_custom_predicate_name};
 
 use crate::pm::PackageId;
 use crate::predicate_cache::{
-    CacheEntry, CacheTtl, Fingerprints, PredicateCache, WatchSet, cache_key, now_ms,
+    CacheEntry, CacheTtl, Fingerprints, PredicateCache, PredicateCacheError, WatchSet, cache_key,
+    now_ms,
 };
 
 /// Evaluate a predicate (or a set of them) against a [`PredicateContext`].
@@ -148,7 +149,10 @@ impl<'a> PredicateContext<'a> {
 
     /// Persist the disk cache back to `cache_path`. No-op if this context
     /// was not built with `with_disk_cache` or the cache was not modified.
-    pub fn persist_disk_cache(&mut self, cache_path: &Path) -> Result<()> {
+    pub(crate) fn persist_disk_cache(
+        &mut self,
+        cache_path: &Path,
+    ) -> Result<(), PredicateCacheError> {
         let (Some(current), Some(original)) = (&self.disk_cache, &self.disk_cache_original) else {
             return Ok(());
         };
@@ -507,7 +511,7 @@ mod tests {
     fn parse_rejects_renamed_crate_predicate() {
         let err = parse("crate(serde)").unwrap_err();
         assert!(
-            err.to_string().contains("use `depends-on(serde)` instead"),
+            err.to_string().contains("use `depends-on(...)` instead"),
             "expected migration hint, got: {err}"
         );
     }
@@ -1011,6 +1015,48 @@ mod tests {
     }
 
     // --- Disk cache integration tests ---
+
+    #[test]
+    fn disk_cache_persist_failure_preserves_destination_and_retries() {
+        use std::error::Error;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("cache.json");
+        let mut ctx = PredicateContext::new(&[]).with_disk_cache(&cache_path);
+        let entry = CacheEntry {
+            result: true,
+            fingerprints: Fingerprints::default(),
+            stale_at_ms: None,
+        };
+        Arc::make_mut(ctx.disk_cache.as_mut().unwrap()).put("cache-value-canary", entry.clone());
+
+        std::fs::create_dir(&cache_path).unwrap();
+        let sentinel = cache_path.join("keep.txt");
+        std::fs::write(&sentinel, b"preserve this content").unwrap();
+        let error = ctx.persist_disk_cache(&cache_path).unwrap_err();
+        assert!(matches!(&error, PredicateCacheError::Persist { path, .. } if path == &cache_path));
+        assert!(error.source().is_some());
+        assert!(!error.to_string().contains("cache-value-canary"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve this content");
+        assert!(!Arc::ptr_eq(
+            ctx.disk_cache.as_ref().unwrap(),
+            ctx.disk_cache_original.as_ref().unwrap(),
+        ));
+        drop(error);
+
+        std::fs::remove_file(&sentinel).unwrap();
+        std::fs::remove_dir(&cache_path).unwrap();
+        ctx.persist_disk_cache(&cache_path).unwrap();
+        assert_eq!(
+            PredicateCache::load(&cache_path).get("cache-value-canary"),
+            Some(&entry)
+        );
+        assert!(Arc::ptr_eq(
+            ctx.disk_cache.as_ref().unwrap(),
+            ctx.disk_cache_original.as_ref().unwrap(),
+        ));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     fn ctx_with_disk_cache<'a>(
         deps: &'a [PackageId],

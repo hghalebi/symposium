@@ -67,15 +67,37 @@ pub struct StatusEntry {
     pub state: StatusState,
 }
 
-/// Compute the enablement report for the workspace `deps` points at.
+/// Failure to compute an enablement report.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StatusError {
+    /// Enablement is scoped to a Rust workspace.
+    #[error("not in a Rust workspace")]
+    WorkspaceRequired,
+    /// The complete registry set could not be resolved.
+    #[error("could not resolve configured registries for status")]
+    Registry(#[from] crate::config::RegistryError),
+}
+
+/// Legacy error adapter retained through root 0.6. New callers should use
+/// [`try_workspace_status`].
 pub async fn workspace_status(
     sym: &Symposium,
     deps: &Arc<WorkspaceDeps>,
 ) -> Result<Vec<StatusEntry>> {
-    let ws = deps
-        .load()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("not in a Rust workspace"))?;
+    Ok(try_workspace_status(sym, deps).await?)
+}
+
+/// Compute the enablement report for the workspace `deps` points at.
+///
+/// # Errors
+/// Returns [`StatusError`] when no Rust workspace is available or configured
+/// registry sources cannot be resolved completely.
+pub async fn try_workspace_status(
+    sym: &Symposium,
+    deps: &Arc<WorkspaceDeps>,
+) -> std::result::Result<Vec<StatusEntry>, StatusError> {
+    let ws = deps.load().cloned().ok_or(StatusError::WorkspaceRequired)?;
 
     let mut entries = Vec::new();
 
@@ -204,9 +226,19 @@ fn entry_for(found: &DiscoveredPlugin) -> StatusEntry {
 }
 
 /// The `cargo agents status` entry point.
+/// Legacy error adapter retained through root 0.6. New callers should use [`try_status`].
 pub async fn status(sym: &Symposium, cwd: &Path) -> Result<()> {
+    Ok(try_status(sym, cwd).await?)
+}
+
+/// Report plugin enablement for a workspace.
+///
+/// # Errors
+/// Returns [`StatusError`] when no Rust workspace is available or configured
+/// registry sources cannot be resolved completely.
+pub async fn try_status(sym: &Symposium, cwd: &Path) -> std::result::Result<(), StatusError> {
     let deps = sym.workspace_deps(cwd);
-    let entries = workspace_status(sym, &deps).await?;
+    let entries = try_workspace_status(sym, &deps).await?;
     if entries.is_empty() {
         tracing::info!(
             report = %ReportEvent::Info {
@@ -226,4 +258,22 @@ pub async fn status(sym: &Symposium, cwd: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn detached_status_has_a_typed_workspace_error_and_legacy_adapter() {
+        let temp = tempfile::tempdir().unwrap();
+        let sym = Symposium::try_from_dir(temp.path()).unwrap();
+        let deps = Arc::new(WorkspaceDeps::detached());
+        assert!(matches!(
+            try_workspace_status(&sym, &deps).await,
+            Err(StatusError::WorkspaceRequired)
+        ));
+        let legacy: Result<Vec<StatusEntry>> = workspace_status(&sym, &deps).await;
+        assert!(legacy.unwrap_err().is::<StatusError>());
+    }
 }

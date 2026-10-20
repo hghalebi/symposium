@@ -356,6 +356,15 @@ fn legacy_trait_implementations_keep_their_custom_behavior() {
     assert_eq!(error.to_string(), "legacy hook adapter failed");
     assert_eq!(error.source().unwrap().to_string(), "legacy parser marker");
     assert_eq!(
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .kind(),
+        std::io::ErrorKind::Other
+    );
+    assert_eq!(
         erased
             .try_parse_output(b"ignored")
             .unwrap_err()

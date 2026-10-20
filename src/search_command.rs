@@ -88,7 +88,16 @@ pub async fn try_find_matches(
 
 /// The `cargo agents search` entry point: report every match grouped by the
 /// instance it came from, or a nothing-found message.
+/// Legacy error adapter retained through root 0.6. New callers should use [`try_search`].
 pub async fn search(sym: &Symposium, query: &str) -> Result<()> {
+    Ok(try_search(sym, query).await?)
+}
+
+/// Report matching plugins after validating all registry sources.
+///
+/// # Errors
+/// Returns [`RegistryError`] before searching when a configured source is invalid.
+pub async fn try_search(sym: &Symposium, query: &str) -> Result<(), RegistryError> {
     let matches = try_find_matches(sym, query).await?;
     if matches.is_empty() {
         tracing::info!(

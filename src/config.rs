@@ -468,10 +468,26 @@ pub const REGISTRY_CACHE_SUBDIR: &str = "plugin-sources";
 
 const BUILTIN_RECOMMENDATIONS_URL: &str = "https://github.com/symposium-dev/recommendations";
 
-/// Failure to construct the application context from configuration and paths.
+/// Failure to load, persist, or prepare the application configuration and paths.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConfigError {
+    /// The user configuration could not be serialized.
+    #[error("failed to serialize user configuration")]
+    Serialize {
+        /// The serialization failure, retained for inspection without printing values.
+        #[source]
+        source: toml::ser::Error,
+    },
+    /// The user configuration could not be written.
+    #[error("failed to write user configuration {}", path.display())]
+    Write {
+        /// The intended configuration file.
+        path: PathBuf,
+        /// The underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
     /// A required warning could not be delivered before selecting defaults.
     #[error("failed to write configuration warning")]
     Warning(#[source] std::io::Error),
@@ -1018,12 +1034,20 @@ impl Symposium {
         })
     }
 
-    /// Write the user config to disk.
-    pub fn save_config(&self) -> anyhow::Result<()> {
+    /// Write the user configuration to disk with a structured serialization or I/O error.
+    pub fn try_save_config(&self) -> Result<(), ConfigError> {
         let path = self.dirs.config_dir.join("config.toml");
-        let contents = toml::to_string_pretty(&self.config)?;
-        fs::write(&path, contents)?;
-        Ok(())
+        let contents = toml::to_string_pretty(&self.config)
+            .map_err(|source| ConfigError::Serialize { source })?;
+        fs::write(&path, contents).map_err(|source| ConfigError::Write { path, source })
+    }
+
+    /// Write the user config to disk.
+    ///
+    /// Legacy error-erasing adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_save_config`] for structured failures.
+    pub fn save_config(&self) -> anyhow::Result<()> {
+        self.try_save_config().map_err(Into::into)
     }
 
     #[cfg(test)]
@@ -1235,6 +1259,32 @@ mod tests {
         assert!(error.source().is_some());
         assert!(matches!(error, ConfigError::Read { path: actual, .. } if actual == path));
         assert!(path.is_dir());
+    }
+
+    #[test]
+    fn checked_config_save_preserves_typed_failure_and_existing_destination() {
+        use std::error::Error as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        sym.try_save_config().unwrap();
+        let path = tmp.path().join("config.toml");
+        let contents = fs::read_to_string(&path).unwrap();
+        let _: RawConfig = toml::from_str(&contents).unwrap();
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let sentinel = path.join("foreign-data");
+        fs::write(&sentinel, "keep").unwrap();
+        let error = sym.try_save_config().unwrap_err();
+        assert!(error.source().unwrap().is::<std::io::Error>());
+        assert!(matches!(error, ConfigError::Write { path: actual, .. } if actual == path));
+        let legacy = sym.save_config().unwrap_err();
+        assert!(matches!(
+            legacy.downcast_ref::<ConfigError>(),
+            Some(ConfigError::Write { .. })
+        ));
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), "keep");
     }
 
     #[test]

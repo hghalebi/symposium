@@ -64,7 +64,7 @@ pub enum HookSchemaError {
 impl HookSchemaError {
     fn legacy(source: anyhow::Error) -> Self {
         Self::LegacyAdapter {
-            source: source.into_boxed_dyn_error(),
+            source: source.reallocate_into_boxed_dyn_error_without_backtrace(),
         }
     }
 }

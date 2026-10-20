@@ -2,7 +2,7 @@ use crate::predicate::PredicateEval;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -12,7 +12,214 @@ use crate::hook_schema::HookAgent;
 use crate::pm::{ANY_VERSION, PackageId, PluginKind, UnvalidatedPlugin};
 use symposium_install::Source;
 
+pub use crate::skills::{FrontmatterError, SkillError};
 pub use symposium_sdk::manifest::{Audience, HookFormat};
+
+/// Semantic rejection of a parsed plugin manifest.
+///
+/// Displays describe the violated rule without rendering manifest values.
+/// Concrete parser and installer causes remain available through the error chain.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum PluginValidationError {
+    /// The removed `crates` field was supplied.
+    #[error("the `crates` field has been renamed; use `depends-on` instead")]
+    RetiredCrates,
+    /// The former string skill-source form was supplied.
+    #[error(
+        "string skill sources are no longer supported; reference a crate plugin via `[[plugins]] source.cargo"
+    )]
+    RetiredSourceShorthand,
+    /// A former crate skill-source form was supplied.
+    #[error(
+        "crate skill sources are no longer supported; reference a crate plugin via `[[plugins]] source.cargo"
+    )]
+    RetiredCrateSkillSource,
+    /// A skill group selected both alternatives.
+    #[error("source.path and source.git are mutually exclusive")]
+    ConflictingSkillSources,
+    /// A source table selected neither alternative.
+    #[error("a skill group `source` must set `path` or `git`")]
+    MissingSkillSourceChoice,
+    /// A skill group omitted its source table.
+    #[error("a `[[skills]]` group must set `source.path` or `source.git`")]
+    MissingSkillSource,
+    /// Chained Git/path plugins are not supported by the current contract.
+    #[error(
+        "[[plugins]] currently supports only `source.cargo`; git and path chained plugins are not yet implemented"
+    )]
+    UnsupportedChainedSource,
+    /// A chained reference omitted its Cargo source.
+    #[error("[[plugins]] entry needs `source.cargo` as a dependency atom or a name/version table")]
+    MissingChainedCargo,
+    /// A chained Cargo atom did not identify a crate.
+    #[error("[[plugins]] source.cargo needs a crate name, not `*`")]
+    ChainedWildcard,
+    /// A chained Cargo table omitted the crate name.
+    #[error("[[plugins]] source.cargo `name` is empty")]
+    MissingChainedName,
+    /// A chained Cargo dependency atom was malformed.
+    #[error("invalid [[plugins]] source.cargo dependency atom")]
+    ChainedDependency {
+        /// The concrete SDK grammar failure.
+        #[source]
+        source: symposium_sdk::predicate::PredicateSyntaxError,
+    },
+    /// A chained Cargo version requirement was malformed.
+    #[error("invalid [[plugins]] source.cargo version requirement")]
+    ChainedVersion {
+        /// The original version grammar failure.
+        #[source]
+        source: semver::Error,
+    },
+    /// A removed dependency-table source form was supplied.
+    #[error(
+        "[[plugins]] source.cargo no longer takes the dependency-table form; use `{{ name = \"<crate>\", version = \"<requirement>\" }}`"
+    )]
+    RetiredChainedCargoTable,
+    /// A chained Cargo source had another unsupported shape.
+    #[error("[[plugins]] source.cargo takes a dependency atom or a name/version table")]
+    InvalidChainedCargo,
+    /// A named installation reference could not be resolved.
+    #[error("unknown installation reference")]
+    UnknownInstallation {
+        /// The owning declaration, retained for structured inspection.
+        context: String,
+        /// The unresolved name, retained without routine rendering.
+        name: String,
+    },
+    /// A synthetic name collided with another installation.
+    #[error("synthetic installation name conflicts with an existing one")]
+    ConflictingInstallationName,
+    /// A manifest repeated a declared installation name.
+    #[error("duplicate installation name")]
+    DuplicateInstallation,
+    /// Installation/hook executable alternatives violate the runnable contract.
+    #[error(transparent)]
+    Runnable(#[from] RunnableSelectionError),
+    /// A hook could not resolve an executable or script.
+    #[error("hook command has no `executable` or `script` — nothing to run")]
+    MissingRunnable,
+    /// Both an installation and its hook supplied arguments.
+    #[error("`args` is set on both the installation and the hook; remove it from one")]
+    ConflictingArguments,
+    /// A registry manifest omitted its required name.
+    #[error("plugin manifest is missing `name`")]
+    MissingName,
+    /// Registry manifests cannot change positional default content.
+    #[error("`[defaults]` is only supported in workspace and crate plugin manifests")]
+    UnsupportedDefaults,
+    /// A subcommand name was empty.
+    #[error("subcommand name is empty")]
+    EmptySubcommand,
+    /// A subcommand selected a known built-in command name.
+    #[error("subcommand `{name}` shadows a built-in `cargo agents` command")]
+    ReservedSubcommand {
+        /// The matched built-in command name.
+        name: String,
+    },
+    /// A subcommand name contained characters outside its grammar.
+    #[error("subcommand name has invalid characters (allow ASCII alphanumeric, `-`, `_`)")]
+    InvalidSubcommandName,
+    /// A subcommand's description exceeded the supported limit.
+    #[error("subcommand description exceeds 1024 bytes")]
+    OversizeSubcommandDescription,
+    /// A custom predicate name violated the SDK grammar.
+    #[error("invalid custom predicate name")]
+    CustomPredicate {
+        /// The original SDK grammar failure.
+        #[source]
+        source: symposium_sdk::predicate::PredicateSyntaxError,
+    },
+    /// A standalone skill supplied neither a name nor a usable directory name.
+    #[error("standalone skill has neither a frontmatter `name` nor a named directory")]
+    MissingStandaloneName,
+}
+
+/// A plugin could not be read, parsed, validated, or discovered.
+///
+/// Routine rendering includes the affected path and operation, never parser
+/// source contents. Inspect [`std::error::Error::source`] for concrete causes.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum PluginLoadError {
+    /// A manifest or conventional skill directory could not be inspected.
+    #[error("failed to inspect plugin entry at `{}`", path.display())]
+    Inspect {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// An existing entry had the wrong filesystem kind.
+    #[error("plugin entry at `{}` must be {expected}", path.display())]
+    UnexpectedKind {
+        path: PathBuf,
+        expected: &'static str,
+    },
+    /// A manifest could not be read.
+    #[error("failed to read plugin manifest at `{}`", path.display())]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// A manifest was not valid TOML/schema input.
+    #[error("failed to parse plugin manifest at `{}`", path.display())]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    /// Parsed content violated a semantic rule.
+    #[error("invalid plugin at `{}`: {source}", path.display())]
+    Validate {
+        path: PathBuf,
+        #[source]
+        source: PluginValidationError,
+    },
+    /// Registry discovery failed before entries could be enumerated reliably.
+    #[error("failed to enumerate plugin source: {source}")]
+    Layout {
+        #[from]
+        source: crate::pm::layout::LayoutError,
+    },
+    /// A standalone skill could not supply its synthesized manifest.
+    #[error("failed to load standalone skill at `{}`: {source}", path.display())]
+    StandaloneSkill {
+        path: PathBuf,
+        #[source]
+        source: SkillError,
+    },
+    /// A discovered child skill was invalid.
+    #[error("invalid plugin skill: {source}")]
+    Skill {
+        #[from]
+        source: SkillError,
+    },
+}
+
+/// A crate existence check failed independently of whether the crate exists.
+///
+/// Display omits request URLs and response contents; concrete sources remain
+/// available for callers that need structured transport diagnostics.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum CrateCheckError {
+    /// The HTTP client could not be constructed.
+    #[error("failed to construct crate registry client")]
+    Client {
+        /// The original HTTP-client construction failure.
+        #[source]
+        source: reqwest::Error,
+    },
+    /// A registry request or response failed.
+    #[error("failed to check crate existence in registry")]
+    Registry {
+        /// The original registry-client failure.
+        #[source]
+        source: crates_io_api::Error,
+    },
+}
 /// The unvalidated manifest schema lives in the SDK, because it is what
 /// crosses the package-manager boundary. This module owns the other half:
 /// turning one into a validated [`PluginManifest`]: applying defaults, promoting
@@ -45,7 +252,9 @@ pub struct PluginMcpServer {
 }
 
 /// Validate a raw `[[mcp_servers]]` entry.
-fn validate_mcp_server(raw: RawPluginMcpServer) -> Result<PluginMcpServer> {
+fn validate_mcp_server(
+    raw: RawPluginMcpServer,
+) -> std::result::Result<PluginMcpServer, PluginValidationError> {
     reject_crates_field(&raw.crates)?;
     Ok(PluginMcpServer {
         predicates: crate::predicate::PredicateSet::merged(raw.depends_on, raw.predicates),
@@ -53,10 +262,12 @@ fn validate_mcp_server(raw: RawPluginMcpServer) -> Result<PluginMcpServer> {
     })
 }
 
-/// Shared rejection for the retired `crates` field, with a migration hint.
-fn reject_crates_field(crates: &Option<toml::Value>) -> Result<()> {
+/// Reject the retired `crates` field without rendering its value.
+fn reject_crates_field(
+    crates: &Option<toml::Value>,
+) -> std::result::Result<(), PluginValidationError> {
     if crates.is_some() {
-        bail!("the `crates` field has been renamed; use `depends-on` instead");
+        return Err(PluginValidationError::RetiredCrates);
     }
     Ok(())
 }
@@ -81,33 +292,20 @@ pub enum PluginSource {
 }
 
 /// Validate a raw skill-group `source` into a [`PluginSource`].
-fn validate_plugin_source(raw: RawPluginSource) -> Result<PluginSource> {
-    {
-        match raw {
-            RawPluginSource::Shorthand(value) => bail!(
-                "`source = \"{value}\"` is no longer supported; a crate now provides a plugin \
-                 via a `[[plugins]] source.cargo = \"...\"` reference"
-            ),
-            RawPluginSource::Table(fields) => {
-                if fields.crate_path.is_some() || fields.crate_field.is_some() {
-                    bail!(
-                        "crate skill sources are no longer referenced from a skill group; \
-                         reference the crate's plugin with a `[[plugins]] source.cargo = \"...\"` \
-                         entry instead"
-                    );
-                }
-
-                let exclusive_count = fields.path.is_some() as u8 + fields.git.is_some() as u8;
-                if exclusive_count > 1 {
-                    bail!("source.path and source.git are mutually exclusive");
-                }
-
-                Ok(match (fields.path, fields.git) {
-                    (Some(p), None) => PluginSource::Path(p),
-                    (None, Some(url)) => PluginSource::Git(url),
-                    (None, None) => bail!("a skill group `source` must set `path` or `git`"),
-                    _ => unreachable!("exclusive_count > 1 guard"),
-                })
+fn validate_plugin_source(
+    raw: RawPluginSource,
+) -> std::result::Result<PluginSource, PluginValidationError> {
+    match raw {
+        RawPluginSource::Shorthand(_) => Err(PluginValidationError::RetiredSourceShorthand),
+        RawPluginSource::Table(fields) => {
+            if fields.crate_path.is_some() || fields.crate_field.is_some() {
+                return Err(PluginValidationError::RetiredCrateSkillSource);
+            }
+            match (fields.path, fields.git) {
+                (Some(path), None) => Ok(PluginSource::Path(path)),
+                (None, Some(url)) => Ok(PluginSource::Git(url)),
+                (None, None) => Err(PluginValidationError::MissingSkillSourceChoice),
+                (Some(_), Some(_)) => Err(PluginValidationError::ConflictingSkillSources),
             }
         }
     }
@@ -168,80 +366,65 @@ pub struct SkillGroup {
 }
 
 /// Validate a raw `[[skills]]` entry.
-fn validate_skill_group(raw: RawSkillGroup) -> Result<SkillGroup> {
-    {
-        reject_crates_field(&raw.crates)?;
-        let source = validate_plugin_source(
-            raw.source
-                .context("a `[[skills]]` group must set `source.path` or `source.git`")?,
-        )?;
-        Ok(SkillGroup {
-            predicates: crate::predicate::PredicateSet::merged(raw.depends_on, raw.predicates),
-            source,
-            source_label: None,
-            workspace_member: false,
-        })
-    }
+fn validate_skill_group(
+    raw: RawSkillGroup,
+) -> std::result::Result<SkillGroup, PluginValidationError> {
+    reject_crates_field(&raw.crates)?;
+    let source = validate_plugin_source(
+        raw.source
+            .ok_or(PluginValidationError::MissingSkillSource)?,
+    )?;
+    Ok(SkillGroup {
+        predicates: crate::predicate::PredicateSet::merged(raw.depends_on, raw.predicates),
+        source,
+        source_label: None,
+        workspace_member: false,
+    })
 }
 
 /// Validate a raw `[[plugins]]` chained reference.
-fn validate_chained_plugin(raw: RawChainedPlugin) -> Result<ChainedPlugin> {
-    {
-        if raw.source.git.is_some() || raw.source.path.is_some() {
-            bail!(
-                "[[plugins]] currently supports only `source.cargo`; \
-                 git and path chained plugins are not yet implemented"
-            );
-        }
-        let Some(cargo) = raw.source.cargo else {
-            bail!(
-                "[[plugins]] entry needs `source.cargo = \"<crate><version req>\"` \
-                 or `source.cargo = {{ name = \"...\", version = \"...\" }}`"
-            );
-        };
-        let (name, version) = match cargo {
-            RawChainedCargo::Atom(atom) => match crate::predicate::parse_dep_atom(&atom)? {
-                crate::predicate::Predicate::DependsOn(name, req) => {
-                    (name, req.map(|r| r.to_string()))
-                }
-                _ => bail!("[[plugins]] source.cargo needs a crate name, not `*`"),
-            },
-            RawChainedCargo::Table(t) => {
-                if t.name.is_empty() {
-                    bail!("[[plugins]] source.cargo `name` is empty");
-                }
-                let version = t.version.filter(|v| !v.is_empty() && v.as_str() != "*");
-                if let Some(req) = &version {
-                    semver::VersionReq::parse(req).with_context(|| {
-                        format!(
-                            "[[plugins]] source.cargo version {req:?} is not a valid version requirement"
-                        )
-                    })?;
-                }
-                (t.name, version)
-            }
-            RawChainedCargo::Other(v) => {
-                if let toml::Value::Table(t) = &v
-                    && let Some((name, toml::Value::String(req))) = t.iter().next()
-                {
-                    bail!(
-                        "[[plugins]] source.cargo no longer takes the dependency-table form \
-                         `{{ {name} = \"{req}\" }}`; write it as \
-                         `source.cargo = {{ name = \"{name}\", version = \"{req}\" }}`"
-                    );
-                }
-                bail!(
-                    "[[plugins]] source.cargo takes a dependency atom (`\"widget>=1\"`) \
-                     or a `{{ name = \"...\", version = \"...\" }}` table"
-                )
-            }
-        };
-        Ok(ChainedPlugin {
-            predicates: crate::predicate::PredicateSet::merged(raw.depends_on, raw.predicates),
-            name,
-            version,
-        })
+fn validate_chained_plugin(
+    raw: RawChainedPlugin,
+) -> std::result::Result<ChainedPlugin, PluginValidationError> {
+    if raw.source.git.is_some() || raw.source.path.is_some() {
+        return Err(PluginValidationError::UnsupportedChainedSource);
     }
+    let cargo = raw
+        .source
+        .cargo
+        .ok_or(PluginValidationError::MissingChainedCargo)?;
+    let (name, version) = match cargo {
+        RawChainedCargo::Atom(atom) => match symposium_sdk::predicate::try_parse_dep_atom(&atom)
+            .map_err(|source| PluginValidationError::ChainedDependency { source })?
+        {
+            crate::predicate::Predicate::DependsOn(name, req) => (name, req.map(|r| r.to_string())),
+            _ => return Err(PluginValidationError::ChainedWildcard),
+        },
+        RawChainedCargo::Table(table) => {
+            if table.name.is_empty() {
+                return Err(PluginValidationError::MissingChainedName);
+            }
+            let version = table.version.filter(|v| !v.is_empty() && v.as_str() != "*");
+            if let Some(req) = &version {
+                semver::VersionReq::parse(req)
+                    .map_err(|source| PluginValidationError::ChainedVersion { source })?;
+            }
+            (table.name, version)
+        }
+        RawChainedCargo::Other(value) => {
+            if let toml::Value::Table(table) = &value
+                && matches!(table.iter().next(), Some((_, toml::Value::String(_))))
+            {
+                return Err(PluginValidationError::RetiredChainedCargoTable);
+            }
+            return Err(PluginValidationError::InvalidChainedCargo);
+        }
+    };
+    Ok(ChainedPlugin {
+        predicates: crate::predicate::PredicateSet::merged(raw.depends_on, raw.predicates),
+        name,
+        version,
+    })
 }
 
 /// A `[[installations]]` entry in the validated `PluginManifest`.
@@ -598,18 +781,21 @@ fn resolve_or_promote(
     names: &mut std::collections::BTreeSet<String>,
     synth_name: &mut dyn FnMut() -> String,
     ctx: &str,
-) -> Result<String> {
+) -> std::result::Result<String, PluginValidationError> {
     match raw {
         RawInstallationRef::Named(name) => {
             if !names.contains(&name) {
-                bail!("{ctx} references unknown installation `{name}`");
+                return Err(PluginValidationError::UnknownInstallation {
+                    context: ctx.into(),
+                    name,
+                });
             }
             Ok(name)
         }
         RawInstallationRef::Inline(inline) => {
             let name = synth_name();
             if !names.insert(name.clone()) {
-                bail!("{ctx}: synthetic installation name `{name}` conflicts with an existing one");
+                return Err(PluginValidationError::ConflictingInstallationName);
             }
             let RawInlineInstallation {
                 install_commands,
@@ -654,7 +840,7 @@ fn validate_hook(
     raw: RawHook,
     installations: &mut Vec<Installation>,
     names: &mut std::collections::BTreeSet<String>,
-) -> Result<Hook> {
+) -> std::result::Result<Hook, PluginValidationError> {
     let RawHook {
         name: hook_name,
         event,
@@ -690,20 +876,13 @@ fn validate_hook(
     if runnable.is_none() {
         let cargo_inferable = matches!(install.source, Some(Source::Cargo(_)));
         if !cargo_inferable {
-            bail!(
-                "hook `{hook_name}`: command `{}` has no `executable` or `script` and the hook \
-                 supplies none either — nothing to run",
-                install.name
-            );
+            return Err(PluginValidationError::MissingRunnable);
         }
     }
 
     // Args: at most one of hook.args / install.args is non-empty.
     let final_args = match (install.args.is_empty(), hook_args.is_empty()) {
-        (false, false) => bail!(
-            "hook `{hook_name}`: `args` is set on both the installation and the hook; \
-             remove it from one"
-        ),
+        (false, false) => return Err(PluginValidationError::ConflictingArguments),
         (true, _) => hook_args,
         (false, true) => install.args.clone(),
     };
@@ -743,7 +922,7 @@ fn validate_hook(
 /// - `executable` and `script` are mutually exclusive on a single layer.
 /// - cargo + `git` requires an explicit `executable`, since we can't query
 ///   crates.io to infer one.
-fn validate_installation(install: &Installation) -> Result<()> {
+fn validate_installation(install: &Installation) -> std::result::Result<(), PluginValidationError> {
     install.runnable_spec(None, None)?;
     Ok(())
 }
@@ -837,7 +1016,7 @@ pub struct LoadWarning {
 /// are synthesized into default plugins, so this is just a plugin list.
 #[derive(Debug)]
 struct SourceDirContents {
-    plugins: Vec<Result<Plugin>>,
+    plugins: Vec<std::result::Result<Plugin, PluginLoadError>>,
 }
 
 /// Where a plugin manifest came from, for validation rules that differ by
@@ -898,7 +1077,7 @@ async fn ensure_registry_instances(instances: Vec<crate::pm::PmInstance>, update
     // is a no-op).
     let force = matches!(update, UpdateLevel::Fetch);
     for inst in instances {
-        if let Err(e) = inst.pm.refresh(update, force).await {
+        if let Err(e) = inst.pm.try_refresh(update, force).await {
             tracing::warn!(registry = %inst.name, error = %e, "failed to refresh registry");
         }
     }
@@ -945,7 +1124,7 @@ async fn sync_registry_instances(
             Some(_) => continue,
             None => false,
         };
-        match inst.pm.refresh(UpdateLevel::Fetch, force).await {
+        match inst.pm.try_refresh(UpdateLevel::Fetch, force).await {
             Ok(true) => {
                 tracing::info!(registry = %inst.name, "synced");
                 synced.push(inst.name.clone());
@@ -986,7 +1165,11 @@ async fn list_plugins_with_managers(pms: &crate::pm::PmRegistry) -> Vec<Provider
 
     // Trusted instances only: registry entries, not dependency-embedded crates.
     for inst in pms.instances().filter(|i| i.trusted) {
-        for p in inst.registry_plugins().await.unwrap_or_default() {
+        for p in registry_plugins_with_diagnostics(inst)
+            .await
+            .into_iter()
+            .flat_map(|outcome| outcome.plugins)
+        {
             by_registry
                 .entry(inst.name.clone())
                 .or_default()
@@ -1044,13 +1227,46 @@ pub async fn try_find_plugin(
 
 async fn find_plugin_with_managers(pms: &crate::pm::PmRegistry, name: &str) -> Option<Plugin> {
     for inst in pms.instances().filter(|i| i.trusted) {
-        for parsed in inst.registry_plugins().await.unwrap_or_default() {
+        for parsed in registry_plugins_with_diagnostics(inst)
+            .await
+            .into_iter()
+            .flat_map(|outcome| outcome.plugins)
+        {
             if parsed.manifest.name == name {
                 return Some(parsed);
             }
         }
     }
     None
+}
+
+async fn registry_plugins_with_diagnostics(
+    inst: &crate::pm::PmInstance,
+) -> Option<crate::pm::PluginCollection<Plugin>> {
+    match inst.registry_plugins_outcome().await {
+        Ok(outcome) => {
+            for error in &outcome.errors {
+                tracing::warn!(
+                    registry = %inst.name,
+                    report = %crate::report::ReportEvent::Warning {
+                        message: format!("skipping {error}"),
+                    },
+                    "failed to load registry plugin"
+                );
+            }
+            Some(outcome)
+        }
+        Err(error) => {
+            tracing::warn!(
+                registry = %inst.name,
+                report = %crate::report::ReportEvent::Warning {
+                    message: error.to_string(),
+                },
+                "failed to read plugin registry"
+            );
+            None
+        }
+    }
 }
 
 /// The unvalidated plugin for a registry entry at `root/subpath`: a `Symposium.toml`
@@ -1064,34 +1280,61 @@ pub(crate) fn entry_plugin(
     root: &Path,
     subpath: &Path,
     source_name: &str,
-) -> Option<Result<UnvalidatedPlugin>> {
+) -> Option<std::result::Result<UnvalidatedPlugin, PluginLoadError>> {
     let dir = root.join(subpath);
-    Some(match crate::pm::layout::classify(&dir)? {
-        crate::pm::layout::EntryKind::Plugin(toml_path) => (|| -> Result<UnvalidatedPlugin> {
-            let content = fs::read_to_string(&toml_path)?;
-            let manifest = RawPluginManifest::parse(&content)?;
-            let base = toml_path.parent().unwrap_or(&dir).to_path_buf();
+    let entry = match classify_plugin_entry(&dir) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return None,
+        Err(error) => return Some(Err(error)),
+    };
+    Some(match entry {
+        crate::pm::layout::EntryKind::Plugin(path) => read_raw_manifest(&path).map(|manifest| {
+            let base = path.parent().unwrap_or(&dir).to_path_buf();
             let name = manifest.name.clone().unwrap_or_default();
-            Ok(UnvalidatedPlugin::new(
+            UnvalidatedPlugin::new(
                 PackageId::new(source_name, name, ANY_VERSION),
                 base,
                 manifest,
             )
-            .with_label_root(root))
-        })()
-        .with_context(|| format!("loading plugin from `{}`", toml_path.display())),
-        crate::pm::layout::EntryKind::Skill(skill_md) => (|| -> Result<UnvalidatedPlugin> {
-            let manifest = standalone_skill_manifest(&skill_md)?;
-            let base = skill_md.parent().unwrap_or(&dir).to_path_buf();
-            let name = manifest.name.clone().unwrap_or_default();
-            Ok(UnvalidatedPlugin::new(
-                PackageId::new(source_name, name, ANY_VERSION),
-                base,
-                manifest,
-            )
-            .with_label_root(root))
-        })()
-        .with_context(|| format!("loading skill from `{}`", skill_md.display())),
+            .with_label_root(root)
+        }),
+        crate::pm::layout::EntryKind::Skill(path) => {
+            standalone_skill_manifest(&path).map(|manifest| {
+                let base = path.parent().unwrap_or(&dir).to_path_buf();
+                let name = manifest.name.clone().unwrap_or_default();
+                UnvalidatedPlugin::new(
+                    PackageId::new(source_name, name, ANY_VERSION),
+                    base,
+                    manifest,
+                )
+                .with_label_root(root)
+            })
+        }
+    })
+}
+
+fn classify_plugin_entry(
+    dir: &Path,
+) -> std::result::Result<Option<crate::pm::layout::EntryKind>, PluginLoadError> {
+    let manifest = dir.join(crate::pm::layout::MANIFEST_FILE);
+    if optional_plugin_entry(&manifest, PluginEntryKind::Manifest)? {
+        return Ok(Some(crate::pm::layout::EntryKind::Plugin(manifest)));
+    }
+    let skill = dir.join(crate::pm::layout::SKILL_FILE);
+    if optional_plugin_entry(&skill, PluginEntryKind::SkillFile)? {
+        return Ok(Some(crate::pm::layout::EntryKind::Skill(skill)));
+    }
+    Ok(None)
+}
+
+fn read_raw_manifest(path: &Path) -> std::result::Result<RawPluginManifest, PluginLoadError> {
+    let content = fs::read_to_string(path).map_err(|source| PluginLoadError::Read {
+        path: path.into(),
+        source,
+    })?;
+    RawPluginManifest::parse(&content).map_err(|source| PluginLoadError::Parse {
+        path: path.into(),
+        source,
     })
 }
 
@@ -1105,7 +1348,10 @@ pub(crate) fn entry_plugin(
 ///
 /// `kind` comes from the instance that answered, never from the plugin, so a PM
 /// cannot elect its own policy.
-pub(crate) fn validate_plugin(plugin: UnvalidatedPlugin, kind: PluginKind) -> Result<Plugin> {
+pub(crate) fn validate_plugin(
+    plugin: UnvalidatedPlugin,
+    kind: PluginKind,
+) -> std::result::Result<Plugin, PluginValidationError> {
     let package_name = plugin.id.name.clone();
     let origin = match kind {
         PluginKind::Registry => ManifestOrigin::Registry,
@@ -1119,8 +1365,7 @@ pub(crate) fn validate_plugin(plugin: UnvalidatedPlugin, kind: PluginKind) -> Re
         manifest,
         label_root,
     } = plugin;
-    let mut plugin = validate_manifest(manifest, origin)
-        .with_context(|| format!("invalid plugin at `{}`", crate::output::display_path(&root)))?;
+    let mut plugin = validate_manifest(manifest, origin)?;
     resolve_group_sources(&mut plugin, &root, label_root.as_deref().unwrap_or(&root));
     Ok(Plugin {
         canonical: id,
@@ -1171,8 +1416,16 @@ pub(crate) fn resolve_group_sources(
 /// to the plugin level so ordinary registry validation decides dormancy: a
 /// skill naming a dependency activates when it is present, a bare one waits to
 /// be `use`d.
-pub(crate) fn standalone_skill_manifest(skill_md: &Path) -> Result<RawPluginManifest> {
-    let (frontmatter_name, predicates) = crate::skills::standalone_skill_meta(skill_md)?;
+pub(crate) fn standalone_skill_manifest(
+    skill_md: &Path,
+) -> std::result::Result<RawPluginManifest, PluginLoadError> {
+    let (frontmatter_name, predicates) =
+        crate::skills::standalone_skill_meta(skill_md).map_err(|source| {
+            PluginLoadError::StandaloneSkill {
+                path: skill_md.into(),
+                source,
+            }
+        })?;
     let name = frontmatter_name
         .or_else(|| {
             skill_md
@@ -1181,7 +1434,10 @@ pub(crate) fn standalone_skill_manifest(skill_md: &Path) -> Result<RawPluginMani
                 .and_then(|n| n.to_str())
                 .map(str::to_string)
         })
-        .context("standalone skill has neither a frontmatter `name` nor a named directory")?;
+        .ok_or_else(|| PluginLoadError::Validate {
+            path: skill_md.into(),
+            source: PluginValidationError::MissingStandaloneName,
+        })?;
 
     let mut manifest = RawPluginManifest {
         name: Some(name),
@@ -1267,8 +1523,14 @@ async fn load_registry_impl(
     // active set through discovery / consent and the driver's `load_plugin`,
     // never here. Each registry instance logs its own load failures.
     for inst in pms.instances().filter(|i| i.trusted) {
-        match inst.registry_plugins().await {
-            Some(found) => plugins.extend(found),
+        match registry_plugins_with_diagnostics(inst).await {
+            Some(outcome) => {
+                let is_complete = outcome.is_complete();
+                plugins.extend(outcome.plugins);
+                if !is_complete {
+                    unreadable_registries.push(inst.name.clone());
+                }
+            }
             None => unreadable_registries.push(inst.name.clone()),
         }
     }
@@ -1313,6 +1575,26 @@ pub async fn active_plugins(
     workspace_root: Option<&Path>,
     ctx: &mut crate::predicate::PredicateContext<'_>,
 ) -> Vec<Plugin> {
+    active_plugins_outcome(sym, registry, pms, workspace_root, ctx)
+        .await
+        .plugins
+}
+
+/// Active plugins plus whether every contributing source was read successfully.
+/// Destructive reconciliation must wait when a provider or validation failed.
+pub(crate) struct ActivePluginCollection {
+    pub plugins: Vec<Plugin>,
+    pub is_complete: bool,
+}
+
+pub(crate) async fn active_plugins_outcome(
+    sym: &Symposium,
+    registry: &PluginRegistry,
+    pms: &crate::pm::PmRegistry,
+    workspace_root: Option<&Path>,
+    ctx: &mut crate::predicate::PredicateContext<'_>,
+) -> ActivePluginCollection {
+    let mut is_complete = registry.unreadable_registries.is_empty() && registry.warnings.is_empty();
     let mut active = Vec::new();
     // Crate identities already loaded through the set, keyed on `(pm, name)` so
     // a crate reached through two chains — or a chain and dependency enablement —
@@ -1347,14 +1629,22 @@ pub async fn active_plugins(
     // Fixed-point: resolve each id through the set, record any new plugin, and
     // enqueue its own chained references.
     while let Some(id) = worklist.pop() {
-        for plugin in pms.load_plugin(&id).await {
+        let (plugins, errors, complete) = pms.load_plugin_outcome(&id).await.into_parts();
+        for error in errors {
+            tracing::warn!(%error, "failed to load active plugin; source set is incomplete");
+        }
+        is_complete &= complete;
+        for plugin in plugins {
             if visited.insert(plugin_key(&plugin.canonical)) {
                 record_active(plugin, ctx, &mut active, &mut worklist);
             }
         }
     }
 
-    active
+    ActivePluginCollection {
+        plugins: active,
+        is_complete,
+    }
 }
 
 /// The dedup key for a loaded crate plugin: its ecosystem plus normalized name,
@@ -1469,19 +1759,26 @@ fn workspace_plugin_for_dir(
     workspace_root: &Path,
     dir: &Path,
     agents_skills: bool,
-) -> Result<Option<Plugin>> {
+) -> std::result::Result<Option<Plugin>, PluginLoadError> {
     let manifest_path = dir.join(crate::pm::layout::MANIFEST_FILE);
-    let bare_convention = dir.join(CRATE_DEFAULT_SKILLS_PATH).is_dir()
-        || (agents_skills && dir.join(AGENTS_SKILLS_PATH).is_dir());
-    let raw: RawPluginManifest = if manifest_path.is_file() {
-        toml::from_str(&fs::read_to_string(&manifest_path)?)?
-    } else if bare_convention {
-        // Bare convention: a `skills/` (or `.agents/skills/`) directory with
-        // no manifest is an all-defaults plugin.
-        toml::from_str("").expect("empty manifest parses")
-    } else {
-        return Ok(None);
-    };
+    let raw: RawPluginManifest =
+        if optional_plugin_entry(&manifest_path, PluginEntryKind::Manifest)? {
+            read_raw_manifest(&manifest_path)?
+        } else if optional_plugin_entry(
+            &dir.join(CRATE_DEFAULT_SKILLS_PATH),
+            PluginEntryKind::SkillDirectory,
+        )? || (agents_skills
+            && optional_plugin_entry(
+                &dir.join(AGENTS_SKILLS_PATH),
+                PluginEntryKind::SkillDirectory,
+            )?)
+        {
+            // Bare convention: a `skills/` (or `.agents/skills/`) directory with
+            // no manifest is an all-defaults plugin.
+            RawPluginManifest::default()
+        } else {
+            return Ok(None);
+        };
 
     let dir_name = dir
         .file_name()
@@ -1494,7 +1791,10 @@ fn workspace_plugin_for_dir(
             agents_skills,
         },
     )
-    .with_context(|| format!("validating `{}`", manifest_path.display()))?;
+    .map_err(|source| PluginLoadError::Validate {
+        path: manifest_path,
+        source,
+    })?;
     resolve_group_sources(&mut plugin, dir, workspace_root);
 
     Ok(Some(Plugin {
@@ -1502,6 +1802,53 @@ fn workspace_plugin_for_dir(
         manifest: plugin,
         workspace_member: true,
     }))
+}
+
+enum PluginEntryKind {
+    Manifest,
+    SkillFile,
+    SkillDirectory,
+}
+
+fn optional_plugin_entry(
+    path: &Path,
+    expected: PluginEntryKind,
+) -> std::result::Result<bool, PluginLoadError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return match fs::symlink_metadata(path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Ok(_) => Err(PluginLoadError::Inspect {
+                    path: path.into(),
+                    source,
+                }),
+                Err(source) => Err(PluginLoadError::Inspect {
+                    path: path.into(),
+                    source,
+                }),
+            };
+        }
+        Err(source) => {
+            return Err(PluginLoadError::Inspect {
+                path: path.into(),
+                source,
+            });
+        }
+    };
+    let (matches, expected) = match expected {
+        PluginEntryKind::Manifest => (metadata.is_file(), "a manifest file"),
+        PluginEntryKind::SkillFile => (metadata.is_file(), "a skill file"),
+        PluginEntryKind::SkillDirectory => (metadata.is_dir(), "a skill directory"),
+    };
+    if matches {
+        Ok(true)
+    } else {
+        Err(PluginLoadError::UnexpectedKind {
+            path: path.into(),
+            expected,
+        })
+    }
 }
 
 /// Scan a directory laid out like a plugin source, loading its plugin
@@ -1517,15 +1864,22 @@ fn workspace_plugin_for_dir(
 /// Registry loading goes through the package-manager instances instead
 /// ([`load_registry`]). `source_name` becomes each `Plugin`'s
 /// canonical `pm` tag; callers that don't care pass `""`.
-fn scan_source_dir<P: AsRef<Path>>(dir: P, source_name: &str) -> Result<SourceDirContents> {
+fn scan_source_dir(
+    dir: impl AsRef<Path>,
+    source_name: &str,
+) -> std::result::Result<SourceDirContents, PluginLoadError> {
     let dir = dir.as_ref();
     let mut plugins = Vec::new();
 
-    for entry in crate::pm::layout::enumerate(dir)? {
+    for entry in crate::pm::layout::try_enumerate(dir)? {
         let Some(plugin) = entry_plugin(dir, &entry.subpath, source_name) else {
             continue;
         };
-        let plugin = plugin.and_then(|p| validate_plugin(p, PluginKind::Registry));
+        let plugin = plugin.and_then(|plugin| {
+            let path = plugin.root.clone();
+            validate_plugin(plugin, PluginKind::Registry)
+                .map_err(|source| PluginLoadError::Validate { path, source })
+        });
         tracing::debug!(subpath = %entry.subpath.display(), ok = plugin.is_ok(), "loaded entry");
         plugins.push(plugin);
     }
@@ -1549,6 +1903,36 @@ pub struct ValidationResult {
     pub children: Vec<ValidationResult>,
 }
 
+/// Typed result of validating one plugin or child skill.
+///
+/// Unlike the legacy [`ValidationResult`], each failure keeps its owning
+/// concrete error domain. The result tree preserves independent item failures.
+#[derive(Debug)]
+pub struct TypedPluginValidationResult {
+    /// Plugin/skill identifier, or `<unknown>` when loading failed first.
+    pub id: String,
+    /// The item represented by this node.
+    pub kind: ValidationKind,
+    /// Validation success or its concrete load/validation cause.
+    pub result: std::result::Result<(), PluginLoadError>,
+    /// Existing non-fatal validation guidance.
+    pub warning: Option<String>,
+    /// Individually validated skills within a plugin.
+    pub children: Vec<TypedPluginValidationResult>,
+}
+
+impl From<TypedPluginValidationResult> for ValidationResult {
+    fn from(result: TypedPluginValidationResult) -> Self {
+        Self {
+            id: result.id,
+            kind: result.kind,
+            result: result.result.map_err(Into::into),
+            warning: result.warning,
+            children: result.children.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 /// The kind of item that was validated.
 #[derive(Debug)]
 pub enum ValidationKind {
@@ -1570,6 +1954,20 @@ impl std::fmt::Display for ValidationKind {
 /// Scans for TOML plugin manifests and standalone SKILL.md files,
 /// attempts to load each, and returns validation results for all items found.
 pub fn validate_source_dir(dir: &Path) -> Result<Vec<ValidationResult>> {
+    Ok(try_validate_source_dir(dir)?
+        .into_iter()
+        .map(Into::into)
+        .collect())
+}
+
+/// Validate every discovered plugin and skill with concrete per-item failures.
+///
+/// # Errors
+/// Source discovery errors stop enumeration. Individual load/validation errors
+/// remain in their result nodes so unrelated valid items are still reported.
+pub fn try_validate_source_dir(
+    dir: &Path,
+) -> std::result::Result<Vec<TypedPluginValidationResult>, PluginLoadError> {
     let contents = scan_source_dir(dir, "")?;
     let mut results = Vec::new();
 
@@ -1598,7 +1996,7 @@ pub fn validate_source_dir(dir: &Path) -> Result<Vec<ValidationResult>> {
                         .clone()
                         .unwrap_or_else(|| "skills".to_string());
                     if found.is_empty() {
-                        children.push(ValidationResult {
+                        children.push(TypedPluginValidationResult {
                             id: group_label,
                             kind: ValidationKind::Skill,
                             result: Ok(()),
@@ -1611,9 +2009,11 @@ pub fn validate_source_dir(dir: &Path) -> Result<Vec<ValidationResult>> {
                         for skill_result in found {
                             let (skill_id, result) = match skill_result {
                                 Ok(skill) => (skill.name().to_string(), Ok(())),
-                                Err(e) => (group_label.clone(), Err(e)),
+                                Err(source) => {
+                                    (group_label.clone(), Err(PluginLoadError::Skill { source }))
+                                }
                             };
-                            children.push(ValidationResult {
+                            children.push(TypedPluginValidationResult {
                                 id: skill_id,
                                 kind: ValidationKind::Skill,
                                 result,
@@ -1635,7 +2035,7 @@ pub fn validate_source_dir(dir: &Path) -> Result<Vec<ValidationResult>> {
                 )
             })
         });
-        results.push(ValidationResult {
+        results.push(TypedPluginValidationResult {
             id,
             kind: ValidationKind::Plugin,
             result,
@@ -1653,10 +2053,28 @@ pub fn validate_source_dir(dir: &Path) -> Result<Vec<ValidationResult>> {
 /// standalone SKILL.md files, returning deduplicated crate names.
 /// Items that fail to load are silently skipped.
 pub fn collect_crate_names_in_source_dir(dir: &Path) -> Result<Vec<String>> {
+    Ok(try_collect_crate_names_in_source_dir(dir)?)
+}
+
+/// Collect dependency names from the valid entries of a plugin source.
+///
+/// # Errors
+/// Returns a typed layout error if discovery fails. Invalid individual entries
+/// remain skipped with a visible diagnostic, preserving the partial-result policy.
+pub fn try_collect_crate_names_in_source_dir(
+    dir: &Path,
+) -> std::result::Result<Vec<String>, PluginLoadError> {
     let contents = scan_source_dir(dir, "")?;
     let mut names = std::collections::BTreeSet::new();
 
-    for plugin_result in contents.plugins.into_iter().flatten() {
+    for plugin_result in contents.plugins {
+        let plugin_result = match plugin_result {
+            Ok(plugin) => plugin,
+            Err(error) => {
+                tracing::warn!(%error, "skipping invalid plugin while collecting dependencies");
+                continue;
+            }
+        };
         plugin_result
             .manifest
             .predicates
@@ -1673,15 +2091,44 @@ pub fn collect_crate_names_in_source_dir(dir: &Path) -> Result<Vec<String>> {
 }
 
 /// Check whether a crate name exists on crates.io.
+///
+/// Legacy root 0.6 adapter: transport failures are warned and remain `false`.
+/// Maintained callers use [`try_check_crate_exists`] to distinguish those failures.
 pub async fn check_crate_exists(crate_name: &str) -> bool {
-    let client = match crates_io_api::AsyncClient::new(
-        "symposium (https://github.com/symposium-dev/symposium)",
-        std::time::Duration::from_millis(1000),
-    ) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    client.get_crate(crate_name).await.is_ok()
+    match try_check_crate_exists(crate_name).await {
+        Ok(exists) => exists,
+        Err(error) => {
+            tracing::warn!(%error, "crate existence check failed");
+            false
+        }
+    }
+}
+
+/// Check crate existence without treating a failed registry request as absence.
+///
+/// # Errors
+/// Returns HTTP-client construction or registry failures. Only the registry's
+/// explicit `NotFound` response becomes `Ok(false)`.
+pub async fn try_check_crate_exists(
+    crate_name: &str,
+) -> std::result::Result<bool, CrateCheckError> {
+    let http = reqwest::Client::builder()
+        .user_agent("symposium (https://github.com/symposium-dev/symposium)")
+        .build()
+        .map_err(|source| CrateCheckError::Client { source })?;
+    let client =
+        crates_io_api::AsyncClient::with_http_client(http, std::time::Duration::from_millis(1000));
+    match client.get_crate(crate_name).await {
+        Ok(_) => Ok(true),
+        Err(source) => crate_check_failure(source),
+    }
+}
+
+fn crate_check_failure(source: crates_io_api::Error) -> std::result::Result<bool, CrateCheckError> {
+    match source {
+        crates_io_api::Error::NotFound(_) => Ok(false),
+        source => Err(CrateCheckError::Registry { source }),
+    }
 }
 
 /// Load and validate a single plugin from a TOML manifest.
@@ -1692,6 +2139,19 @@ pub async fn check_crate_exists(crate_name: &str) -> bool {
 /// like the `plugin validate` CLI — that need neither can pass an empty string
 /// and the manifest's parent directory.
 pub fn load_plugin(manifest_path: &Path, source_name: &str, source_dir: &Path) -> Result<Plugin> {
+    Ok(try_load_plugin(manifest_path, source_name, source_dir)?)
+}
+
+/// Read, parse, and validate a registry plugin without erasing its failure type.
+///
+/// # Errors
+/// Returns a concrete read, TOML, or semantic validation error. Display output
+/// omits parser contents while retaining the source for structured inspection.
+pub fn try_load_plugin(
+    manifest_path: &Path,
+    source_name: &str,
+    source_dir: &Path,
+) -> std::result::Result<Plugin, PluginLoadError> {
     load_plugin_as(
         manifest_path,
         source_name,
@@ -1700,32 +2160,29 @@ pub fn load_plugin(manifest_path: &Path, source_name: &str, source_dir: &Path) -
     )
 }
 
-/// [`load_plugin`] with an explicit manifest origin — the entry position
-/// within its registry decides the validation rules (a recommendations
-/// `cargo/<name>/` entry gains an implied gate and default name).
 fn load_plugin_as(
     manifest_path: &Path,
     source_name: &str,
     source_dir: &Path,
     origin: ManifestOrigin<'_>,
-) -> Result<Plugin> {
-    let content = fs::read_to_string(manifest_path)?;
-    let manifest: RawPluginManifest = toml::from_str(&content)?;
-    let mut plugin = validate_manifest(manifest, origin)
-        .with_context(|| format!("validating `{}`", manifest_path.display()))?;
+) -> std::result::Result<Plugin, PluginLoadError> {
+    let manifest = read_raw_manifest(manifest_path)?;
+    let mut plugin =
+        validate_manifest(manifest, origin).map_err(|source| PluginLoadError::Validate {
+            path: manifest_path.into(),
+            source,
+        })?;
     let base = manifest_path.parent().unwrap_or(source_dir);
     resolve_group_sources(&mut plugin, base, source_dir);
     Ok(Plugin {
         canonical: PackageId::new(source_name, &plugin.name, ANY_VERSION),
         manifest: plugin,
-        // Registry sources are never workspace members; the workspace-plugin
-        // loader is the only place that stamps true.
         workspace_member: false,
     })
 }
 
-fn raw_crate_manifest(content: &str) -> Result<RawPluginManifest> {
-    Ok(toml::from_str(content)?)
+fn raw_crate_manifest(content: &str) -> std::result::Result<RawPluginManifest, toml::de::Error> {
+    RawPluginManifest::parse(content)
 }
 
 /// Merge a crate's two manifest sources into one, for the cargo PM to offer.
@@ -1744,40 +2201,58 @@ fn raw_crate_manifest(content: &str) -> Result<RawPluginManifest> {
 /// The default group itself is appended by [`validate_manifest`] under
 /// [`ManifestOrigin::Crate`], not here: defaults are policy, and policy is
 /// Symposium's.
-pub(crate) fn merge_crate_manifest(
+#[cfg(test)]
+fn merge_crate_manifest(
     metadata: Option<toml::Table>,
     file: Option<&str>,
     crate_name: &str,
 ) -> RawPluginManifest {
-    let meta = metadata.and_then(
-        |t| match toml::Value::Table(t).try_into::<RawPluginManifest>() {
-            Ok(m) => Some(m),
-            Err(e) => {
-                tracing::warn!(
-                    crate_name = %crate_name,
-                    error = %e,
-                    "ignoring malformed [package.metadata.symposium]"
-                );
+    let (manifest, errors) =
+        merge_crate_manifest_outcome(metadata, file, crate_name, Path::new(""));
+    for error in errors {
+        tracing::warn!(%crate_name, %error, "ignoring malformed crate plugin layer");
+    }
+    manifest
+}
+
+/// Merge valid crate manifest layers while retaining each rejected layer's cause.
+/// A malformed layer does not discard a valid sibling, but makes the provider
+/// outcome incomplete for destructive reconciliation.
+pub(crate) fn merge_crate_manifest_outcome(
+    metadata: Option<toml::Table>,
+    file: Option<&str>,
+    _crate_name: &str,
+    root: &Path,
+) -> (RawPluginManifest, Vec<PluginLoadError>) {
+    let mut errors = Vec::new();
+    let metadata = metadata.and_then(|table| {
+        match toml::Value::Table(table).try_into::<RawPluginManifest>() {
+            Ok(manifest) => Some(manifest),
+            Err(source) => {
+                errors.push(PluginLoadError::Parse {
+                    path: root.join("Cargo.toml"),
+                    source,
+                });
                 None
             }
-        },
-    );
-    let file = file.and_then(|c| match raw_crate_manifest(c) {
-        Ok(m) => Some(m),
-        Err(e) => {
-            tracing::warn!(
-                crate_name = %crate_name,
-                error = %e,
-                "ignoring malformed crate Symposium.toml"
-            );
+        }
+    });
+    let file = file.and_then(|content| match raw_crate_manifest(content) {
+        Ok(manifest) => Some(manifest),
+        Err(source) => {
+            errors.push(PluginLoadError::Parse {
+                path: root.join(crate::pm::layout::MANIFEST_FILE),
+                source,
+            });
             None
         }
     });
-    match (meta, file) {
-        (Some(a), Some(b)) => a.merge(b),
-        (Some(m), None) | (None, Some(m)) => m,
+    let manifest = match (metadata, file) {
+        (Some(base), Some(over)) => base.merge(over),
+        (Some(manifest), None) | (None, Some(manifest)) => manifest,
         (None, None) => RawPluginManifest::default(),
-    }
+    };
+    (manifest, errors)
 }
 
 /// Convert a raw manifest into a validated `PluginManifest`.
@@ -1789,45 +2264,43 @@ pub(crate) fn merge_crate_manifest(
 fn validate_manifest(
     mut manifest: RawPluginManifest,
     origin: ManifestOrigin<'_>,
-) -> Result<PluginManifest> {
+) -> std::result::Result<PluginManifest, PluginValidationError> {
     let name = match (manifest.name.take(), &origin) {
         (Some(n), _) => n,
         (None, ManifestOrigin::WorkspaceMember { dir_name, .. }) => dir_name.to_string(),
         (None, ManifestOrigin::Crate { crate_name }) => crate_name.to_string(),
-        (None, ManifestOrigin::Registry) => bail!("plugin manifest is missing `name`"),
+        (None, ManifestOrigin::Registry) => return Err(PluginValidationError::MissingName),
     };
     match &origin {
         ManifestOrigin::Registry => {
             if manifest.defaults.is_some() {
-                bail!("`[defaults]` is only supported in workspace and crate plugin manifests");
+                return Err(PluginValidationError::UnsupportedDefaults);
             }
         }
         ManifestOrigin::WorkspaceMember { agents_skills, .. } => {
             let defaults = manifest.defaults.take().unwrap_or_default();
             if defaults.skills {
-                let group: RawSkillGroup =
-                    toml::from_str(r#"source.path = "skills""#).expect("static default group");
-                manifest.skills.push(group);
+                manifest.push_skill_group(
+                    CRATE_DEFAULT_SKILLS_PATH,
+                    crate::predicate::PredicateSet::default(),
+                );
                 if *agents_skills {
-                    let group: RawSkillGroup = toml::from_str(indoc::indoc! {r#"
-                        predicates = ["workspace-member()"]
-                        source.path = ".agents/skills"
-                    "#})
-                    .expect("static default group");
-                    manifest.skills.push(group);
+                    manifest.push_skill_group(
+                        AGENTS_SKILLS_PATH,
+                        crate::predicate::PredicateSet {
+                            predicates: vec![crate::predicate::Predicate::WorkspaceMember],
+                        },
+                    );
                 }
             }
         }
         ManifestOrigin::Crate { .. } => {
-            // A crate is a dependency, not a workspace member: it gets the
-            // default `skills/` group (so a bare `Symposium.toml` doesn't
-            // silently drop skills the metadata path would have found), but
-            // not the workspace-only `.agents/skills` maintainer group.
             let defaults = manifest.defaults.take().unwrap_or_default();
             if defaults.skills {
-                let group: RawSkillGroup =
-                    toml::from_str(r#"source.path = "skills""#).expect("static default group");
-                manifest.skills.push(group);
+                manifest.push_skill_group(
+                    CRATE_DEFAULT_SKILLS_PATH,
+                    crate::predicate::PredicateSet::default(),
+                );
             }
         }
     }
@@ -1835,7 +2308,7 @@ fn validate_manifest(
     let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for entry in &manifest.installations {
         if !names.insert(entry.name.clone()) {
-            bail!("duplicate installation name `{}`", entry.name);
+            return Err(PluginValidationError::DuplicateInstallation);
         }
     }
 
@@ -1852,7 +2325,8 @@ fn validate_manifest(
         } = raw;
         // Pre-register the entry so synthesized requirement names can use
         // `<name>__req_<i>` without colliding with the entry itself.
-        installations.push(Installation {
+        let installation_index = installations.len();
+        let installation = Installation {
             name: name.clone(),
             requirements: Vec::new(),
             install_commands,
@@ -1860,12 +2334,9 @@ fn validate_manifest(
             executable,
             script,
             args,
-        });
-        let idx = installations
-            .iter()
-            .position(|i| i.name == name)
-            .expect("just pushed");
-        validate_installation(&installations[idx])?;
+        };
+        validate_installation(&installation)?;
+        installations.push(installation);
         let mut reqs = Vec::with_capacity(raw_reqs.len());
         for (i, r) in raw_reqs.into_iter().enumerate() {
             let req = resolve_or_promote(
@@ -1877,11 +2348,10 @@ fn validate_manifest(
             )?;
             reqs.push(req);
         }
-        let idx = installations
-            .iter()
-            .position(|i| i.name == name)
-            .expect("just pushed");
-        installations[idx].requirements = reqs;
+        let installation = installations
+            .get_mut(installation_index)
+            .ok_or(RunnableSelectionError::MissingInstallation)?;
+        installation.requirements = reqs;
     }
 
     let mut hooks = Vec::with_capacity(manifest.hooks.len());
@@ -1911,7 +2381,7 @@ fn validate_manifest(
         .skills
         .into_iter()
         .map(validate_skill_group)
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<std::result::Result<Vec<_>, PluginValidationError>>()?;
     if matches!(origin, ManifestOrigin::WorkspaceMember { .. }) {
         for group in &mut skills {
             group.workspace_member = true;
@@ -1921,13 +2391,13 @@ fn validate_manifest(
         .mcp_servers
         .into_iter()
         .map(validate_mcp_server)
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<std::result::Result<Vec<_>, PluginValidationError>>()?;
 
     let chained = manifest
         .plugins
         .into_iter()
         .map(validate_chained_plugin)
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<std::result::Result<Vec<_>, PluginValidationError>>()?;
 
     // A registry plugin that references no dependency anywhere — at the
     // plugin, skill-group, hook, MCP-server, or chain-edge level, via
@@ -1979,18 +2449,18 @@ const RESERVED_SUBCOMMAND_NAMES: &[&str] = &[
 const MAX_SUBCOMMAND_DESCRIPTION_LEN: usize = 1024;
 
 /// Validate the user-typed name of a `[subcommand.<name>]` table.
-fn validate_subcommand_name(name: &str) -> Result<()> {
+fn validate_subcommand_name(name: &str) -> std::result::Result<(), PluginValidationError> {
     if name.is_empty() {
-        bail!("subcommand name is empty");
+        return Err(PluginValidationError::EmptySubcommand);
     }
     if RESERVED_SUBCOMMAND_NAMES.contains(&name) {
-        bail!("subcommand `{name}` shadows a built-in `cargo agents` command");
+        return Err(PluginValidationError::ReservedSubcommand { name: name.into() });
     }
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        bail!("subcommand `{name}` has invalid characters (allow ASCII alphanumeric, `-`, `_`)");
+        return Err(PluginValidationError::InvalidSubcommandName);
     }
     Ok(())
 }
@@ -2002,7 +2472,7 @@ fn validate_subcommand(
     raw: RawSubcommand,
     installations: &mut Vec<Installation>,
     names: &mut std::collections::BTreeSet<String>,
-) -> Result<Subcommand> {
+) -> std::result::Result<Subcommand, PluginValidationError> {
     validate_subcommand_name(&name)?;
 
     let RawSubcommand {
@@ -2016,7 +2486,7 @@ fn validate_subcommand(
     reject_crates_field(&crates)?;
 
     if description.len() > MAX_SUBCOMMAND_DESCRIPTION_LEN {
-        bail!("subcommand `{name}` description exceeds {MAX_SUBCOMMAND_DESCRIPTION_LEN} chars");
+        return Err(PluginValidationError::OversizeSubcommandDescription);
     }
 
     let command = resolve_or_promote(
@@ -2040,8 +2510,9 @@ fn validate_custom_predicate(
     raw: RawCustomPredicate,
     installations: &mut Vec<Installation>,
     names: &mut std::collections::BTreeSet<String>,
-) -> Result<CustomPredicate> {
-    crate::predicate::validate_custom_predicate_name(&raw.name)?;
+) -> std::result::Result<CustomPredicate, PluginValidationError> {
+    symposium_sdk::predicate::try_validate_custom_predicate_name(&raw.name)
+        .map_err(|source| PluginValidationError::CustomPredicate { source })?;
 
     let command = resolve_or_promote(
         raw.command,
@@ -2102,6 +2573,180 @@ fn build_custom_predicate_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn has_source<T: std::error::Error + 'static>(
+        error: &(dyn std::error::Error + 'static),
+    ) -> bool {
+        let mut current = Some(error);
+        while let Some(error) = current {
+            if error.is::<T>() {
+                return true;
+            }
+            current = error.source();
+        }
+        false
+    }
+
+    #[test]
+    fn crate_check_failures_keep_sources_and_do_not_become_absence() {
+        let failure = crates_io_api::Error::Url(url::ParseError::EmptyHost);
+        let error = crate_check_failure(failure).unwrap_err();
+        assert!(matches!(error, CrateCheckError::Registry { .. }));
+        assert!(has_source::<crates_io_api::Error>(&error));
+        assert!(has_source::<url::ParseError>(&error));
+
+        let source = reqwest::Client::builder()
+            .user_agent("PRIVATE_CRATE_CHECK_CANARY\n")
+            .build()
+            .unwrap_err();
+        let error = CrateCheckError::Client { source };
+        assert!(has_source::<reqwest::Error>(&error));
+        assert!(!error.to_string().contains("PRIVATE_CRATE_CHECK_CANARY"));
+    }
+
+    #[test]
+    fn typed_plugin_loading_preserves_io_and_toml_sources_without_contents() {
+        use std::error::Error as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Symposium.toml");
+        let missing = try_load_plugin(&path, "test", tmp.path()).unwrap_err();
+        assert!(matches!(missing, PluginLoadError::Read { .. }));
+        assert_eq!(
+            missing
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        let original = "name = \"PRIVATE_PLUGIN_TOML_CANARY\" trailing\n";
+        fs::write(&path, original).unwrap();
+        let error = try_load_plugin(&path, "test", tmp.path()).unwrap_err();
+        assert!(matches!(error, PluginLoadError::Parse { .. }));
+        assert!(has_source::<toml::de::Error>(&error));
+        assert!(!error.to_string().contains("PRIVATE_PLUGIN_TOML_CANARY"));
+        assert!(
+            error
+                .source()
+                .unwrap()
+                .to_string()
+                .contains("PRIVATE_PLUGIN_TOML_CANARY")
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn typed_plugin_validation_preserves_semver_and_sdk_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Symposium.toml");
+        let version = "name = 'test'\n[[plugins]]\nsource.cargo = { name = 'widget', version = 'PRIVATE_VERSION_CANARY' }\n";
+        fs::write(&path, version).unwrap();
+        let error = try_load_plugin(&path, "test", tmp.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            PluginLoadError::Validate {
+                source: PluginValidationError::ChainedVersion { .. },
+                ..
+            }
+        ));
+        assert!(has_source::<semver::Error>(&error));
+        assert!(!error.to_string().contains("PRIVATE_VERSION_CANARY"));
+
+        let predicate = "name = 'test'\n[[predicate]]\nname = 'PRIVATE_PREDICATE_CANARY!'\ncommand = 'missing'\n";
+        fs::write(&path, predicate).unwrap();
+        let error = try_load_plugin(&path, "test", tmp.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            PluginLoadError::Validate {
+                source: PluginValidationError::CustomPredicate { .. },
+                ..
+            }
+        ));
+        assert!(has_source::<symposium_sdk::predicate::PredicateSyntaxError>(&error));
+        assert!(!error.to_string().contains("PRIVATE_PREDICATE_CANARY"));
+    }
+
+    #[test]
+    fn typed_directory_validation_retains_independent_outcomes_and_legacy_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, content) in [
+            ("valid", "name = 'valid'\ndepends-on = ['*']\n"),
+            ("invalid", "name = 'PRIVATE_DIRECTORY_CANARY' trailing\n"),
+        ] {
+            let dir = tmp.path().join(name);
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("Symposium.toml"), content).unwrap();
+        }
+        let results = try_validate_source_dir(tmp.path()).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .any(|item| item.id == "valid" && item.result.is_ok())
+        );
+        let invalid = results
+            .iter()
+            .find_map(|item| item.result.as_ref().err())
+            .unwrap();
+        assert!(matches!(invalid, PluginLoadError::Parse { .. }));
+        assert!(has_source::<toml::de::Error>(invalid));
+        assert!(!invalid.to_string().contains("PRIVATE_DIRECTORY_CANARY"));
+        let legacy: Vec<ValidationResult> = results.into_iter().map(Into::into).collect();
+        let _: &anyhow::Result<()> = &legacy[0].result;
+        assert_eq!(legacy.len(), 2);
+        assert_eq!(
+            try_collect_crate_names_in_source_dir(tmp.path()).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn workspace_plugin_wrong_entry_types_are_visible_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Symposium.toml");
+        assert!(
+            workspace_plugin_for_dir(tmp.path(), tmp.path(), false)
+                .unwrap()
+                .is_none()
+        );
+        fs::create_dir(&manifest).unwrap();
+        let error = workspace_plugin_for_dir(tmp.path(), tmp.path(), false).unwrap_err();
+        assert!(matches!(error, PluginLoadError::UnexpectedKind { .. }));
+        assert!(matches!(
+            entry_plugin(tmp.path(), Path::new(""), "test").unwrap(),
+            Err(PluginLoadError::UnexpectedKind { .. })
+        ));
+        let (plugins, warnings) = workspace_plugins(tmp.path(), &[], false);
+        assert!(plugins.is_empty());
+        assert_eq!(warnings.len(), 1);
+        fs::remove_dir(&manifest).unwrap();
+        fs::write(tmp.path().join("skills"), b"not a directory").unwrap();
+        assert!(matches!(
+            workspace_plugin_for_dir(tmp.path(), tmp.path(), false),
+            Err(PluginLoadError::UnexpectedKind { .. })
+        ));
+    }
+
+    #[test]
+    fn crate_layer_merge_retains_valid_sibling_and_typed_private_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let metadata: toml::Table = toml::from_str("name = 'valid-metadata'").unwrap();
+        let (manifest, errors) = merge_crate_manifest_outcome(
+            Some(metadata),
+            Some("name = 'PRIVATE_LAYER_CANARY' trailing"),
+            "test",
+            tmp.path(),
+        );
+        assert_eq!(manifest.name.as_deref(), Some("valid-metadata"));
+        assert_eq!(errors.len(), 1);
+        assert!(
+            matches!(&errors[0], PluginLoadError::Parse { path, .. } if path == &tmp.path().join("Symposium.toml"))
+        );
+        assert!(has_source::<toml::de::Error>(&errors[0]));
+        assert!(!errors[0].to_string().contains("PRIVATE_LAYER_CANARY"));
+    }
 
     fn runnable_installation() -> Installation {
         Installation {
@@ -2197,12 +2842,12 @@ mod tests {
 
     fn from_str(s: &str) -> Result<PluginManifest> {
         let manifest: RawPluginManifest = toml::from_str(s)?;
-        validate_manifest(manifest, ManifestOrigin::Registry)
+        Ok(validate_manifest(manifest, ManifestOrigin::Registry)?)
     }
 
     fn from_str_as(s: &str, origin: ManifestOrigin<'_>) -> Result<PluginManifest> {
         let manifest: RawPluginManifest = toml::from_str(s)?;
-        validate_manifest(manifest, origin)
+        Ok(validate_manifest(manifest, origin)?)
     }
 
     /// A flat registry plugin gates itself on its own `depends-on`, evaluated
@@ -2280,11 +2925,9 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("dependency-table form"), "{msg}");
-        // The hint must point at a *valid* replacement — the table form, which
-        // preserves the crate name and version. It must not suggest the broken
-        // atom `"widget1"` (parses as a crate literally named `widget1`).
+        // The migration hint uses placeholders so manifest values cannot leak.
         assert!(
-            msg.contains(r#"{ name = "widget", version = "1" }"#),
+            msg.contains(r#"{ name = "<crate>", version = "<requirement>" }"#),
             "{msg}"
         );
         assert!(!msg.contains(r#""widget1""#), "{msg}");
@@ -2299,10 +2942,10 @@ mod tests {
         file: Option<&str>,
         crate_name: &str,
     ) -> Result<PluginManifest> {
-        validate_manifest(
+        Ok(validate_manifest(
             merge_crate_manifest(metadata, file, crate_name),
             ManifestOrigin::Crate { crate_name },
-        )
+        )?)
     }
 
     #[test]
@@ -2669,7 +3312,7 @@ mod tests {
         "#};
         let err = from_str(toml).unwrap_err();
         assert!(
-            err.to_string().contains("use `depends-on(serde)` instead"),
+            err.to_string().contains("use `depends-on(...)` instead"),
             "expected migration hint, got: {err}"
         );
     }
@@ -2746,7 +3389,7 @@ mod tests {
         // the plugin, which takes the skill's declared name and is not dormant.
         let gated = entry_plugin(tmp.path(), Path::new("gated"), "recs")
             .expect("the entry is a bare skill")
-            .and_then(|o| validate_plugin(o, PluginKind::Registry))
+            .map(|plugin| validate_plugin(plugin, PluginKind::Registry).unwrap())
             .unwrap();
         assert_eq!(gated.manifest.name, "gated-skill");
         assert!(!gated.manifest.requires_use);
@@ -2758,7 +3401,7 @@ mod tests {
         // rule leaves it dormant until `use`d.
         let bare = entry_plugin(tmp.path(), Path::new("bare"), "recs")
             .expect("the entry is a bare skill")
-            .and_then(|o| validate_plugin(o, PluginKind::Registry))
+            .map(|plugin| validate_plugin(plugin, PluginKind::Registry).unwrap())
             .unwrap();
         assert_eq!(bare.manifest.name, "bare-skill");
         assert!(bare.manifest.requires_use);
@@ -3105,9 +3748,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires crates.io access; run explicitly with --ignored"]
     async fn check_crate_exists_on_crates_io() {
-        assert!(check_crate_exists("serde").await);
-        assert!(!check_crate_exists("this-crate-definitely-does-not-exist-zzz").await);
+        assert!(try_check_crate_exists("serde").await.unwrap());
+        assert!(
+            !try_check_crate_exists("this-crate-definitely-does-not-exist-zzz")
+                .await
+                .unwrap()
+        );
     }
 
     #[test]

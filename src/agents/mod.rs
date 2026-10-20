@@ -9,7 +9,7 @@ mod mcp_server_registration;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
@@ -42,8 +42,8 @@ pub enum Agent {
 }
 
 impl Agent {
-    /// Parse an agent name from a config string.
-    pub fn from_config_name(name: &str) -> Result<Self> {
+    /// Parse a supported agent name without including untrusted names in diagnostics.
+    pub fn try_from_config_name(name: &str) -> std::result::Result<Self, AgentConfigError> {
         match name {
             "antigravity" => Ok(Agent::Antigravity),
             "claude" => Ok(Agent::Claude),
@@ -52,10 +52,16 @@ impl Agent {
             "goose" => Ok(Agent::Goose),
             "kiro" => Ok(Agent::Kiro),
             "opencode" => Ok(Agent::OpenCode),
-            other => bail!(
-                "unknown agent: {other} (expected antigravity, claude, codex, copilot, goose, kiro, or opencode)"
-            ),
+            _ => Err(AgentConfigError::UnknownAgent),
         }
+    }
+
+    /// Parse an agent name from a config string.
+    ///
+    /// Legacy error-erasing adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_from_config_name`] for structured failures.
+    pub fn from_config_name(name: &str) -> Result<Self> {
+        Self::try_from_config_name(name).map_err(Into::into)
     }
 
     /// Config name as stored in TOML.
@@ -101,16 +107,38 @@ impl Agent {
     // Skill installation paths
     // -----------------------------------------------------------------------
 
+    /// Resolve a project skill directory after validating the single directory name.
+    pub fn try_project_skill_dir(
+        &self,
+        project_root: &Path,
+        skill_name: &str,
+    ) -> std::result::Result<PathBuf, AgentConfigError> {
+        if !crate::skills::is_safe_dir_name(skill_name) {
+            return Err(AgentConfigError::UnsafeSkillName);
+        }
+        Ok(self.project_skill_path(project_root, skill_name))
+    }
+
     /// Project-level skill directory for a given skill name.
     ///
     /// Claude Code requires `.claude/skills/`, while Antigravity, Copilot and
     /// Antigravity, Codex and Copilot support the vendor-neutral
     /// `.agents/skills/` path.
+    ///
+    /// Legacy infallible adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_project_skill_dir`] when the name is not already validated.
+    ///
+    /// # Panics
+    /// Panics when `skill_name` is not a safe single directory name.
     pub fn project_skill_dir(&self, project_root: &Path, skill_name: &str) -> PathBuf {
         assert!(
             crate::skills::is_safe_dir_name(skill_name),
             "unsafe skill directory name {skill_name:?}"
         );
+        self.project_skill_path(project_root, skill_name)
+    }
+
+    fn project_skill_path(&self, project_root: &Path, skill_name: &str) -> PathBuf {
         match self {
             Agent::Claude => project_root.join(".claude").join("skills").join(skill_name),
             Agent::Antigravity | Agent::Codex | Agent::Copilot => {
@@ -122,12 +150,34 @@ impl Agent {
         }
     }
 
+    /// Resolve a supported global skill directory after validating its name.
+    pub fn try_global_skill_dir(
+        &self,
+        home: &Path,
+        skill_name: &str,
+    ) -> std::result::Result<Option<PathBuf>, AgentConfigError> {
+        if !crate::skills::is_safe_dir_name(skill_name) {
+            return Err(AgentConfigError::UnsafeSkillName);
+        }
+        Ok(self.global_skill_path(home, skill_name))
+    }
+
     /// Global skill directory for a given skill name, if supported.
+    ///
+    /// Legacy infallible adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_global_skill_dir`] when the name is not already validated.
+    ///
+    /// # Panics
+    /// Panics when `skill_name` is not a safe single directory name.
     pub fn global_skill_dir(&self, home: &Path, skill_name: &str) -> Option<PathBuf> {
         assert!(
             crate::skills::is_safe_dir_name(skill_name),
             "unsafe skill directory name {skill_name:?}"
         );
+        self.global_skill_path(home, skill_name)
+    }
+
+    fn global_skill_path(&self, home: &Path, skill_name: &str) -> Option<PathBuf> {
         match self {
             // Antigravity's shared config root, the one location all three of its
             // surfaces (CLI, IDE, web) read.
@@ -151,12 +201,25 @@ impl Agent {
     // -----------------------------------------------------------------------
 
     /// Register hooks in the project-level agent config.
+    /// Legacy error-erasing adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_register_project_hooks`] for structured failures.
     pub fn register_project_hooks(
+        &self,
+        project_root: &Path,
+        sym: &Symposium,
+        out: &Output,
+    ) -> Result<()> {
+        self.try_register_project_hooks(project_root, sym, out)
+            .map_err(Into::into)
+    }
+
+    /// Register project hooks while preserving malformed files and typed failures.
+    pub fn try_register_project_hooks(
         &self,
         project_root: &Path,
         _sym: &Symposium,
         out: &Output,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), AgentConfigError> {
         match self {
             Agent::Antigravity => {
                 register_antigravity_hooks(&project_root.join(".agents").join("hooks.json"), out)
@@ -187,7 +250,19 @@ impl Agent {
     }
 
     /// Register hooks in the global agent config.
-    pub fn register_hooks(&self, home: &Path, _sym: &Symposium, out: &Output) -> Result<()> {
+    /// Legacy error-erasing adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_register_hooks`] for structured failures.
+    pub fn register_hooks(&self, home: &Path, sym: &Symposium, out: &Output) -> Result<()> {
+        self.try_register_hooks(home, sym, out).map_err(Into::into)
+    }
+
+    /// Register global hooks while preserving malformed files and typed failures.
+    pub fn try_register_hooks(
+        &self,
+        home: &Path,
+        _sym: &Symposium,
+        out: &Output,
+    ) -> std::result::Result<(), AgentConfigError> {
         tracing::debug!(agent = %self.config_name(), "registering hooks");
         // Register hooks
         match self {
@@ -289,6 +364,8 @@ impl Agent {
     }
 
     /// Register MCP servers in the agent's config for `scope`.
+    /// Legacy error-erasing adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_register_mcp_servers`] for structured failures.
     pub fn register_mcp_servers(
         &self,
         scope: McpScope,
@@ -297,6 +374,19 @@ impl Agent {
         servers: &[sacp::schema::McpServer],
         out: &Output,
     ) -> Result<()> {
+        self.try_register_mcp_servers(scope, project_root, home, servers, out)
+            .map_err(Into::into)
+    }
+
+    /// Register MCP servers for the requested scope with structured failures.
+    pub fn try_register_mcp_servers(
+        &self,
+        scope: McpScope,
+        project_root: &Path,
+        home: &Path,
+        servers: &[sacp::schema::McpServer],
+        out: &Output,
+    ) -> std::result::Result<(), AgentConfigError> {
         tracing::debug!(agent = %self.config_name(), count = servers.len(), ?scope, "registering MCP servers");
         let path = self.mcp_config_path(scope, project_root, home);
         match self {
@@ -323,6 +413,8 @@ impl Agent {
     }
 
     /// Remove MCP servers from the agent's config for `scope`.
+    /// Legacy error-erasing adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_unregister_mcp_servers`] for structured failures.
     pub fn unregister_mcp_servers(
         &self,
         scope: McpScope,
@@ -331,6 +423,19 @@ impl Agent {
         names: &[&str],
         out: &Output,
     ) -> Result<()> {
+        self.try_unregister_mcp_servers(scope, project_root, home, names, out)
+            .map_err(Into::into)
+    }
+
+    /// Remove only the named MCP servers, preserving unrelated agent settings.
+    pub fn try_unregister_mcp_servers(
+        &self,
+        scope: McpScope,
+        project_root: &Path,
+        home: &Path,
+        names: &[&str],
+        out: &Output,
+    ) -> std::result::Result<(), AgentConfigError> {
         let path = self.mcp_config_path(scope, project_root, home);
         match self {
             Agent::Claude => {
@@ -356,44 +461,86 @@ impl Agent {
     }
 
     /// Remove hooks from the project-level agent config.
-    pub fn unregister_project_hooks(&self, project_root: &Path, _sym: &Symposium, out: &Output) {
-        match self {
-            Agent::Antigravity => {
-                unregister_antigravity_hooks(&project_root.join(".agents").join("hooks.json"), out)
-            }
-            Agent::Claude => {
-                unregister_claude_hooks(&project_root.join(".claude").join("settings.json"), out)
-            }
-            Agent::Codex => {
-                unregister_codex_hooks(&project_root.join(".codex").join("hooks.json"), out)
-            }
-            Agent::Copilot => {
-                unregister_copilot_hooks(&project_root.join(".github").join("hooks"), out)
-            }
-            Agent::Kiro => unregister_kiro_hooks(&project_root.join(".kiro").join("agents"), out),
-            Agent::Goose => {}    // no hooks to unregister
-            Agent::OpenCode => {} // no hooks to unregister
+    ///
+    /// Legacy best-effort adapter retained until the root crate's 0.6 release.
+    /// Rejected configuration remains unchanged and the failure is reported.
+    pub fn unregister_project_hooks(&self, project_root: &Path, sym: &Symposium, out: &Output) {
+        if let Err(error) = self.try_unregister_project_hooks(project_root, sym, out) {
+            out.warn(error);
         }
     }
 
-    /// Remove hooks from the global agent config.
-    pub fn unregister_hooks(&self, home: &Path, _sym: &Symposium, out: &Output) {
-        match self {
-            Agent::Antigravity => unregister_antigravity_hooks(
-                &home.join(".gemini").join("config").join("hooks.json"),
-                out,
+    /// Remove project hooks while preserving structured failures.
+    pub fn try_unregister_project_hooks(
+        &self,
+        project_root: &Path,
+        _sym: &Symposium,
+        out: &Output,
+    ) -> std::result::Result<(), AgentConfigError> {
+        let (path, layout) = match self {
+            Agent::Antigravity => (
+                project_root.join(".agents/hooks.json"),
+                HookConfigLayout::Antigravity,
             ),
-            Agent::Claude => {
-                unregister_claude_hooks(&home.join(".claude").join("settings.json"), out)
-            }
-            Agent::Codex => unregister_codex_hooks(&home.join(".codex").join("hooks.json"), out),
-            Agent::Copilot => {
-                unregister_copilot_hooks_global(&home.join(".copilot").join("settings.json"), out)
-            }
-            Agent::Kiro => unregister_kiro_hooks(&home.join(".kiro").join("agents"), out),
-            Agent::Goose => {}    // no hooks to unregister
-            Agent::OpenCode => {} // no hooks to unregister
+            Agent::Claude => (
+                project_root.join(".claude/settings.json"),
+                HookConfigLayout::Grouped,
+            ),
+            Agent::Codex => (
+                project_root.join(".codex/hooks.json"),
+                HookConfigLayout::Grouped,
+            ),
+            Agent::Copilot => (
+                project_root.join(".github/hooks/symposium.json"),
+                HookConfigLayout::CopilotProject,
+            ),
+            Agent::Kiro => (
+                project_root.join(".kiro/agents/symposium.json"),
+                HookConfigLayout::Kiro,
+            ),
+            Agent::Goose | Agent::OpenCode => return Ok(()),
+        };
+        try_unregister_hook_file_with_output(&path, layout, out)
+    }
+
+    /// Remove hooks from the global agent config.
+    ///
+    /// Legacy best-effort adapter retained until the root crate's 0.6 release.
+    /// Rejected configuration remains unchanged and the failure is reported.
+    pub fn unregister_hooks(&self, home: &Path, sym: &Symposium, out: &Output) {
+        if let Err(error) = self.try_unregister_hooks(home, sym, out) {
+            out.warn(error);
         }
+    }
+
+    /// Remove global hooks while preserving structured failures.
+    pub fn try_unregister_hooks(
+        &self,
+        home: &Path,
+        _sym: &Symposium,
+        out: &Output,
+    ) -> std::result::Result<(), AgentConfigError> {
+        let (path, layout) = match self {
+            Agent::Antigravity => (
+                home.join(".gemini/config/hooks.json"),
+                HookConfigLayout::Antigravity,
+            ),
+            Agent::Claude => (
+                home.join(".claude/settings.json"),
+                HookConfigLayout::Grouped,
+            ),
+            Agent::Codex => (home.join(".codex/hooks.json"), HookConfigLayout::Grouped),
+            Agent::Copilot => (
+                home.join(".copilot/settings.json"),
+                HookConfigLayout::CopilotSettings,
+            ),
+            Agent::Kiro => (
+                home.join(".kiro/agents/symposium.json"),
+                HookConfigLayout::Kiro,
+            ),
+            Agent::Goose | Agent::OpenCode => return Ok(()),
+        };
+        try_unregister_hook_file_with_output(&path, layout, out)
     }
 }
 
@@ -401,7 +548,10 @@ impl Agent {
 // Claude Code hook registration
 // ---------------------------------------------------------------------------
 
-fn register_claude_hooks(settings_path: &Path, out: &Output) -> Result<()> {
+fn register_claude_hooks(
+    settings_path: &Path,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
     let mut settings = load_json_or_empty(settings_path)?;
     let display = display_path(settings_path);
     let root = json_object_mut(&mut settings, settings_path, "")?;
@@ -445,7 +595,10 @@ fn register_claude_hooks(settings_path: &Path, out: &Output) -> Result<()> {
 // Codex CLI hook registration
 // ---------------------------------------------------------------------------
 
-fn register_codex_hooks(hooks_path: &Path, out: &Output) -> Result<()> {
+fn register_codex_hooks(
+    hooks_path: &Path,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
     let mut settings = load_json_or_empty(hooks_path)?;
     let display = display_path(hooks_path);
     let root = json_object_mut(&mut settings, hooks_path, "")?;
@@ -484,6 +637,7 @@ fn register_codex_hooks(hooks_path: &Path, out: &Output) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn unregister_codex_hooks(hooks_path: &Path, out: &Output) {
     unregister_hook_file(hooks_path, HookConfigLayout::Grouped, out);
 }
@@ -493,16 +647,26 @@ fn unregister_codex_hooks(hooks_path: &Path, out: &Output) {
 // ---------------------------------------------------------------------------
 
 /// Register hooks in the global Copilot user settings file (`~/.copilot/settings.json`).
-fn register_copilot_hooks_global(config_path: &Path, out: &Output) -> Result<()> {
+fn register_copilot_hooks_global(
+    config_path: &Path,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
     register_copilot_hooks_file(config_path, false, out)
 }
 
 /// Register hooks in a project-level Copilot hooks directory (`.github/hooks/`).
-fn register_copilot_hooks(hooks_dir: &Path, out: &Output) -> Result<()> {
+fn register_copilot_hooks(
+    hooks_dir: &Path,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
     register_copilot_hooks_file(&hooks_dir.join("symposium.json"), true, out)
 }
 
-fn register_copilot_hooks_file(config_path: &Path, project: bool, out: &Output) -> Result<()> {
+fn register_copilot_hooks_file(
+    config_path: &Path,
+    project: bool,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
     let display = display_path(config_path);
     let mut config = load_json_or_empty(config_path)?;
     let root = json_object_mut(&mut config, config_path, "")?;
@@ -510,7 +674,7 @@ fn register_copilot_hooks_file(config_path: &Path, project: bool, out: &Output) 
     if project {
         match root.get("version") {
             Some(version) if version == &json!(1) => {}
-            Some(_) => return Err(config_shape(config_path, "/version", "version 1").into()),
+            Some(_) => return Err(config_shape(config_path, "/version", "version 1")),
             None => {
                 root.insert("version".into(), json!(1));
                 changed = true;
@@ -613,7 +777,10 @@ fn antigravity_handler(cli_arg: &str) -> serde_json::Value {
     })
 }
 
-fn register_antigravity_hooks(hooks_path: &Path, out: &Output) -> Result<()> {
+fn register_antigravity_hooks(
+    hooks_path: &Path,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
     let mut config = load_json_or_empty(hooks_path)?;
     let display = display_path(hooks_path);
     let root = json_object_mut(&mut config, hooks_path, "")?;
@@ -644,6 +811,7 @@ fn register_antigravity_hooks(hooks_path: &Path, out: &Output) -> Result<()> {
 
 /// Remove only symposium's own named entry, leaving hooks other tools or the
 /// user registered in the same file untouched.
+#[cfg(test)]
 fn unregister_antigravity_hooks(hooks_path: &Path, out: &Output) {
     unregister_hook_file(hooks_path, HookConfigLayout::Antigravity, out);
 }
@@ -702,7 +870,10 @@ fn merge_kiro_hooks(
 }
 
 /// Register hooks by creating a Kiro agent file (`.kiro/agents/symposium.json`).
-fn register_kiro_hooks(agents_dir: &Path, out: &Output) -> Result<()> {
+fn register_kiro_hooks(
+    agents_dir: &Path,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
     let hook_file = agents_dir.join("symposium.json");
     let display = display_path(&hook_file);
 
@@ -756,6 +927,7 @@ fn kiro_hook_entries() -> Vec<(&'static str, serde_json::Value)> {
 }
 
 /// Remove the symposium agent file from a Kiro agents directory.
+#[cfg(test)]
 fn unregister_kiro_hooks(agents_dir: &Path, out: &Output) {
     unregister_hook_file(
         &agents_dir.join("symposium.json"),
@@ -768,11 +940,13 @@ fn unregister_kiro_hooks(agents_dir: &Path, out: &Output) {
 // Hook unregistration
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 fn unregister_claude_hooks(settings_path: &Path, out: &Output) {
     unregister_hook_file(settings_path, HookConfigLayout::Grouped, out);
 }
 
 /// Remove symposium hooks from a Copilot project hooks directory.
+#[cfg(test)]
 fn unregister_copilot_hooks(hooks_dir: &Path, out: &Output) {
     unregister_hook_file(
         &hooks_dir.join("symposium.json"),
@@ -782,6 +956,7 @@ fn unregister_copilot_hooks(hooks_dir: &Path, out: &Output) {
 }
 
 /// Remove symposium hooks from the global Copilot config.
+#[cfg(test)]
 fn unregister_copilot_hooks_global(config_path: &Path, out: &Output) {
     unregister_hook_file(config_path, HookConfigLayout::CopilotSettings, out);
 }
@@ -845,6 +1020,18 @@ impl HookConfigLayout {
     }
 }
 
+fn try_unregister_hook_file_with_output(
+    path: &Path,
+    layout: HookConfigLayout,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
+    if try_unregister_hook_file(path, layout)? {
+        out.removed(format!("{}: removed hooks", display_path(path)));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn unregister_hook_file(path: &Path, layout: HookConfigLayout, out: &Output) {
     match try_unregister_hook_file(path, layout) {
         Ok(true) => out.removed(format!("{}: removed hooks", display_path(path))),
@@ -1001,13 +1188,24 @@ fn event_to_cli_arg(event: &str) -> &str {
 
 /// Agent configuration failures with content-free diagnostics and structured sources.
 ///
-/// Public registration methods retain their compatible `anyhow::Result` signatures;
-/// callers can downcast to this type to inspect a filesystem or parser source.
+/// Canonical `try_*` methods return this type directly. Legacy registration methods
+/// retain their compatible `anyhow::Result` signatures through the root 0.6 release.
 /// Format the top-level error for diagnostics: parser source displays can contain
 /// configuration contents.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AgentConfigError {
+    /// A skill name is empty, traverses directories, or is otherwise unsafe as one component.
+    #[error("unsafe skill directory name")]
+    UnsafeSkillName,
+    /// The requested name is not one of the supported agents.
+    #[error(
+        "unknown agent (expected antigravity, claude, codex, copilot, goose, kiro, or opencode)"
+    )]
+    UnknownAgent,
+    /// A newer transport variant cannot be represented safely by this adapter.
+    #[error("unsupported MCP server transport")]
+    UnsupportedMcpServer,
     /// The agent configuration could not be read.
     #[error("failed to read agent configuration {path}")]
     Read {
@@ -1260,7 +1458,83 @@ fn save_json(path: &Path, value: &serde_json::Value) -> std::result::Result<(), 
 mod tests {
     use super::*;
 
-    type HookRegistrar = fn(&Path, &Output) -> Result<()>;
+    #[test]
+    fn checked_agent_name_rejects_without_echoing_untrusted_input() {
+        let error = Agent::try_from_config_name("synthetic-secret-canary").unwrap_err();
+        assert!(matches!(error, AgentConfigError::UnknownAgent));
+        assert!(!error.to_string().contains("synthetic-secret-canary"));
+        let legacy = Agent::from_config_name("synthetic-secret-canary").unwrap_err();
+        assert!(matches!(
+            legacy.downcast_ref::<AgentConfigError>(),
+            Some(AgentConfigError::UnknownAgent)
+        ));
+    }
+
+    #[test]
+    fn checked_skill_paths_validate_without_panicking_or_changing_valid_paths() {
+        let base = Path::new("root");
+        for agent in Agent::all() {
+            for name in ["", ".", "..", "../outside", "synthetic-secret-canary/child"] {
+                for error in [
+                    agent.try_project_skill_dir(base, name).unwrap_err(),
+                    agent.try_global_skill_dir(base, name).unwrap_err(),
+                ] {
+                    assert!(matches!(error, AgentConfigError::UnsafeSkillName));
+                    assert!(!error.to_string().contains("synthetic-secret-canary"));
+                }
+            }
+            assert_eq!(
+                agent.try_project_skill_dir(base, "safe-skill").unwrap(),
+                agent.project_skill_dir(base, "safe-skill"),
+            );
+            assert_eq!(
+                agent.try_global_skill_dir(base, "safe-skill").unwrap(),
+                agent.global_skill_dir(base, "safe-skill"),
+            );
+        }
+    }
+
+    #[test]
+    fn checked_public_hook_changes_preserve_parser_sources_and_rejected_bytes() {
+        use std::error::Error as _;
+
+        for (agent, file) in [
+            (Agent::Antigravity, ".agents/hooks.json"),
+            (Agent::Claude, ".claude/settings.json"),
+            (Agent::Codex, ".codex/hooks.json"),
+            (Agent::Copilot, ".github/hooks/symposium.json"),
+            (Agent::Kiro, ".kiro/agents/symposium.json"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let sym = Symposium::try_from_dir(&tmp.path().join("symposium")).unwrap();
+            let path = tmp.path().join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let original = "{invalid-json synthetic-secret-canary";
+            fs::write(&path, original).unwrap();
+            for error in [
+                agent
+                    .try_register_project_hooks(tmp.path(), &sym, &Output::quiet())
+                    .unwrap_err(),
+                agent
+                    .try_unregister_project_hooks(tmp.path(), &sym, &Output::quiet())
+                    .unwrap_err(),
+            ] {
+                assert!(matches!(error, AgentConfigError::Json { .. }));
+                assert!(error.source().unwrap().is::<serde_json::Error>());
+                assert!(!error.to_string().contains("synthetic-secret-canary"));
+                assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            }
+            let legacy = agent
+                .register_project_hooks(tmp.path(), &sym, &Output::quiet())
+                .unwrap_err();
+            assert!(matches!(
+                legacy.downcast_ref::<AgentConfigError>(),
+                Some(AgentConfigError::Json { .. })
+            ));
+        }
+    }
+
+    type HookRegistrar = fn(&Path, &Output) -> std::result::Result<(), AgentConfigError>;
 
     struct HookRegistration {
         register: HookRegistrar,
@@ -1523,7 +1797,10 @@ mod tests {
                 let error =
                     (case.register)(&tmp.path().join(case.target), &Output::quiet()).unwrap_err();
                 assert!(
-                    error.downcast_ref::<AgentConfigError>().is_some(),
+                    matches!(
+                        error,
+                        AgentConfigError::Json { .. } | AgentConfigError::Shape { .. }
+                    ),
                     "{error}"
                 );
                 assert!(!error.to_string().contains("synthetic-secret-canary"));

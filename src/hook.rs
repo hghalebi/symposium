@@ -47,13 +47,13 @@ struct ResolvedHook {
 }
 
 impl ResolvedHook {
-    fn build(parsed_plugin: &Plugin, hook: &crate::plugins::Hook) -> anyhow::Result<Self> {
+    fn build(parsed_plugin: &Plugin, hook: &crate::plugins::Hook) -> Result<Self, HookError> {
         let plugin = &parsed_plugin.manifest;
-        let lookup = |name: &str| -> anyhow::Result<Installation> {
+        let lookup = |name: &str| -> Result<Installation, HookError> {
             plugin
                 .get_installation(name)
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("installation `{name}` not found in plugin"))
+                .ok_or(HookError::MissingInstallation)
         };
 
         let command = lookup(&hook.command)?;
@@ -61,7 +61,7 @@ impl ResolvedHook {
             .requirements
             .iter()
             .map(|name| lookup(name))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, HookError>>()?;
 
         Ok(Self {
             hook_name: hook.name.clone(),
@@ -229,6 +229,9 @@ pub enum HookError {
     /// Registry configuration could not provide a complete source set.
     #[error("failed to resolve hook registries")]
     Registry(#[from] crate::config::RegistryError),
+    /// A hook refers to an installation absent from its validated manifest.
+    #[error("hook refers to a missing installation")]
+    MissingInstallation,
     /// An agent does not support the selected event.
     #[error("agent {agent:?} does not support hook event {event:?}")]
     UnsupportedEvent { agent: HookAgent, event: HookEvent },
@@ -608,7 +611,7 @@ async fn run_auto_sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, session_start
     };
 
     tracing::debug!("auto-sync running");
-    if let Err(_error) = crate::sync::sync(sym, deps, update).await {
+    if let Err(_error) = crate::sync::try_sync(sym, deps, update).await {
         tracing::warn!(session_start, "auto-sync during hook failed (continuing)");
         return false;
     }
@@ -868,7 +871,13 @@ fn update_nudge(sym: &Symposium) -> Option<String> {
     }
     crate::state::record_update_check(sym.config_dir());
 
-    let latest = crate::self_update::check_upgrade(sym).ok()??;
+    let latest = match crate::self_update::try_check_upgrade(sym) {
+        Ok(latest) => latest?,
+        Err(error) => {
+            tracing::warn!(error = %error, "hook update check failed (continuing)");
+            return None;
+        }
+    };
     Some(format!(
         "symposium {latest} is available (current: {CURRENT_VERSION}). \
          Run `cargo agents self-update` to upgrade."
@@ -1120,7 +1129,7 @@ async fn try_dispatch_plugin_hooks(
         &mut ctx,
     )
     .await;
-    let hooks = dispatched_hooks_for_payload(&plugins, sym_input, host_agent, &mut ctx);
+    let hooks = dispatched_hooks_for_payload(&plugins, sym_input, host_agent, &mut ctx)?;
 
     let handler =
         crate::hook_schema::agent_event(host_agent, event).ok_or(HookError::UnsupportedEvent {
@@ -1270,7 +1279,7 @@ fn dispatched_hooks_for_payload(
     input: &symposium::InputEvent,
     host_agent: HookAgent,
     ctx: &mut crate::predicate::PredicateContext,
-) -> Vec<ResolvedHook> {
+) -> Result<Vec<ResolvedHook>, HookError> {
     tracing::trace!(event = ?input.event(), plugin_count = plugins.len(), "matching hooks for payload");
 
     let mut out = Vec::new();
@@ -1319,12 +1328,7 @@ fn dispatched_hooks_for_payload(
                 continue;
             }
             tracing::debug!(event = ?input.event(), selected = true, format = ?hook.format, "hook selected");
-            match ResolvedHook::build(parsed_plugin, hook) {
-                Ok(dispatched) => out.push(dispatched),
-                Err(_error) => {
-                    tracing::warn!(event = ?input.event(), "failed to resolve hook for dispatch");
-                }
-            }
+            out.push(ResolvedHook::build(parsed_plugin, hook)?);
         } else if parsed_plugin
             .manifest
             .hooks
@@ -1335,7 +1339,7 @@ fn dispatched_hooks_for_payload(
         }
     }
 
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1873,6 +1877,22 @@ mod tests {
     }
 
     #[test]
+    fn missing_hook_installation_is_typed_and_never_silently_skipped() {
+        let mut plugin = plugin_with_hook(vec![], vec![]);
+        plugin.manifest.hooks[0].command = STREAM_CANARY.into();
+        let error = dispatched_hooks_for_payload(
+            &[plugin],
+            &pre_tool_use_input(),
+            HookAgent::Claude,
+            &mut crate::predicate::PredicateContext::new(&[]),
+        )
+        .err()
+        .expect("missing installation must reject dispatch");
+        assert!(matches!(error, HookError::MissingInstallation));
+        assert!(!error.to_string().contains(STREAM_CANARY));
+    }
+
+    #[test]
     fn dispatch_skips_when_plugin_predicate_fails() {
         let plugin = plugin_with_hook(vec!["false"], vec![]);
         let hooks = dispatched_hooks_for_payload(
@@ -1880,7 +1900,8 @@ mod tests {
             &pre_tool_use_input(),
             HookAgent::Claude,
             &mut crate::predicate::PredicateContext::new(&[]),
-        );
+        )
+        .unwrap();
         assert!(hooks.is_empty(), "plugin-level false should drop all hooks");
     }
 
@@ -1892,7 +1913,8 @@ mod tests {
             &pre_tool_use_input(),
             HookAgent::Claude,
             &mut crate::predicate::PredicateContext::new(&[]),
-        );
+        )
+        .unwrap();
         assert!(hooks.is_empty(), "hook-level false should drop the hook");
     }
 
@@ -1904,7 +1926,8 @@ mod tests {
             &pre_tool_use_input(),
             HookAgent::Claude,
             &mut crate::predicate::PredicateContext::new(&[]),
-        );
+        )
+        .unwrap();
         assert_eq!(hooks.len(), 1);
     }
 
@@ -1925,7 +1948,8 @@ mod tests {
             &pre_tool_use_input(),
             HookAgent::Claude,
             &mut crate::predicate::PredicateContext::new(&[]),
-        );
+        )
+        .unwrap();
         assert!(
             empty.is_empty(),
             "crate-gated hook should not fire without the crate"
@@ -1942,7 +1966,8 @@ mod tests {
             &pre_tool_use_input(),
             HookAgent::Claude,
             &mut crate::predicate::PredicateContext::new(&deps),
-        );
+        )
+        .unwrap();
         assert_eq!(
             matched.len(),
             1,

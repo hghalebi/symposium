@@ -1,6 +1,31 @@
 # Key modules
 
-Symposium is a Rust crate with both a library (`src/lib.rs`) and a binary (`src/bin/cargo-agents.rs`). The library re-exports all modules so that integration tests can access internals.
+Symposium is a Rust crate with both a library (`src/lib.rs`) and a binary (`src/bin/cargo-agents.rs`). Public modules expose supported application and plugin integration boundaries. Implementation modules such as installation, crate sources, skills and predicate evaluation remain crate-private; public errors are narrowly re-exported when callers need their concrete sources.
+
+### Typed failures and compatibility
+
+Canonical fallible entry points use `try_*` methods and concrete `thiserror`
+errors at each responsibility: configuration and agent edits, package resolution,
+manifest/skill validation, installation, synchronization, consent and commands.
+Errors preserve their original parser, filesystem, process, or transport sources.
+Their normal displays describe the operation without echoing source lines,
+commands, URLs, environment values, or untrusted payloads. The executable owns
+final diagnostic formatting and output delivery; it prints the outer error
+rather than recursively formatting a potentially private source chain.
+
+The existing published root 0.5, SDK 0.1 and installer 0.1 signatures are retained
+as short compatibility adapters. Removal belongs to root 0.6, independently
+versioned SDK 0.2 and installer 0.2 respectively. These windows do not change
+package versions or authorize publication. Owned application callers use the
+canonical APIs. Public extension traits retain their original required methods;
+new default typed methods adapt external legacy implementations explicitly,
+while built-in implementations return concrete errors directly.
+
+Optional discovery, cache maintenance and update hints retain their best-effort
+policies with safe diagnostics. Required operations propagate failures. Cache
+persistence updates its saved snapshot only after successful replacement, so a
+failed write stays retryable. A selected hook with a missing installation is a
+typed dispatch failure rather than a silently omitted hook.
 
 ### `symposium-sdk`: the shared plugin vocabulary
 
@@ -15,7 +40,7 @@ What deliberately stays in Symposium is *validation*: defaults, inline-installat
 
 ### `config.rs` — application context
 
-Everything hangs off the `Symposium` struct, which wraps the parsed `Config` with resolved paths for config, cache, and log directories. Two constructors: `from_environment()` for production and `from_dir()` for tests.
+Everything hangs off the `Symposium` struct, which wraps the parsed `Config` with resolved paths for config, cache, and log directories. The canonical constructors are `try_from_environment()` for production and `try_from_dir()` for isolated tests, returning `ConfigError`. Their older infallible signatures remain compatible until root 0.6.
 
 Defines the user-wide `Config` (stored at `~/.symposium/config.toml`) with `[[agent]]` entries, logging, `[[registry]]` entries (`[[plugin-source]]` is the retired spelling, still accepted), defaults, `auto-update` (off/warn/on, default on), and the `[plugins]` enablement section. User config is deserialized through `RawConfig` and validated into the runtime `Config`; runtime code does not deserialize `Config` directly. Provides `registry_instances()` to build the effective registry `PmInstance`s directly (the builtin recommendations entry, the builtin `user-plugins` entry, then the configured ones): a git `[[registry]]` entry becomes a `GitPm`, a path entry a `PathPm`, each a trust root named for its registry (that name is what its plugins are attributed to). There is no `ResolvedRegistry`/`content_dir` intermediate — a git registry's cache directory and its refresh live on the `GitPm` itself. `package_managers(deps)` prepends the fixed cargo transport (a `CargoPm` built over the shared `deps` resolver) to those to make the active `PmRegistry`. `detached_managers()` is the workspace-independent form (registry listing, crates.io search) — its cargo transport is built over a detached resolver that never runs `cargo metadata`. The `workspace_deps(cwd)` factory is the standard way to create a `WorkspaceDeps` — it wires in `cargo_override` and `cache_dir` so callers get both the `SYMPOSIUM_CARGO` override and cross-invocation disk caching, and returns it as an `Arc` so a `CargoPm` can hold one.
 
@@ -158,7 +183,7 @@ Enablement is the second axis alongside activation predicates: predicates say *w
 
 On top of that read side sits the consent write side. `prompt_for_consent(sym, deps, out)` asks one question per candidate (enable / ask me later / never ask again) and `apply_consent` records the answers — approvals into `auto-enable`, declines into `disable`, saved to the user config. Only explicit answers are recorded: the default ("ask me later") and Escape write nothing, so reflexively hitting Enter never permanently declines anything.
 
-**The prompt is inert unless `out.is_interactive()`** — a non-quiet, non-capturing `Output` attached to a terminal on *both* ends. That is the whole safety property: hook dispatch and anything an agent triggers run with a quiet output, and the library test harness runs with a capturing one, so neither can reach stdin. A bare TTY check would not do, since `cargo test` inherits the developer's terminal. The only caller is the `Commands::Sync` arm in `cli.rs` — the hook-triggered auto-sync path calls `sync::sync` directly and never passes through it. `pending_candidates` is the non-interactive counterpart: `hook.rs`'s `consent_hint` renders it into `SessionStart` context so the agent can tell the user, without symposium ever blocking.
+**The prompt is inert unless `out.is_interactive()`** — a non-quiet, non-capturing `Output` attached to a terminal on *both* ends. That is the whole safety property: hook dispatch and anything an agent triggers run with a quiet output, and the library test harness runs with a capturing one, so neither can reach stdin. A bare TTY check would not do, since `cargo test` inherits the developer's terminal. The only caller is the `Commands::Sync` arm in `cli.rs` — the hook-triggered auto-sync path calls `sync::try_sync` directly and never passes through it. `pending_candidates` is the non-interactive counterpart: `hook.rs`'s `consent_hint` renders it into `SessionStart` context so the agent can tell the user, without symposium ever blocking.
 
 ### `use_command.rs` / `search_command.rs` / `status_command.rs` — the enablement commands
 
@@ -188,7 +213,7 @@ Handles the hook pipeline: parse agent wire-format input → auto-sync → built
 
 `run_auto_sync` takes a `session_start` flag: on `SessionStart` it skips the `Cargo.lock` freshness gate and syncs with `UpdateLevel::Check` (so upstream skill/source changes land once per session); every other event keeps the gated, `UpdateLevel::None` path. The matching `ensure_registries` refresh level is decided in the binary entry point from the same event. `SessionStart` additionally runs `prewarm_hook_sources` (best-effort, gated by `auto-sync`): it walks every applicable plugin's hooks and *refreshes* each installation's already-cached source via `refresh_installation_if_present` (`UpdateLevel::Check`). This is what keeps hook *binaries/scripts* (not just manifests) current once per session — in particular the only path that re-pulls a `cargo + git` hook binary whose branch moved — so the dispatch path can keep acquiring with `None` (cache/debounced) and pay no per-event network cost. It is **refresh-only**: a source that was never acquired is left alone (it installs lazily on first dispatch), so `SessionStart` never eagerly installs a tool a hook may never use.
 
-On `SessionStart`, `handle_session_start` composes three independently-computed `additionalContext` fragments: a `discovery_hint` (suggests `cargo agents --help` when the workspace exposes applicable plugin subcommands, reusing `subcommand_dispatch::applicable_subcommands`), a `consent_hint` (names the dependency plugins awaiting consent, via `discovery::pending_candidates` — a hook must never block on stdin, so the candidates are reported as context pointing at `cargo agents sync` / `cargo agents use` rather than asked about), and an `update_nudge` (the throttled self-update warning); only the nudge is gated behind the update-check throttle. `handle_post_tool_use` and `handle_user_prompt_submit` add one generic notice (there may be new plugins, run `cargo agents sync`) when `run_auto_sync` reports that it re-synced because `Cargo.lock` changed. The plugin dispatch path matches plugin `Hook`s against the event over the active plugin set (`skills::active_plugins`, so crate-sourced hooks fire too), selects the best format for each plugin (native match > symposium > single-other-agent fallback), builds a `ResolvedHook` per match (looking up the named installations on the plugin), then for each `ResolvedHook`: acquires its `requirements` (best-effort), runs `install_commands` after the source step, picks a `Runnable` from (hook-or-install) `executable`/`script`, and spawns it (binary directly for `Exec`, via `sh <path>` for `Script`). Input is delivered in the selected format; output is converted back to the agent's wire format before returning.
+On `SessionStart`, `handle_session_start` composes three independently-computed `additionalContext` fragments: a `discovery_hint` (suggests `cargo agents --help` when the workspace exposes applicable plugin subcommands, reusing `subcommand_dispatch::applicable_subcommands`), a `consent_hint` (names the dependency plugins awaiting consent, via `discovery::pending_candidates` — a hook must never block on stdin, so the candidates are reported as context pointing at `cargo agents sync` / `cargo agents use` rather than asked about), and an `update_nudge` (the throttled self-update warning); only the nudge is gated behind the update-check throttle. `handle_post_tool_use` and `handle_user_prompt_submit` add one generic notice (there may be new plugins, run `cargo agents sync`) when `run_auto_sync` reports that it re-synced because `Cargo.lock` changed. The plugin dispatch path matches plugin `Hook`s against the event over the active plugin set (`skills::active_plugins`, so crate-sourced hooks fire too), selects the best format for each plugin (native match > symposium > single-other-agent fallback), builds a `ResolvedHook` per match (looking up the named installations on the plugin), then for each `ResolvedHook`: acquires its `requirements` (required failures stop dispatch), runs `install_commands` after the source step, picks a `Runnable` from (hook-or-install) `executable`/`script`, and spawns it (binary directly for `Exec`, via `sh <path>` for `Script`). Input is delivered in the selected format; output is converted back to the agent's wire format before returning.
 
 ### `state.rs` — persistent state
 

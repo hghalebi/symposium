@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add typed canonical configuration, registry, manifest, installation, workflow,
+  command and hook APIs with inspectable original error sources. Existing root
+  signatures remain compatibility adapters until root 0.6; independently
+  versioned SDK and installer adapters target 0.2. No versions are bumped.
+
+### Fixed
+
+- Validate registry and runnable alternatives before filesystem, setup or
+  consent effects; preserve foreign settings and failed cache replacements.
+- Keep diagnostic displays free of parser source lines and command payloads,
+  propagate required hook transport failures, and preserve native denials.
+- Retry predicate cache persistence after failed writes, including durability
+  failures, instead of falsely advancing the saved snapshot.
+- Report single-manifest validation success without copying manifest values to
+  stdout. Use `plugin show` to inspect an explicitly selected resolved plugin.
+
 ## [0.5.1](https://github.com/symposium-dev/symposium/compare/symposium-v0.5.0...symposium-v0.5.1) - 2026-10-01
 
 ### Other

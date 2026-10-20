@@ -7,27 +7,138 @@ use crate::predicate::PredicateEval;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
 use symposium_install::UpdateLevel;
+use symposium_sdk::predicate::PredicateSyntaxError;
+use thiserror::Error;
 
 use crate::config::Symposium;
 use crate::plugins::{Plugin, PluginSource, SkillGroup};
 use crate::predicate::{PredicateContext, PredicateSet};
 
+/// A frontmatter failure whose display never includes source text or field values.
+///
+/// YAML parser diagnostics remain available through [`std::error::Error::source`]
+/// and can contain private input. Do not recursively format those sources in logs.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum FrontmatterError {
+    /// The opening frontmatter delimiter is absent.
+    #[error("SKILL.md must start with --- frontmatter fence")]
+    MissingOpeningFence,
+    /// The closing frontmatter delimiter is absent.
+    #[error("no closing --- fence in frontmatter")]
+    MissingClosingFence,
+    /// The fenced text is malformed YAML.
+    #[error("frontmatter is not valid YAML")]
+    Yaml(#[source] serde_yaml_ng::Error),
+    /// The YAML root is not a mapping.
+    #[error("SKILL.md frontmatter must be a YAML mapping")]
+    ExpectedMapping,
+    /// A frontmatter key is not a string.
+    #[error("SKILL.md frontmatter keys must be strings")]
+    NonStringKey,
+    /// A frontmatter value is not a string.
+    #[error("SKILL.md frontmatter fields must be strings")]
+    NonStringValue,
+    /// The retired dependency field must be migrated.
+    #[error("the `crates` frontmatter field has been renamed; use `depends-on` instead")]
+    RetiredCrates,
+}
+
+/// A skill read, validation, discovery, or acquisition failure with safe display text.
+///
+/// Paths and concrete parser/I/O sources are retained for structured inspection.
+/// Sources and `Debug` output can contain private data and must not be logged.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum SkillError {
+    /// The skill's Markdown file could not be read.
+    #[error("failed to read SKILL.md")]
+    Read {
+        /// The affected skill file.
+        path: PathBuf,
+        /// The original filesystem failure.
+        source: std::io::Error,
+    },
+    /// A directory or directory entry could not be inspected.
+    #[error("failed to discover SKILL.md files")]
+    Discover {
+        /// The affected directory or entry.
+        path: PathBuf,
+        /// The original filesystem failure.
+        source: std::io::Error,
+    },
+    /// A configured skill directory exists with a different filesystem type.
+    #[error("skill source must be a directory")]
+    NotDirectory {
+        /// The configured source path.
+        path: PathBuf,
+    },
+    /// A skill's frontmatter could not be parsed.
+    #[error("failed to parse frontmatter in SKILL.md")]
+    Frontmatter {
+        /// The affected skill file.
+        path: PathBuf,
+        /// The concrete frontmatter failure.
+        source: FrontmatterError,
+    },
+    /// Skill-level dependency or predicate syntax is invalid.
+    #[error("invalid SKILL.md depends-on predicate or predicates")]
+    Predicates {
+        /// The affected skill file.
+        path: PathBuf,
+        /// The original predicate syntax failure.
+        source: PredicateSyntaxError,
+    },
+    /// A required published-skill field is missing.
+    #[error("SKILL.md frontmatter missing required `{field}` field")]
+    MissingField {
+        /// The fixed required field name.
+        field: &'static str,
+    },
+    /// The skill name cannot safely name an installation directory.
+    #[error("SKILL.md `name` must be a plain directory name")]
+    UnsafeName,
+    /// The description contains no non-whitespace text.
+    #[error("SKILL.md `description` must not be empty")]
+    EmptyDescription,
+    /// The description exceeds the existing UTF-8 byte limit.
+    #[error("SKILL.md `description` exceeds 1024 bytes ({byte_len} bytes)")]
+    OversizeDescription {
+        /// The observed UTF-8 byte length.
+        byte_len: usize,
+    },
+    /// A Git skill source could not be validated, fetched, or inspected.
+    #[error("failed to acquire Git skill source")]
+    Git(#[source] symposium_install::git::GitError),
+    /// The acquired Git source lacks metadata needed to pin its contents.
+    #[error("skipping Git skill group: cache metadata missing; cannot pin commit SHA")]
+    MissingGitMetadata {
+        /// The acquired source directory.
+        path: PathBuf,
+    },
+}
+
 fn source_display(source: &PluginSource) -> String {
     match source {
         PluginSource::Path(p) => format!("path:{}", p.display()),
-        PluginSource::Git(url) => format!("git:{url}"),
+        PluginSource::Git(url) => match symposium_install::git::try_parse_git_url(url) {
+            Ok(_) => format!("git:{url}"),
+            Err(_) => "git:invalid source".to_string(),
+        },
     }
 }
 
 /// The group's resolved source label: the string the package manager attached
 /// to a `Path` source, or the derived form for a `Git` source.
 fn group_source_label(group: &crate::plugins::SkillGroup) -> String {
-    group
-        .source_label
-        .clone()
-        .unwrap_or_else(|| source_display(&group.source))
+    match &group.source {
+        PluginSource::Git(_) => source_display(&group.source),
+        PluginSource::Path(_) => group
+            .source_label
+            .clone()
+            .unwrap_or_else(|| source_display(&group.source)),
+    }
 }
 
 /// A parsed skill from a SKILL.md file.
@@ -70,16 +181,11 @@ impl Skill {
 // only a string — not a structured origin — is carried to the sync layer.
 
 /// 8-hex-char prefix of SHA-256 over the JSON-serialized origin key.
-fn hash_origin_key<T: serde::Serialize>(key: &T) -> String {
+fn hash_origin_key(key: &str) -> String {
     use sha2::{Digest, Sha256};
-    let bytes = serde_json::to_vec(key).expect("origin key always serializes");
-    let digest = Sha256::digest(&bytes);
-    let mut out = String::with_capacity(8);
-    for byte in &digest[..4] {
-        use std::fmt::Write;
-        write!(out, "{byte:02x}").unwrap();
-    }
-    out
+    let encoded = serde_json::Value::String(key.to_owned()).to_string();
+    let digest = Sha256::digest(encoded.as_bytes());
+    format!("{digest:x}").chars().take(8).collect()
 }
 
 /// Origin hash for a skill, keyed on its `SKILL.md`'s canonical path so that the
@@ -100,6 +206,14 @@ pub struct SkillWithGroupContext {
     /// The hash of where the skill was discovered. Drives install-path disambiguation
     /// and dedup at sync time.
     pub origin_hash: String,
+}
+
+/// Successful skills and whether any source or item could not be inspected.
+pub(crate) struct SkillCollection {
+    /// Applicable skills successfully discovered from the available sources.
+    pub skills: Vec<SkillWithGroupContext>,
+    /// Cleanup must retain installed skills while a source or item is unresolved.
+    pub has_failures: bool,
 }
 
 /// Resolve all applicable skills from the registry.
@@ -143,7 +257,7 @@ pub async fn skills_applicable_to(
         .expect("skill fixture has valid registry sources");
     let active =
         crate::plugins::active_plugins(sym, registry, &pms, workspace_root, &mut ctx).await;
-    collect_skills(sym, &active, &mut ctx, update).await
+    collect_skills(sym, &active, &mut ctx, update).await.skills
 }
 
 /// Extract the applicable skills from an already-resolved active plugin set.
@@ -157,40 +271,43 @@ pub(crate) async fn collect_skills(
     active: &[Plugin],
     ctx: &mut PredicateContext<'_>,
     update: UpdateLevel,
-) -> Vec<SkillWithGroupContext> {
-    let mut results = Vec::new();
+) -> SkillCollection {
+    let mut collection = SkillCollection {
+        skills: Vec::new(),
+        has_failures: false,
+    };
     for parsed in active {
         ctx.set_workspace_member(parsed.workspace_member);
         for group in &parsed.manifest.skills {
-            let skills = load_skills_for_group(sym, parsed, group, ctx, update).await;
+            let (skills, has_failures) =
+                load_skills_for_group(sym, parsed, group, ctx, update).await;
+            collection.has_failures |= has_failures;
             for (skill, origin_hash) in skills {
                 collect_skill_applicable_to(
                     skill,
                     origin_hash,
                     &parsed.manifest.name,
                     ctx,
-                    &mut results,
+                    &mut collection.skills,
                 );
             }
         }
     }
-    results
+    collection
 }
 
 /// Discover and load skills for a group, applying pre-fetch filtering.
 ///
 /// Checks group-level `depends-on` predicates against `for_crates` before
 /// fetching git sources, to avoid unnecessary downloads. Each returned skill is
-/// paired with the origin hash it was discovered through — its group's origin
-/// key combined
-/// with the SKILL.md's path within that origin, one per discovered SKILL.md.
+/// paired with the hash of its canonical on-disk SKILL.md path.
 async fn load_skills_for_group(
     sym: &Symposium,
     parsed: &Plugin,
     group: &SkillGroup,
     ctx: &mut PredicateContext<'_>,
     update: UpdateLevel,
-) -> Vec<(Skill, String)> {
+) -> (Vec<(Skill, String)>, bool) {
     let plugin = &parsed.manifest;
 
     // Pre-fetch filtering: skip groups whose predicates don't hold (crate
@@ -217,11 +334,17 @@ async fn load_skills_for_group(
                 reason: Some("group predicates not satisfied".into()),
             },
         );
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
-    let resolved = resolve_group_dirs(sym, parsed, group, update).await;
-    let skills = collect_skills_from_dirs(resolved, group);
+    let resolved = match resolve_group_dirs(sym, parsed, group, update).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to load skill group");
+            return (Vec::new(), true);
+        }
+    };
+    let (skills, has_failures) = collect_skills_from_dirs(resolved, group);
 
     tracing::debug!(
         report = %crate::report::ReportEvent::SkillGroupConsidered {
@@ -234,7 +357,7 @@ async fn load_skills_for_group(
         },
     );
 
-    skills
+    (skills, has_failures)
 }
 
 /// A base directory resolved for a skill group, with the report labels for the
@@ -260,30 +383,24 @@ async fn resolve_group_dirs(
     parsed: &Plugin,
     group: &SkillGroup,
     update: UpdateLevel,
-) -> Vec<ResolvedSkillDir> {
+) -> Result<Vec<ResolvedSkillDir>, SkillError> {
     let plugin = &parsed.manifest;
 
     match &group.source {
         // Resolved to an absolute directory by the package manager, so there is
         // nothing to join here.
-        PluginSource::Path(dir) => {
-            vec![ResolvedSkillDir {
-                dir: dir.clone(),
-                plugin_label: plugin.name.clone(),
-                source_label: group_source_label(group),
-            }]
-        }
+        PluginSource::Path(dir) => Ok(vec![ResolvedSkillDir {
+            dir: dir.clone(),
+            plugin_label: plugin.name.clone(),
+            source_label: group_source_label(group),
+        }]),
         PluginSource::Git(url) => {
-            let Some((cache_dir, source, _commit_sha)) =
-                fetch_git_skill_source(sym, url, update).await
-            else {
-                return Vec::new();
-            };
-            vec![ResolvedSkillDir {
+            let (cache_dir, source, _commit_sha) = fetch_git_skill_source(sym, url, update).await?;
+            Ok(vec![ResolvedSkillDir {
                 dir: cache_dir,
                 plugin_label: source.repo_id(),
                 source_label: format!("git:{url}"),
-            }]
+            }])
         }
     }
 }
@@ -294,8 +411,9 @@ async fn resolve_group_dirs(
 fn collect_skills_from_dirs(
     resolved: Vec<ResolvedSkillDir>,
     group: &SkillGroup,
-) -> Vec<(Skill, String)> {
+) -> (Vec<(Skill, String)>, bool) {
     let mut skills = Vec::new();
+    let mut has_failures = false;
     for entry in resolved {
         let discovered = discover_skills(&entry.dir, group.workspace_member, &group.predicates);
         tracing::debug!(
@@ -312,42 +430,38 @@ fn collect_skills_from_dirs(
                     let origin_hash = skill_origin_hash(&skill.path);
                     skills.push((skill, origin_hash));
                 }
-                Err(e) => tracing::warn!(
-                    source = %entry.source_label,
-                    error = %e,
-                    "failed to load skill",
-                ),
+                Err(error) => {
+                    has_failures = true;
+                    tracing::warn!(source = %entry.source_label, error = %error, "failed to load skill");
+                }
             }
         }
     }
-    skills
+    (skills, has_failures)
 }
 
 /// Fetch a `source.git` group's tarball and look up the resolved commit
 /// SHA from the cache meta. Returns `(cache_dir, parsed_source, commit_sha)`
-/// or `None` (with a warning) on failure.
+/// or a typed failure; the group boundary reports failure and retains other groups.
 async fn fetch_git_skill_source(
     sym: &Symposium,
     git_url: &str,
     update: UpdateLevel,
-) -> Option<(PathBuf, symposium_install::git::GitSource, String)> {
-    let cache_mgr = symposium_install::git::GitCacheManager::new(&sym.install_context(), "plugins");
-    let (cache_dir, source) = match cache_mgr.fetch_url_parsed(git_url, update).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(git = %git_url, error = %e, "failed to fetch skill source");
-            return None;
-        }
-    };
-    let Some(meta) = cache_mgr.read_meta_for(&cache_dir) else {
-        tracing::warn!(
-            git = %git_url,
-            cache_dir = %cache_dir.display(),
-            "skipping git skill group: cache meta missing (cannot pin commit SHA)"
-        );
-        return None;
-    };
-    Some((cache_dir, source, meta.commit_sha))
+) -> Result<(PathBuf, symposium_install::git::GitSource, String), SkillError> {
+    let cache_mgr =
+        symposium_install::git::GitCacheManager::try_new(&sym.install_context(), "plugins")
+            .map_err(SkillError::Git)?;
+    let (cache_dir, source) = cache_mgr
+        .try_fetch_url_parsed(git_url, update)
+        .await
+        .map_err(SkillError::Git)?;
+    let meta = cache_mgr
+        .try_read_meta_for(&cache_dir)
+        .map_err(SkillError::Git)?
+        .ok_or_else(|| SkillError::MissingGitMetadata {
+            path: cache_dir.clone(),
+        })?;
+    Ok((cache_dir, source, meta.commit_sha))
 }
 
 /// Discover all skills found in a given directory.
@@ -358,18 +472,35 @@ pub(crate) fn discover_skills(
     skills_dir: &Path,
     workspace_member: bool,
     group_predicates: &PredicateSet,
-) -> Vec<Result<Skill>> {
-    if !skills_dir.is_dir() {
-        return Vec::new();
+) -> Vec<Result<Skill, SkillError>> {
+    match std::fs::metadata(skills_dir) {
+        Ok(metadata) if !metadata.is_dir() => {
+            return vec![Err(SkillError::NotDirectory {
+                path: skills_dir.to_path_buf(),
+            })];
+        }
+        Ok(_) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(source) => {
+            return vec![Err(SkillError::Discover {
+                path: skills_dir.to_path_buf(),
+                source,
+            })];
+        }
     }
 
     let mut skill_files = Vec::new();
-    find_skill_files_recursive(skills_dir, &mut skill_files);
+    let errors = find_skill_files_recursive(skills_dir, &mut skill_files);
     prune_nested_skills(&mut skill_files);
 
-    skill_files
+    errors
         .into_iter()
-        .map(|skill_md| load_skill(&skill_md, workspace_member, group_predicates))
+        .map(Err)
+        .chain(
+            skill_files
+                .into_iter()
+                .map(|skill_md| load_skill(&skill_md, workspace_member, group_predicates)),
+        )
         .collect()
 }
 
@@ -379,30 +510,65 @@ pub(crate) fn discover_skills(
 /// symposium itself installed the directory, and installed copies are never
 /// sources. This matters for `.agents/skills/`, which is both a workspace
 /// skill-group source and the install destination for vendor-neutral agents.
-pub(crate) fn find_skill_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
+pub(crate) fn find_skill_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Vec<SkillError> {
     let mut ancestors = crate::dir_walk::Ancestors::rooted_at(dir);
-    find_skill_files_in(dir, &mut ancestors, out);
+    let mut errors = Vec::new();
+    find_skill_files_in(dir, &mut ancestors, out, &mut errors);
+    errors
 }
 
 fn find_skill_files_in(
     dir: &Path,
     ancestors: &mut crate::dir_walk::Ancestors,
     out: &mut Vec<PathBuf>,
+    errors: &mut Vec<SkillError>,
 ) {
-    if dir.join(crate::sync::MARKER_FILE).exists() {
-        return;
+    let marker = dir.join(crate::sync::MARKER_FILE);
+    match std::fs::metadata(&marker) {
+        Ok(_) => return,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            errors.push(SkillError::Discover {
+                path: marker,
+                source,
+            });
+            return;
+        }
     }
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(source) => {
+            errors.push(SkillError::Discover {
+                path: dir.to_path_buf(),
+                source,
+            });
+            return;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(source) => {
+                errors.push(SkillError::Discover {
+                    path: dir.to_path_buf(),
+                    source,
+                });
+                continue;
+            }
+        };
         let path = entry.path();
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(source) => {
+                errors.push(SkillError::Discover { path, source });
+                continue;
+            }
+        };
         // `is_dir` follows symlinks, so a symlinked directory of skills is
         // discovered — and can name a directory this walk is already inside.
-        if path.is_dir() {
+        if metadata.is_dir() {
             if ancestors.enter(&path) {
-                find_skill_files_in(&path, ancestors, out);
+                find_skill_files_in(&path, ancestors, out, errors);
                 ancestors.leave();
             }
         } else if path.file_name().is_some_and(|f| f == "SKILL.md") {
@@ -418,10 +584,10 @@ pub(crate) fn prune_nested_skills(paths: &mut Vec<PathBuf>) {
     paths.sort_by_key(|p| p.components().count());
     let mut kept: Vec<PathBuf> = Vec::new();
     for path in paths.drain(..) {
-        let skill_dir = path.parent().unwrap();
-        let nested = kept.iter().any(|k| {
-            let k_dir = k.parent().unwrap();
-            skill_dir.starts_with(k_dir)
+        let nested = path.parent().is_some_and(|skill_dir| {
+            kept.iter()
+                .filter_map(|path| path.parent())
+                .any(|parent| skill_dir.starts_with(parent))
         });
         if !nested {
             kept.push(path);
@@ -435,13 +601,13 @@ pub(crate) fn prune_nested_skills(paths: &mut Vec<PathBuf>) {
 fn frontmatter_predicates(
     depends_on: Option<&str>,
     predicates: Option<&str>,
-) -> Result<PredicateSet> {
+) -> Result<PredicateSet, PredicateSyntaxError> {
     let depends_on = match depends_on {
-        Some(s) => Some(crate::predicate::DependsOnList::parse(s)?),
+        Some(s) => Some(crate::predicate::DependsOnList::try_parse(s)?),
         None => None,
     };
     let extra = match predicates {
-        Some(s) => PredicateSet::parse(s)?,
+        Some(s) => PredicateSet::try_parse(s)?,
         None => PredicateSet::default(),
     };
     Ok(PredicateSet::merged(depends_on, extra))
@@ -453,18 +619,28 @@ fn frontmatter_predicates(
 /// by them and the ordinary dormancy rule applies — a bare skill with no
 /// dependency is dormant until `use`d). See
 /// [`plugins::standalone_skill_manifest`](crate::plugins::standalone_skill_manifest).
-pub(crate) fn standalone_skill_meta(skill_md: &Path) -> Result<(Option<String>, PredicateSet)> {
-    let content = std::fs::read_to_string(skill_md)
-        .with_context(|| format!("failed to read {}", skill_md.display()))?;
-    let fm = parse_frontmatter(&content)
-        .with_context(|| format!("failed to parse frontmatter in {}", skill_md.display()))?;
+pub(crate) fn standalone_skill_meta(
+    skill_md: &Path,
+) -> Result<(Option<String>, PredicateSet), SkillError> {
+    let content = std::fs::read_to_string(skill_md).map_err(|source| SkillError::Read {
+        path: skill_md.to_path_buf(),
+        source,
+    })?;
+    let fm = parse_frontmatter(&content).map_err(|source| SkillError::Frontmatter {
+        path: skill_md.to_path_buf(),
+        source,
+    })?;
     let name = fm.fields.get("name").map(|n| {
         n.strip_prefix('"')
             .and_then(|s| s.strip_suffix('"'))
             .unwrap_or(n)
             .to_string()
     });
-    let predicates = frontmatter_predicates(fm.depends_on.as_deref(), fm.predicates.as_deref())?;
+    let predicates = frontmatter_predicates(fm.depends_on.as_deref(), fm.predicates.as_deref())
+        .map_err(|source| SkillError::Predicates {
+            path: skill_md.to_path_buf(),
+            source,
+        })?;
     Ok((name, predicates))
 }
 
@@ -482,9 +658,11 @@ fn load_skill(
     skill_md_path: &Path,
     workspace_member: bool,
     group_predicates: &PredicateSet,
-) -> Result<Skill> {
-    let content = std::fs::read_to_string(skill_md_path)
-        .with_context(|| format!("failed to read {}", skill_md_path.display()))?;
+) -> Result<Skill, SkillError> {
+    let content = std::fs::read_to_string(skill_md_path).map_err(|source| SkillError::Read {
+        path: skill_md_path.to_path_buf(),
+        source,
+    })?;
 
     let fm = if workspace_member && !content.trim_start().starts_with("---") {
         RawFrontmatter {
@@ -493,8 +671,9 @@ fn load_skill(
             predicates: None,
         }
     } else {
-        parse_frontmatter(&content).with_context(|| {
-            format!("failed to parse frontmatter in {}", skill_md_path.display())
+        parse_frontmatter(&content).map_err(|source| SkillError::Frontmatter {
+            path: skill_md_path.to_path_buf(),
+            source,
         })?
     };
 
@@ -519,26 +698,29 @@ fn load_skill(
 
     let name = frontmatter
         .get("name")
-        .context("SKILL.md frontmatter missing required `name` field")?;
+        .ok_or(SkillError::MissingField { field: "name" })?;
     if !is_safe_dir_name(name) {
-        bail!("SKILL.md `name` must be a plain directory name, got {name:?}");
+        return Err(SkillError::UnsafeName);
     }
 
     // Validate description per agentskills.io spec
     // (https://agentskills.io/specification.md): required, non-empty, max 1024 chars.
     match frontmatter.get("description") {
         None if workspace_member => {}
-        None => bail!("SKILL.md frontmatter missing required `description` field"),
+        None => {
+            return Err(SkillError::MissingField {
+                field: "description",
+            });
+        }
         Some(desc) => {
             let trimmed_desc = desc.trim();
             if trimmed_desc.is_empty() {
-                bail!("SKILL.md `description` must not be empty");
+                return Err(SkillError::EmptyDescription);
             }
             if trimmed_desc.len() > 1024 {
-                bail!(
-                    "SKILL.md `description` exceeds 1024 characters ({} chars)",
-                    trimmed_desc.len()
-                );
+                return Err(SkillError::OversizeDescription {
+                    byte_len: trimmed_desc.len(),
+                });
             }
         }
     }
@@ -546,7 +728,11 @@ fn load_skill(
     // Merge the skill-level `depends-on` (dependency atoms, OR-combined) with
     // the frontmatter `predicates` (function-call syntax) into one set, ANDed
     // with the plugin- and group-level sets at match time.
-    let predicates = frontmatter_predicates(fm.depends_on.as_deref(), fm.predicates.as_deref())?;
+    let predicates = frontmatter_predicates(fm.depends_on.as_deref(), fm.predicates.as_deref())
+        .map_err(|source| SkillError::Predicates {
+            path: skill_md_path.to_path_buf(),
+            source,
+        })?;
 
     // Warn if no dependency is referenced at either level — the skill won't
     // match any dependency query, but we don't fail so a misconfigured plugin
@@ -621,10 +807,10 @@ struct RawFrontmatter {
 /// Parse SKILL.md content: extract the `---`-fenced frontmatter. The body
 /// after the frontmatter is not retained — skills install by copying the
 /// file, not by re-emitting parsed content.
-fn parse_frontmatter(content: &str) -> Result<RawFrontmatter> {
+fn parse_frontmatter(content: &str) -> Result<RawFrontmatter, FrontmatterError> {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
-        bail!("SKILL.md must start with --- frontmatter fence");
+        return Err(FrontmatterError::MissingOpeningFence);
     }
 
     let after_first_fence = &trimmed[3..];
@@ -634,15 +820,13 @@ fn parse_frontmatter(content: &str) -> Result<RawFrontmatter> {
 
     let end = after_first_fence
         .find("\n---")
-        .context("no closing --- fence in frontmatter")?;
+        .ok_or(FrontmatterError::MissingClosingFence)?;
 
     let frontmatter_text = &after_first_fence[..end];
 
     let yaml: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(frontmatter_text).context("frontmatter is not valid YAML")?;
-    let mapping = yaml
-        .as_mapping()
-        .context("SKILL.md frontmatter must be a YAML mapping")?;
+        serde_yaml_ng::from_str(frontmatter_text).map_err(FrontmatterError::Yaml)?;
+    let mapping = yaml.as_mapping().ok_or(FrontmatterError::ExpectedMapping)?;
 
     let mut fields = BTreeMap::new();
     let mut depends_on = None;
@@ -650,17 +834,17 @@ fn parse_frontmatter(content: &str) -> Result<RawFrontmatter> {
 
     for (key, value) in mapping {
         let Some(key) = key.as_str() else {
-            bail!("SKILL.md frontmatter keys must be strings");
+            return Err(FrontmatterError::NonStringKey);
         };
 
         let Some(value) = value.as_str() else {
-            bail!("SKILL.md frontmatter field `{key}` must be a string");
+            return Err(FrontmatterError::NonStringValue);
         };
 
         match key {
             "depends-on" => depends_on = Some(value.to_string()),
             "crates" => {
-                bail!("the `crates` frontmatter field has been renamed; use `depends-on` instead")
+                return Err(FrontmatterError::RetiredCrates);
             }
             "predicates" => predicates = Some(value.to_string()),
             _ => {
@@ -692,6 +876,268 @@ mod tests {
         PredicateSet::from_depends_on(s).unwrap()
     }
 
+    fn group(source: PluginSource) -> SkillGroup {
+        SkillGroup {
+            source,
+            predicates: PredicateSet::default(),
+            source_label: None,
+            workspace_member: false,
+        }
+    }
+
+    fn plugin_with_skill_groups(skills: Vec<SkillGroup>) -> Plugin {
+        Plugin {
+            canonical: PackageId::any_version("test", "typed-skills"),
+            workspace_member: false,
+            manifest: crate::plugins::PluginManifest {
+                name: "typed-skills".into(),
+                predicates: PredicateSet::default(),
+                skills,
+                hooks: vec![],
+                mcp_servers: vec![],
+                installations: vec![],
+                subcommands: BTreeMap::new(),
+                custom_predicates: vec![],
+                chained: vec![],
+                requires_use: false,
+            },
+        }
+    }
+
+    #[test]
+    fn origin_hash_preserves_json_string_encoding_and_sha256_prefix() {
+        for (key, expected) in [
+            ("", "12ae32cb"),
+            ("/workspace/skills/rust/SKILL.md", "ae1c6828"),
+            (r"C:\Users\developer\skills\SKILL.md", "b4826630"),
+            ("/workspace/\"quoted\"/SKILL.md", "e692dcfb"),
+            ("/workspace/é/🦀/SKILL.md", "a8de7e98"),
+            ("/workspace/skills/skill-534/SKILL.md", "007baaca"),
+            ("tab\tline\nreturn\rback\u{8}form\u{c}null\0end", "85403ca1"),
+        ] {
+            assert_eq!(hash_origin_key(key), expected, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn frontmatter_errors_classify_shapes_without_disclosing_contents() {
+        const CANARY: &str = "PRIVATE_FRONTMATTER_CANARY";
+        for (yaml, expected) in [
+            (format!("description: [{CANARY}"), "yaml"),
+            (format!("{CANARY}: [{CANARY}]"), "value"),
+            (format!("- {CANARY}"), "mapping"),
+            (format!("1: {CANARY}"), "key"),
+        ] {
+            let error = parse_frontmatter(&format!("---\n{yaml}\n---\n")).unwrap_err();
+            assert!(!error.to_string().contains(CANARY));
+            match (expected, &error) {
+                ("yaml", FrontmatterError::Yaml(_)) => {
+                    use std::error::Error as _;
+                    assert!(error.source().unwrap().is::<serde_yaml_ng::Error>());
+                }
+                ("value", FrontmatterError::NonStringValue)
+                | ("mapping", FrontmatterError::ExpectedMapping)
+                | ("key", FrontmatterError::NonStringKey) => {}
+                _ => panic!("wrong frontmatter classification: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn skill_boundaries_preserve_paths_and_concrete_read_and_yaml_sources() {
+        use std::error::Error as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        let error = load_skill(&path, false, &PredicateSet::default()).unwrap_err();
+        assert!(matches!(&error, SkillError::Read { path: failed, .. } if failed == &path));
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        fs::write(&path, "---\ndescription: [PRIVATE_YAML_CANARY\n---\n").unwrap();
+        let loaded = load_skill(&path, false, &PredicateSet::default()).unwrap_err();
+        let standalone = standalone_skill_meta(&path).unwrap_err();
+        for error in [loaded, standalone] {
+            assert!(!error.to_string().contains("PRIVATE_YAML_CANARY"));
+            assert!(
+                matches!(&error, SkillError::Frontmatter { path: failed, .. } if failed == &path)
+            );
+            let frontmatter = error
+                .source()
+                .unwrap()
+                .downcast_ref::<FrontmatterError>()
+                .unwrap();
+            assert!(frontmatter.source().unwrap().is::<serde_yaml_ng::Error>());
+        }
+    }
+
+    #[test]
+    fn skill_validation_retains_typed_predicates_without_echoing_values() {
+        use std::error::Error as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        for field in [
+            "depends-on: serde>=PRIVATE_PREDICATE_CANARY",
+            "predicates: PRIVATE_PREDICATE_CANARY",
+        ] {
+            fs::write(
+                &path,
+                format!("---\nname: valid\ndescription: d\n{field}\n---\n"),
+            )
+            .unwrap();
+            let loaded = load_skill(&path, false, &PredicateSet::default()).unwrap_err();
+            let standalone = standalone_skill_meta(&path).unwrap_err();
+            for error in [loaded, standalone] {
+                assert!(!error.to_string().contains("PRIVATE_PREDICATE_CANARY"));
+                assert!(matches!(error, SkillError::Predicates { .. }));
+                assert!(error.source().unwrap().is::<PredicateSyntaxError>());
+            }
+        }
+        fs::write(
+            &path,
+            "---\nname: PRIVATE_NAME_CANARY/escape\ndescription: d\n---\n",
+        )
+        .unwrap();
+        let error = load_skill(&path, false, &PredicateSet::default()).unwrap_err();
+        assert!(matches!(error, SkillError::UnsafeName));
+        assert!(!error.to_string().contains("PRIVATE_NAME_CANARY"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discovery_keeps_valid_skills_and_reports_broken_links() {
+        use std::error::Error as _;
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("good")).unwrap();
+        fs::write(
+            tmp.path().join("good/SKILL.md"),
+            "---\nname: good\ndescription: d\ndepends-on: serde\n---\n",
+        )
+        .unwrap();
+        let broken = tmp.path().join("broken");
+        std::os::unix::fs::symlink("missing", &broken).unwrap();
+        let found = discover_skills(tmp.path(), false, &PredicateSet::default());
+        assert_eq!(found.iter().filter(|skill| skill.is_ok()).count(), 1);
+        let error = found.into_iter().find_map(Result::err).unwrap();
+        assert!(matches!(&error, SkillError::Discover { path, .. } if path == &broken));
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(
+            discover_skills(&tmp.path().join("absent"), false, &PredicateSet::default()).is_empty()
+        );
+    }
+
+    #[test]
+    fn pruning_paths_without_parents_does_not_panic() {
+        let mut paths = vec![
+            PathBuf::new(),
+            "outer/SKILL.md".into(),
+            "outer/child/SKILL.md".into(),
+        ];
+        prune_nested_skills(&mut paths);
+        assert_eq!(paths, vec![PathBuf::new(), PathBuf::from("outer/SKILL.md")]);
+    }
+
+    #[tokio::test]
+    async fn skill_collection_retains_siblings_and_signals_incomplete_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        let source = tmp.path().join("skills");
+        fs::create_dir_all(source.join("good")).unwrap();
+        fs::create_dir(source.join("bad")).unwrap();
+        fs::write(
+            source.join("good/SKILL.md"),
+            "---\nname: good\ndescription: d\ndepends-on: serde\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            source.join("bad/SKILL.md"),
+            "---\nname: [PRIVATE_BAD_SKILL_CANARY\n---\n",
+        )
+        .unwrap();
+        let plugin = plugin_with_skill_groups(vec![group(PluginSource::Path(source))]);
+        let deps = ws(&[("serde", "1.0.0")]);
+        let collection = collect_skills(&sym, &[plugin], &mut ctx(&deps), UpdateLevel::None).await;
+        assert!(collection.has_failures);
+        assert_eq!(collection.skills.len(), 1);
+        assert_eq!(collection.skills[0].skill.name(), "good");
+
+        let missing = tmp.path().join("missing");
+        let plugin = plugin_with_skill_groups(vec![group(PluginSource::Path(missing.clone()))]);
+        let collection = collect_skills(&sym, &[plugin], &mut ctx(&deps), UpdateLevel::None).await;
+        assert!(!collection.has_failures);
+        assert!(collection.skills.is_empty());
+        fs::write(&missing, b"not a directory").unwrap();
+        let plugin = plugin_with_skill_groups(vec![group(PluginSource::Path(missing))]);
+        let collection = collect_skills(&sym, &[plugin], &mut ctx(&deps), UpdateLevel::None).await;
+        assert!(collection.has_failures);
+        assert!(collection.skills.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_git_sources_have_safe_reports_and_typed_failures_without_fetching() {
+        use std::error::Error as _;
+        const CANARY: &str = "PRIVATE_GIT_TOKEN_CANARY";
+        symposium_testlib::install_tracing_baseline();
+        let tmp = tempfile::tempdir().unwrap();
+        let sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(log.reopen().unwrap())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let url = format!("https://user:{CANARY}@github.com/owner/repo");
+        let source = PluginSource::Git(url.clone());
+        assert_eq!(source_display(&source), "git:invalid source");
+        assert_eq!(
+            source_display(&PluginSource::Git("https://github.com/owner/repo".into())),
+            "git:https://github.com/owner/repo"
+        );
+        let error = fetch_git_skill_source(&sym, &url, UpdateLevel::None)
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains(CANARY));
+        assert!(
+            error
+                .source()
+                .unwrap()
+                .is::<symposium_install::git::GitError>()
+        );
+        for skipped in [true, false] {
+            let mut group = group(source.clone());
+            group.source_label = Some(url.clone());
+            if skipped {
+                group.predicates = pred_set("serde");
+            }
+            let plugin = plugin_with_skill_groups(vec![group]);
+            let collection =
+                collect_skills(&sym, &[plugin], &mut ctx(&[]), UpdateLevel::None).await;
+            assert_eq!(collection.has_failures, !skipped);
+            assert!(collection.skills.is_empty());
+        }
+        drop(guard);
+        let logs = fs::read_to_string(log.path()).unwrap();
+        assert!(logs.contains("git:invalid source"));
+        assert!(logs.contains("failed to load skill group"));
+        assert!(!logs.contains(CANARY));
+        assert!(!sym.cache_dir().join("plugins").exists());
+    }
+
     /// Discovery follows directory links, so a skills tree that links back
     /// into itself must not be walked forever — and must not report the same
     /// `SKILL.md` once per turn around the loop.
@@ -705,7 +1151,7 @@ mod tests {
         std::os::unix::fs::symlink("..", skills.join("my-skill/back")).unwrap();
 
         let mut found = Vec::new();
-        find_skill_files_recursive(&skills, &mut found);
+        assert!(find_skill_files_recursive(&skills, &mut found).is_empty());
 
         assert_eq!(found, vec![skills.join("my-skill/SKILL.md")]);
     }
@@ -832,11 +1278,7 @@ mod tests {
         "};
 
         let err = parse_frontmatter(content).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("frontmatter field `description` must be a string"),
-            "expected scalar string error, got: {err}"
-        );
+        assert!(matches!(err, FrontmatterError::NonStringValue));
     }
 
     #[test]
