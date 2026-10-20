@@ -83,6 +83,39 @@ A test that asserts on `ReportEvent`s installs a `ReportLayer` with `tracing::su
 
 `install_tracing_baseline` (in `symposium-testlib`) installs a permissive global default subscriber once per test process to keep that cache open, and a thread-local `set_default` still takes precedence over it. `setup_fixture` calls it, and so must any helper that installs its own report layer.
 
+A repeated parallel run confirmed this setup omission in
+`pm::tests::reports_for_invalid_plugin`. It and the shared sync fixture helper
+initialize the baseline before report capture. When an expected warning event
+is missing, inspect that setup before changing the production reporting policy.
+Assert the event's intended content; an empty capture is not evidence that no
+failure occurred. Verify the repair with the full parallel suite, since one
+isolated pass cannot qualify process-wide callsite behavior.
+
+## Executable fixtures are not mutable response files
+
+On Linux, `ETXTBSY` means the kernel refused to execute a file that was open for
+writing. See the Linux [execve(2) manual](https://man7.org/linux/man-pages/man2/execve.2.html).
+A diagnostic run captured OS code 26, `ExecutableFileBusy`, when an installation
+test spawned a freshly written executable. This establishes that fixture's
+failure; it does not identify the writer or establish the cause of an earlier
+Cargo-output assertion whose actual error was not recorded. Keep unexpected
+`Result` values in assertion diagnostics, including the concrete variant and
+native I/O kind/OS code where relevant.
+
+Use the checked-in `cargo-stub.sh` dispatchers for workspace discovery and
+installer acquisition tests. Keep each case's response body in its own ordinary
+`cargo-stub-response` file, which the dispatcher sources. The helper can vary
+exit status, bytes and arguments without rewriting the executable file. Preserve
+the dispatchers' executable Git mode and include the installer's fixture in its
+package. No production retries, delays or permission changes are needed for this
+test setup.
+
+Keep permission assertions distinct from execution coverage. The writable-file
+matrix checks the resolved path, exact mode and unchanged bytes after acquisition;
+a separate Unix test acquires and spawns the existing `/bin/sh`, then verifies
+its mode is unchanged. Run both with the standalone installer feature checks
+and the full parallel workspace suite described in the [test guide](./running-tests.md).
+
 ## Invalid agent configuration must not become an empty configuration
 
 Agent settings are user-owned data. A JSON root, `hooks`/MCP container, or

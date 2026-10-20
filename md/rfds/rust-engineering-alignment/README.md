@@ -503,12 +503,15 @@ not every `try_*` API makes every optional failure fatal.
 Status: completed locally and on hosted CI.
 Step 7 checkpoint: `5249b2b451993dd82cdaca60eef9ce9012ce9707`;
 compatibility follow-up: `c42e6dd9c452edd892edcde5cfdb4fbd387cdb8b`.
-The combined implementation checkpoint
-`b331de96fec0aae83280b5f9baadffe68cefa390` passes
-[all 13 hosted CI jobs](https://github.com/hghalebi/symposium/actions/runs/39448016589).
-This superset qualifies the current implementation across Ubuntu, Intel macOS,
-Windows and musl, including the checks whose earlier runs failed or could not
-allocate runners.
+Recorded successful runtime checkpoint:
+`91048baca07364192c109faf8674608d9d1c02a7` passed
+[all 13 hosted CI jobs](https://github.com/hghalebi/symposium/actions/runs/39454509343).
+That superset qualifies the implementation at that checkpoint across Ubuntu,
+Intel macOS, Windows and musl, including all forty additional normal-parallel
+Ubuntu root-library runs. Each repeat passed 1,052 tests with zero failures and
+one opt-in test ignored. Later heads require their own exact-head result;
+[PR checks](https://github.com/hghalebi/symposium/pull/1/checks) record final-head
+qualification, including the review refinements below.
 
 After debt is repaired, add workspace-wide locked checks, warnings-denied Clippy,
 and explicit SDK/installer standalone default/`clap` coverage. Retain Ubuntu,
@@ -526,9 +529,9 @@ not merely verify that contributor prose contains policy words.
 - [x] The exact implementation checkpoint passes the expanded hosted matrix.
 - [x] Final PR validation evidence and review status are reconciled for that checkpoint.
 
-Observed locally with Rust 1.99.1: 1,317 workspace tests pass with zero failures and one opt-in
-network test ignored. All 12 standalone library gates pass after the final
-compatibility repairs. Public Rustdoc also
+Observed locally for fixture repair `91048bac` with Rust 1.99.1: 1,318 workspace
+tests pass with zero failures and one opt-in network test ignored. All twelve
+standalone library gates pass after the compatibility repairs. Public Rustdoc also
 builds with warnings denied after six broken/redundant links are corrected.
 The activated workflow passes YAML/structure, four-feature-matrix and 26 rendered
 Bash syntax checks; it expands to 13 jobs. The linked hosted run also validates
@@ -563,6 +566,50 @@ job found one hardcoded spawn-error classification in a regression test: native
 `Command::output` returns `NotFound`, not the expected `NotADirectory`. The
 repaired test compares both kind and OS code with the same native operation,
 while still requiring successful acquisition and unchanged sentinel bytes.
+The corrected implementation `b331de96fec0aae83280b5f9baadffe68cefa390` then
+passed [all 13 jobs](https://github.com/hghalebi/symposium/actions/runs/39448016589).
+
+The documentation-only head `383a996` then failed a Cargo-output variant
+assertion in [run 39449989403](https://github.com/hghalebi/symposium/actions/runs/39449989403).
+Its assertion did not include the actual `Result`, so the original error was
+not captured. Diagnostic `c979` passed the ordinary Ubuntu suite and eleven
+parallel root-library repetitions in
+[run 39451681389](https://github.com/hghalebi/symposium/actions/runs/39451681389);
+repetition twelve exposed `reports_for_invalid_plugin` missing the documented
+tracing baseline. That helper and the shared sync fixture helper now initialize
+the baseline before installing report-capture subscribers.
+
+The next diagnostic, `39316d4`, passed ordinary Ubuntu tests and completed all
+forty parallel repetitions in
+[run 39452779131](https://github.com/hghalebi/symposium/actions/runs/39452779131).
+Thirty-nine passed; repetition eighteen captured OS code 26,
+`ExecutableFileBusy`, while spawning a freshly written installation fixture.
+This is an observed failure in a different fixture. Neither diagnostic captured
+the original Cargo error, so attributing that original failure to the same
+mechanism remains an inference. The
+[fixture troubleshooting guidance](../../design/common-issues.md#executable-fixtures-are-not-mutable-response-files)
+separates the Linux kernel contract from that inference.
+
+Repair `91048baca07364192c109faf8674608d9d1c02a7` keeps Cargo dispatch scripts
+checked in and executable, with per-test response bodies in ordinary files.
+The permission matrix still verifies the acquired path, mode and unchanged
+bytes; a separate Unix regression acquires and executes existing `/bin/sh`.
+Rich failure diagnostics remain. Local workspace, twelve standalone feature,
+binary-build and eight CLI checks pass; installer packaging includes its fixture
+and both dispatchers retain Git mode `100755`. At that repair checkpoint, these
+are test-fixture changes with no production behavior, public API or dependency
+change. The successful forty-repeat run provides bounded parallel qualification;
+temporary repetition is removed from the normal workflow.
+
+Final review also marks the newly introduced public `MetadataError` enum
+`#[non_exhaustive]` and documents why self-update diagnostics stay captured.
+Matcher errors remain fail-closed; swallowing them or inheriting raw Cargo stderr
+would weaken the permission or privacy boundary. These review refinements also
+pass the seven local gates, strict public Rustdoc, eight rebuilt CLI journeys
+and original-toolchain compilation/Clippy. The
+[final head's PR checks](https://github.com/hghalebi/symposium/pull/1/checks)
+record hosted qualification for those refinements, documentation and removal of
+temporary repetition; a prior head's pass does not qualify them.
 
 The built CLI passes eight isolated journey checks: help, project-scoped setup,
 local manifest validation, Claude/Kiro/Antigravity native denials, ambiguous

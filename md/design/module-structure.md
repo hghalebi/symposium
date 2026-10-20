@@ -2,7 +2,7 @@
 
 Symposium is a Rust crate with both a library (`src/lib.rs`) and a binary (`src/bin/cargo-agents.rs`). Public modules expose supported application and plugin integration boundaries. Implementation modules such as installation, crate sources, skills and predicate evaluation remain crate-private; public errors are narrowly re-exported when callers need their concrete sources.
 
-### Typed failures and compatibility
+## Typed failures and compatibility
 
 Canonical fallible entry points use `try_*` methods and concrete `thiserror`
 errors at each responsibility: configuration and agent edits, package resolution,
@@ -65,13 +65,41 @@ Implements `cargo agents init`. Prompts for agents (or accepts `--add-agent`/`--
 
 ### `sync.rs` — synchronization command
 
-Implements `cargo agents sync`. Scans workspace dependencies, finds applicable skills from plugin sources, and synchronizes them into each configured agent's skill directory. The core primitive is `sync_skill_dir(source_dir, dest_dir, project_root)`. It copies the entire source directory (not just `SKILL.md`) and is change-aware: it compares source and destination content, only performing the delete-and-recopy when files actually differ, so the disk shows no modifications when nothing changed. Copying and comparing share one traversal, `walk_tree` — they have to agree entry for entry, since a comparison scan that omitted something the copier writes would see a difference on every run and turn each sync into a full recopy. That traversal **follows symlinks** (see [`dir_walk.rs`](#dir_walkrs--following-symlinks-without-looping)), so a linked file installs as a real file and a linked directory as its contents; a broken link and a link back into the tree being copied are reported and skipped rather than failing the sync. A configurable debounce (`sync-debounce-secs`, default 5s, keyed on the `.symposium` marker's mtime) skips even the comparison for recently-synced skills. On each sync, scans every agent's skills parent directory and reaps any marker-bearing subdirectory it didn't install this time, leaving user-managed skills (which lack the marker) untouched. Writes a `.gitignore` with `*` only into individual skill directories (not parent directories like `.claude/` or `.claude/skills/`). Also provides `register_hooks()` for use by `init`, which registers only symposium's own global hook handler — individual plugin hooks are never written into agent configs.
+Implements `cargo agents sync`. The canonical entry point is
+`try_sync(sym, deps, update)`, returning `SyncError`; the published `sync`
+signature remains an `anyhow::Result<()>` adapter through root 0.6. The caller
+supplies `WorkspaceDeps`, so the hook pipeline reuses its resolver rather than
+resolving the workspace twice. Callers are the CLI's `sync` arm after consent,
+`use_command` after an enablement change, and the hook pipeline's auto-sync.
 
-While `PluginRegistry::unreadable_registries` is not empty, `sync` skips that reap and warns once per registry: an unreadable registry offered nothing, so everything it installed would look stale.
+Sync finds applicable skills and installs their entire directories. The private
+`sync_skill_dir(source_dir, dest_dir, project_root, debounce)` compares source and
+destination content. Changed content and managed metadata are prepared in a
+temporary sibling before publication; an ordinary publication failure restores
+the previous copy, while failed rollback retains a recovery backup. Identical
+content is retained and its marker is touched to reset the debounce window.
 
-One entry point, `sync(sym, deps, update)`. The caller supplies the `WorkspaceDeps`, so the hook pipeline hands over the resolver its other stages already used rather than resolving the workspace a second time. Callers: the CLI's `sync` arm (after the consent prompt), `use_command` once an enablement is recorded, and the hook pipeline's auto-sync.
+Copying and comparing share `walk_tree`, so they agree about every entry. The
+walk [follows symlinks](#dir_walkrs--following-symlinks-without-looping): linked
+files become real files and linked directories become their contents. Broken
+links and links back into an ancestor are reported and skipped. The configurable
+`sync-debounce-secs` window (default 5s, keyed on marker mtime) skips comparison
+for a recently synchronized skill.
 
-`sync` takes an `UpdateLevel` that it threads into skill resolution (`skills::collect_skills`), controlling how aggressively `source.git` skill groups are re-fetched. Callers choose: the auto-sync path passes `Check` on `SessionStart` (refresh) and `None` otherwise (debounced); the binary's global `--update` flag feeds manual `cargo agents sync`.
+Stale cleanup removes only marker-bearing installations absent from a complete
+scan. Unreadable registries and incomplete dependency, plugin or skill inputs
+suppress deletion; user-managed directories without the marker remain intact.
+The generated `.gitignore` containing `*` belongs only in an installed skill,
+not in parent directories such as `.claude/skills/`.
+
+Initialization uses `try_register_hooks()` for checked global hook and MCP
+registration. Its legacy `register_hooks()` signature remains a root-0.6
+adapter. Agent hook files contain Symposium's dispatcher; individual plugin hook
+commands are not registered there.
+
+`try_sync` threads `UpdateLevel` into `skills::collect_skills`, controlling Git
+skill refresh. Auto-sync uses `Check` on `SessionStart` and `None` for other
+events; the binary's global `--update` flag controls manual synchronization.
 
 ### `plugins.rs` — plugin registry
 
@@ -189,7 +217,7 @@ On top of that read side sits the consent write side. `prompt_for_consent(sym, d
 
 The user-facing surface over `discovery` and `[plugins]`.
 
-`use_command` records enablement. `use_plugin` first checks whether a configured registry already offers the name — registries are trust roots, so that is a no-op — with dormant plugins the exception, since `use` is exactly how they wake. It then requires the name to resolve to *something* (a workspace dependency, checked offline first, or a `PmRegistry::search` hit — which reaches crates.io via `CargoPm::search`, so a crate you don't depend on still resolves) before pushing a `UseEntry` (workspace-scoped by default, `Global` with `--global`) and saving. Both it and `remove_plugin` re-run `sync::sync` afterward, so skills install or are reaped immediately. `remove_plugin` matches on scope and errors when nothing matched rather than silently succeeding.
+`use_command` records enablement. `use_plugin` first checks whether a configured registry already offers the name — registries are trust roots, so that is a no-op — with dormant plugins the exception, since `use` is exactly how they wake. It then requires the name to resolve to *something* (a workspace dependency, checked offline first, or a `PmRegistry::search` hit — which reaches crates.io via `CargoPm::search`, so a crate you don't depend on still resolves) before pushing a `UseEntry` (workspace-scoped by default, `Global` with `--global`) and saving. Both it and `remove_plugin` re-run `sync::try_sync` afterward, so skills install or are reaped immediately. `remove_plugin` matches on scope and errors when nothing matched rather than silently succeeding.
 
 `search_command` unions two arms: plugin names in the loaded `PluginRegistry` (bare skills included, since they are now plugins) and `PmRegistry::search` across every instance (which matches registry entry subpaths, e.g. a skill's directory name). A PM without a searchable registry returns an empty list and a failing instance is skipped, so an offline registry degrades the results instead of failing the command. Hits are grouped by originating instance for display; the `SearchMatch` report event carries the origin for the JSON form.
 

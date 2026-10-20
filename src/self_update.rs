@@ -260,6 +260,7 @@ pub fn self_update(sym: &Symposium, out: &Output) -> anyhow::Result<()> {
 }
 
 fn cargo_install(sym: &Symposium) -> Result<(), UpdateError> {
+    // Captured Cargo diagnostics may contain private registry or build-script data.
     let output = sym
         .cargo_command()
         .args(["install", CRATE_NAME, "--force"])

@@ -15,6 +15,7 @@ use thiserror::Error;
 
 /// A failure reading or parsing a crate manifest's optional plugin metadata.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MetadataError {
     /// The manifest could not be read as UTF-8 text.
     #[error("failed to read crate manifest")]
