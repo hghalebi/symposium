@@ -192,7 +192,7 @@ mod unix {
         let tmp = tempfile::tempdir().unwrap();
         let cargo = tmp.path().join("fake-cargo");
         fs::write(
-            &cargo,
+            tmp.path().join("cargo-stub-response"),
             format!(
                 r#"#!/bin/sh
 set -eu
@@ -216,7 +216,11 @@ fi
             ),
         )
         .unwrap();
-        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cargo-stub.sh"),
+            &cargo,
+        )
+        .unwrap();
         let native_cache = tmp.path().join(OsString::from_vec(b"cache-\xff".to_vec()));
         let ctx = InstallContext::new(native_cache.clone()).with_cargo_bin(cargo);
         let source = Source::Cargo(

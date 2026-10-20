@@ -471,10 +471,32 @@ mod tests {
                 std::fs::metadata(&executable).unwrap().permissions().mode() & 0o777,
                 mode
             );
-            if mode == 0o700 {
-                assert!(runnable.spawn(&[] as &[&str]).unwrap().status.success());
-            }
+            assert_eq!(std::fs::read(&executable).unwrap(), b"#!/bin/sh\nexit 0\n");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_source_absolute_existing_executable_runs_without_permission_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        // Execute an installed shell so this check never launches a just-written file.
+        let executable = std::path::Path::new("/bin/sh");
+        let original_mode = std::fs::metadata(executable).unwrap().permissions().mode();
+        let mut install = installation();
+        install.executable = Some("/bin/sh".into());
+        let acquired = acquire_installation(&sym, &install, None, None, UpdateLevel::None)
+            .await
+            .unwrap();
+        assert!(acquired.base.is_none());
+        let runnable = resolve_runnable(acquired, "existing shell").unwrap();
+        assert!(matches!(&runnable, Runnable::Exec(path) if path == executable));
+        assert!(runnable.spawn(&["-c", "exit 0"]).unwrap().status.success());
+        assert_eq!(
+            std::fs::metadata(executable).unwrap().permissions().mode(),
+            original_mode
+        );
     }
 
     #[tokio::test]

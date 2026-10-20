@@ -575,28 +575,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn workspace_discovery_uses_cargo_override_and_keeps_rejection_private() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path().join("project");
         fs::create_dir(&workspace).unwrap();
         fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
-        let cargo = tmp.path().join("cargo-stub");
-        fs::write(&cargo, "#!/bin/sh\nprintf '%s/Cargo.toml\\n' \"$PWD\"\n").unwrap();
-        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o700)).unwrap();
+        let response = workspace.join("cargo-stub-response");
+        fs::write(&response, "printf '%s/Cargo.toml\\n' \"$PWD\"\n").unwrap();
+        let cargo = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cargo-stub.sh");
         let mut sym = Symposium::from_dir(tmp.path());
-        sym.set_cargo_override(cargo.clone());
+        sym.set_cargo_override(cargo);
         let found = try_find_workspace_root(&sym, &workspace).unwrap().unwrap();
         assert_eq!(
             fs::canonicalize(found).unwrap(),
             fs::canonicalize(&workspace).unwrap()
         );
 
-        fs::write(
-            &cargo,
-            "#!/bin/sh\nprintf 'private-process-canary' >&2\nexit 23\n",
-        )
-        .unwrap();
+        fs::write(&response, "printf 'private-process-canary' >&2\nexit 23\n").unwrap();
         let error = try_find_workspace_root(&sym, &workspace).unwrap_err();
         assert!(matches!(error, WorkspaceStateError::Discover { .. }));
         assert!(error.source().is_some());

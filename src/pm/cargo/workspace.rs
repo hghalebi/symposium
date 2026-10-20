@@ -799,12 +799,10 @@ mod tests {
 
     #[cfg(unix)]
     fn cargo_stub(root: &Path, script: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
-        let path = root.join("cargo-stub");
-        fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        path
+        // Keep generated responses off the executable inode to avoid Linux ETXTBSY.
+        fs::write(root.join("cargo-stub-response"), format!("{script}\n")).unwrap();
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cargo-stub.sh")
     }
 
     #[cfg(unix)]

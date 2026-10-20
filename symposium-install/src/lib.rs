@@ -1507,12 +1507,16 @@ mod tests {
     fn cargo_command_preserves_native_root_bytes_without_creating_the_path() {
         use std::ffi::OsString;
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().unwrap();
         let cargo = tmp.path().join("capture-cargo");
-        std::fs::write(&cargo, "#!/bin/sh\nset -eu\nprevious=\nfor argument in \"$@\"; do\nif test \"$previous\" = --root; then printf '%s' \"$argument\" > \"$CAPTURE_ROOT\"; fi\nprevious=$argument\ndone\n").unwrap();
-        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(tmp.path().join("cargo-stub-response"), "#!/bin/sh\nset -eu\nprevious=\nfor argument in \"$@\"; do\nif test \"$previous\" = --root; then printf '%s' \"$argument\" > \"$CAPTURE_ROOT\"; fi\nprevious=$argument\ndone\n").unwrap();
+        symlink(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cargo-stub.sh"),
+            &cargo,
+        )
+        .unwrap();
         let root = tmp.path().join(OsString::from_vec(b"native-\xff".to_vec()));
         let ctx = InstallContext::new(tmp.path().join("cache")).with_cargo_bin(cargo);
         for (index, prefix) in [&["binstall", "--no-confirm"][..], &["install"][..]]
@@ -1533,15 +1537,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn failed_install_preserves_previous_versions_and_omits_process_stderr() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
         let cargo = tmp.path().join("fake-cargo");
         std::fs::write(
-            &cargo,
+            tmp.path().join("cargo-stub-response"),
             "#!/bin/sh\nprintf '%s' PRIVATE_CARGO_STDERR_CANARY >&2\nexit 37\n",
         )
         .unwrap();
-        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cargo-stub.sh"),
+            &cargo,
+        )
+        .unwrap();
         let ctx = InstallContext::new(tmp.path().join("cache")).with_cargo_bin(cargo);
         let old = get_binary_cache_dir(&ctx, "tool", "1.0.0").unwrap();
         std::fs::create_dir_all(old.join("bin")).unwrap();
