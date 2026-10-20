@@ -925,8 +925,15 @@ fn classify_child_outcome(
         }
         return Ok(ChildDisposition::Blocked);
     }
-    input.map_err(|source| HookError::PluginInput { source })?;
-    Ok(ChildDisposition::Ready)
+    match input {
+        Ok(()) => Ok(ChildDisposition::Ready),
+        Err(source) if exit_code == Some(0) && source.kind() == std::io::ErrorKind::BrokenPipe => {
+            // Successful hooks may intentionally answer without consuming stdin.
+            tracing::debug!("successful plugin closed its input before delivery completed");
+            Ok(ChildDisposition::Ready)
+        }
+        Err(source) => Err(HookError::PluginInput { source }),
+    }
 }
 
 async fn collect_plugin_output(
@@ -939,10 +946,7 @@ async fn collect_plugin_output(
         async move {
             match stdin {
                 Some(mut stdin) => stdin.write_all(input).await,
-                None => Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "plugin stdin was not piped",
-                )),
+                None => Err(std::io::Error::other("plugin stdin was not piped")),
             }
         },
         child.wait_with_output()
@@ -1416,10 +1420,7 @@ mod tests {
             );
         }
         for exit in [Some(0), Some(1)] {
-            let input = Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                STREAM_CANARY,
-            ));
+            let input = Err(std::io::Error::other(STREAM_CANARY));
             let error = classify_child_outcome(exit, input).unwrap_err();
             assert!(matches!(error, HookError::PluginInput { .. }));
             assert_eq!(error.source().unwrap().to_string(), STREAM_CANARY);
@@ -1429,6 +1430,43 @@ mod tests {
                 ChildDisposition::Ready
             );
         }
+        assert_eq!(
+            classify_child_outcome(
+                Some(0),
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            )
+            .unwrap(),
+            ChildDisposition::Ready,
+        );
+        assert!(matches!(
+            classify_child_outcome(
+                Some(1),
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            ),
+            Err(HookError::PluginInput { .. }),
+        ));
+    }
+
+    #[tokio::test]
+    async fn successful_child_can_answer_without_consuming_input() {
+        let child = Command::new("sh")
+            .args(["-c", "exec 0<&-; printf '%s' '{\"PreToolUse\":{}}'"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let input = vec![b'x'; 2 * 1024 * 1024];
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            collect_plugin_output(child, &input),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, br#"{"PreToolUse":{}}"#);
     }
 
     #[tokio::test]

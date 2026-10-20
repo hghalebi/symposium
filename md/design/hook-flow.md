@@ -41,8 +41,11 @@ The payload is then parsed, and the agent's parser can declare it not an occurre
        handle after writing and collect every spawned child even if writing fails.
      - Collect output from each handler. An explicit exit 2 or signal/no exit code
        is a block, taking precedence over a simultaneous stdin write failure.
-       Without that block, incomplete input or failed process collection is a
-       typed transport failure, not an empty contribution.
+       A successful hook may intentionally close stdin without consuming it;
+       its `BrokenPipe` is diagnosed and its output is still parsed normally.
+       Other input-write failures and failed process collection remain typed
+       transport failures. A successful write only queues bytes; it cannot prove
+       that a child consumed them.
      - Convert output back to the agent's wire format. A recognized canonical
        event envelope must parse and match the selected event; malformed envelopes
        never fall back to the native parser. Legacy untagged host JSON remains

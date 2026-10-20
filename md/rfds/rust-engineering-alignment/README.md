@@ -308,6 +308,13 @@ must produce an I/O error: Rust intentionally treats that standard-stream case
 as a successful no-op. A real broken pipe instead verifies typed warning failure
 before state writes. Traces describe prepared responses, not delivery receipts.
 
+Hosted Linux then exposed a compatibility issue in the input-write policy:
+valid successful shell hooks can ignore stdin, yielding `BrokenPipe` depending
+on scheduling and pipe capacity. The collector now diagnoses that specific
+successful-peer closure and parses its response normally; other I/O failures
+remain typed, and block precedence is unchanged. A bounded real-child regression
+closes stdin explicitly with a 2 MiB input to make the case deterministic.
+
 ### Step 5: Validate registry and installation alternatives once
 
 Keep raw config/manifests unchanged; introduce runtime `Git | Path` and
