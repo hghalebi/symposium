@@ -536,16 +536,21 @@ mod tests {
         let sym = Symposium::try_from_dir(tmp.path()).unwrap();
         let parent = tmp.path().join("not-a-directory");
         std::fs::write(&parent, b"preserve").unwrap();
+        let executable = parent.join("tool");
         let mut install = installation();
-        install.executable = Some(parent.join("tool").to_str().unwrap().into());
+        install.executable = Some(executable.to_str().unwrap().into());
         let acquired = acquire_installation(&sym, &install, None, None, UpdateLevel::None)
             .await
             .unwrap();
+        let expected = std::process::Command::new(&executable)
+            .output()
+            .unwrap_err();
         let error = resolve_runnable(acquired, "user path")
             .unwrap()
             .spawn(&[] as &[&str])
             .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+        assert_eq!(error.kind(), expected.kind());
+        assert_eq!(error.raw_os_error(), expected.raw_os_error());
         assert_eq!(std::fs::read(parent).unwrap(), b"preserve");
     }
 

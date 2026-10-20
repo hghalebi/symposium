@@ -517,7 +517,7 @@ not merely verify that contributor prose contains policy words.
 - [ ] The exact final pushed commit passes the expanded hosted matrix.
 - [ ] Final PR validation evidence and review status are reconciled.
 
-Observed locally: 1,317 workspace tests pass with zero failures and one opt-in
+Observed locally with Rust 1.99.1: 1,317 workspace tests pass with zero failures and one opt-in
 network test ignored. All 12 standalone library gates pass after the final
 compatibility repairs. Public Rustdoc also
 builds with warnings denied after six broken/redundant links are corrected.
@@ -533,6 +533,25 @@ own evidence even if another job waits. Permissions are only `contents: read`;
 book rendering and Rustdoc checks add no deployment or publishing authority.
 No configured required check names referenced the old macOS label at activation;
 branch protections and rules were inspected without changing repository settings.
+
+The first expanded hosted run at `18a0ac5b` passes the rendered documentation
+job and Linux tests, but its SDK feature and workspace Clippy jobs fail on
+`redundant_field_names` in generated named-source conversions. Hosted stable is
+Rust 1.99.1; the earlier local compiler is 1.97.1. Matching that compiler also
+exposes redundant generated `must_use` attributes in `async-trait` 0.1.89.
+Cargo-scoped updates to `async-trait` 0.1.92 and `thiserror` 2.0.21 repair the
+macro expansions, including their required `syn` 3 parser, without changing
+public error/trait contracts or weakening application lints. The manifest
+requirements already permit these releases. An isolated 1.99.1 toolchain is
+used for local qualification; all workspace and standalone gates pass. The
+original 1.97.1 compiler also passes locked all-target compilation and strict
+Clippy with the updated dependencies; the user's default remains unchanged.
+
+That hosted checkpoint passes Windows, Ubuntu and musl tests. Its Intel macOS
+job finds one hardcoded spawn-error classification in a regression test: native
+`Command::output` returns `NotFound`, not the expected `NotADirectory`. The
+repaired test compares both kind and OS code with the same native operation,
+while still requiring successful acquisition and unchanged sentinel bytes.
 
 The built CLI passes eight isolated journey checks: help, project-scoped setup,
 local manifest validation, Claude/Kiro/Antigravity native denials, ambiguous

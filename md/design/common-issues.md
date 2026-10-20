@@ -163,6 +163,22 @@ would conceal new errors. Existing native-schema compatibility tests protect
 wire values and external trait implementations while strict Clippy verifies the
 actual ordinary helper.
 
+If CI points a new lint at a derive attribute, compare the actual compiler
+versions and inspect the macro expansion. Rust 1.99.1 flags named `#[from]`
+initializers emitted by `thiserror` 2.0.18 and redundant `must_use` attributes
+from `async-trait` 0.1.89; the earlier local 1.97.1 checks pass. Compatible
+`thiserror` 2.0.21 and `async-trait` 0.1.92 releases repair those expansions.
+Inspect versions with `cargo search`/`cargo info`, update only the intended
+locked packages, and recheck public error/trait consumers and standalone
+features with the hosted compiler. No application-wide lint allowance is needed.
+
+Filesystem and spawn error categories also vary by platform. A child of a regular
+file can produce `NotFound` on Windows metadata probes or Intel macOS process
+spawning, even when another Unix implementation reports `NotADirectory`. When
+the contract preserves a native failure, compare its kind and OS code with the
+original platform operation. When absence controls cache freshness or cleanup,
+inspect invalid ancestors before converting `NotFound` into optional absence.
+
 ## A lock guard must release the lock, not just close its handle
 
 If telemetry reports contention immediately after a guard is dropped, check for
