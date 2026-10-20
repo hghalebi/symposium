@@ -400,6 +400,65 @@ pub struct RegistryConfig {
     pub auto_update: bool,
 }
 
+enum RegistrySourceRef<'a> {
+    Git(&'a str),
+    Path(&'a str),
+}
+
+impl RegistryConfig {
+    fn validated_source(&self) -> Result<RegistrySourceRef<'_>, RegistryError> {
+        match (self.git.as_deref(), self.path.as_deref()) {
+            (Some(git), None) => Ok(RegistrySourceRef::Git(git)),
+            (None, Some(path)) => Ok(RegistrySourceRef::Path(path)),
+            (Some(_), Some(_)) => Err(RegistryError::BothSources {
+                name: self.name.clone(),
+            }),
+            (None, None) => Err(RegistryError::MissingSource {
+                name: self.name.clone(),
+            }),
+        }
+    }
+}
+
+/// Failure to resolve a complete set of configured registries.
+///
+/// Source URLs are never included in diagnostics. A failed resolution must not
+/// be treated as an empty registry set, particularly before stale-skill cleanup.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RegistryError {
+    /// A registry supplies both alternative source fields.
+    #[error("registry {name:?} sets both `git` and `path`; specify exactly one source")]
+    BothSources {
+        /// The configured registry's name.
+        name: String,
+    },
+    /// A registry supplies neither source field.
+    #[error("registry {name:?} names neither `git` nor `path`; specify exactly one source")]
+    MissingSource {
+        /// The configured registry's name.
+        name: String,
+    },
+    /// A Git registry could not be resolved without acquiring it.
+    #[error("failed to resolve Git registry {name:?}")]
+    Git {
+        /// The configured registry's name.
+        name: String,
+        /// The structured Git configuration or client-construction failure.
+        #[source]
+        source: symposium_install::git::GitError,
+    },
+    /// The optional built-in directory could not be inspected.
+    #[error("failed to inspect user-plugin registry {}", path.display())]
+    ProbeUserPlugins {
+        /// The optional registry path that could not be inspected.
+        path: PathBuf,
+        /// The underlying filesystem failure, distinct from absence.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Merged configuration view
 // ---------------------------------------------------------------------------
@@ -628,6 +687,9 @@ impl Symposium {
     /// including git registries, whose repository is unpacked into the cache
     /// before it is read. Each instance is named for its registry, since that
     /// name is what its plugins are attributed to.
+    ///
+    /// Legacy infallible entry point retained until the root crate's 0.6 release.
+    /// New callers should use [`Self::try_package_managers`].
     pub fn package_managers(
         &self,
         workspace: &Arc<crate::pm::WorkspaceDeps>,
@@ -644,11 +706,48 @@ impl Symposium {
         crate::pm::PmRegistry::new(instances)
     }
 
+    /// Resolve the complete package-manager set for a workspace.
+    ///
+    /// The Cargo transport is followed by trusted registry instances in their
+    /// configured order. Configuration is checked on every call, including
+    /// changes made through the public [`Self::config`] field.
+    ///
+    /// # Errors
+    /// Returns [`RegistryError`] rather than a partial manager set when a
+    /// registry cannot be resolved or the optional user directory cannot be
+    /// inspected. No source is fetched by this operation.
+    pub fn try_package_managers(
+        &self,
+        workspace: &Arc<crate::pm::WorkspaceDeps>,
+    ) -> Result<crate::pm::PmRegistry, RegistryError> {
+        let registries = self.try_registry_instances()?;
+        let mut instances = vec![crate::pm::PmInstance {
+            name: crate::pm::CARGO_PM.to_string(),
+            kind: crate::pm::PluginKind::Package,
+            trusted: false,
+            pm: Box::new(crate::pm::CargoPm::new(Arc::clone(workspace))),
+        }];
+        instances.extend(registries);
+        Ok(crate::pm::PmRegistry::new(instances))
+    }
+
     /// The package managers for a workspace-independent operation (registry
     /// listing, crates.io search): the cargo transport is built over a detached
     /// resolver that never runs `cargo metadata`.
+    ///
+    /// Legacy infallible entry point retained until the root crate's 0.6 release.
+    /// New callers should use [`Self::try_detached_managers`].
     pub fn detached_managers(&self) -> crate::pm::PmRegistry {
         self.package_managers(&Arc::new(crate::pm::WorkspaceDeps::detached()))
+    }
+
+    /// Resolve managers without a workspace or a Cargo metadata invocation.
+    ///
+    /// # Errors
+    /// Returns the same complete-set resolution errors as
+    /// [`Self::try_package_managers`]. No source is fetched.
+    pub fn try_detached_managers(&self) -> Result<crate::pm::PmRegistry, RegistryError> {
+        self.try_package_managers(&Arc::new(crate::pm::WorkspaceDeps::detached()))
     }
 
     /// Override the cargo binary path (test-only).
@@ -769,6 +868,11 @@ impl Symposium {
     /// a separate step. A registry whose source can't be resolved (a malformed
     /// git URL, or an entry naming neither `git` nor `path`) is skipped with a
     /// warning.
+    ///
+    /// Legacy infallible entry point retained until the root crate's 0.6 release.
+    /// It preserves Git precedence for entries with both fields and treats an
+    /// unsuccessful user-directory probe as absence. New callers must use
+    /// [`Self::try_registry_instances`] so failures cannot authorize cleanup.
     pub fn registry_instances(&self) -> Vec<crate::pm::PmInstance> {
         let mut configs: Vec<RegistryConfig> = Vec::new();
 
@@ -797,6 +901,84 @@ impl Symposium {
             .into_iter()
             .filter_map(|cfg| self.registry_instance(cfg))
             .collect()
+    }
+
+    /// Resolve every configured registry before returning a usable set.
+    ///
+    /// Order is the built-in recommendations repository, the optional built-in
+    /// user directory, then user-configured entries. Relative paths resolve
+    /// against the configuration directory. The public raw configuration is
+    /// validated on each call; no source is fetched or rewritten.
+    ///
+    /// # Errors
+    /// Returns [`RegistryError::BothSources`] or [`RegistryError::MissingSource`]
+    /// for invalid alternatives, a typed Git failure for an invalid repository
+    /// source, or a filesystem error when the optional directory cannot be
+    /// inspected. Only `NotFound` means that optional directory is absent.
+    pub fn try_registry_instances(&self) -> Result<Vec<crate::pm::PmInstance>, RegistryError> {
+        let mut instances = Vec::new();
+        if self.config.defaults.symposium_recommendations {
+            instances.push(self.try_registry_instance(&RegistryConfig {
+                name: "symposium-recommendations".to_string(),
+                git: Some(BUILTIN_RECOMMENDATIONS_URL.to_string()),
+                path: None,
+                auto_update: true,
+            })?);
+        }
+        if self.config.defaults.user_plugins {
+            let path = self.dirs.config_dir.join("plugins");
+            match fs::symlink_metadata(&path) {
+                Ok(_) => instances.push(self.try_registry_instance(&RegistryConfig {
+                    name: "user-plugins".to_string(),
+                    git: None,
+                    path: Some("plugins".to_string()),
+                    auto_update: true,
+                })?),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(RegistryError::ProbeUserPlugins { path, source }),
+            }
+        }
+        for config in &self.config.registries {
+            instances.push(self.try_registry_instance(config)?);
+        }
+        Ok(instances)
+    }
+
+    fn try_registry_instance(
+        &self,
+        config: &RegistryConfig,
+    ) -> Result<crate::pm::PmInstance, RegistryError> {
+        let name = config.name.clone();
+        let pm: Box<dyn crate::pm::PackageManager + Send + Sync> =
+            match config.validated_source()? {
+                RegistrySourceRef::Git(url) => Box::new(
+                    crate::pm::GitPm::try_new(
+                        name.clone(),
+                        url,
+                        config.auto_update,
+                        self.install_context(),
+                    )
+                    .map_err(|source| RegistryError::Git {
+                        name: name.clone(),
+                        source,
+                    })?,
+                ),
+                RegistrySourceRef::Path(path) => {
+                    let path = PathBuf::from(path);
+                    let dir = if path.is_absolute() {
+                        path
+                    } else {
+                        self.dirs.config_dir.join(path)
+                    };
+                    Box::new(crate::pm::PathPm::new(name.clone(), dir))
+                }
+            };
+        Ok(crate::pm::PmInstance {
+            name,
+            trusted: true,
+            kind: crate::pm::PluginKind::Registry,
+            pm,
+        })
     }
 
     /// Build the registry instance for one config entry. Relative `path` values

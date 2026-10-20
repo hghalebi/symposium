@@ -22,11 +22,11 @@ pub async fn dispatch_crate(
     tracing::debug!(%name, ?version, "crate-info dispatched");
     let deps = sym.workspace_deps(cwd);
     let id = CargoPm::id_for(name, version);
-    match sym
-        .package_managers(&deps)
-        .fetch(&id, symposium_install::UpdateLevel::None)
-        .await
-    {
+    let pms = match sym.try_package_managers(&deps) {
+        Ok(pms) => pms,
+        Err(error) => return DispatchResult::Err(error.to_string()),
+    };
+    match pms.fetch(&id, symposium_install::UpdateLevel::None).await {
         Ok(result) => {
             let output = format!(
                 "Crate: {}\nVersion: {}\nSource: {}\n",

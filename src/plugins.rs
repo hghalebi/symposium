@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use thiserror::Error;
 
-use crate::config::Symposium;
+use crate::config::{RegistryError, Symposium};
 use crate::hook::HookEvent;
 use crate::hook_schema::HookAgent;
 use crate::pm::{ANY_VERSION, PackageId, PluginKind, UnvalidatedPlugin};
@@ -278,6 +279,102 @@ pub struct Installation {
     /// Default invocation arguments. The hook may set its own; not both.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunnableSpec<'a> {
+    Exec(&'a str),
+    Script(&'a str),
+}
+
+/// Invalid combinations of public installation and hook runnable fields.
+/// Diagnostics name the constraint without exposing runnable paths or command contents.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum RunnableSelectionError {
+    /// Both runnable alternatives were supplied by one installation.
+    #[error("`executable` and `script` are mutually exclusive — pick one")]
+    ConflictingInstallation,
+    /// More than one installation/hook runnable field was supplied.
+    #[error("at most one of `executable` / `script` may be set across hook and installation")]
+    ConflictingFields,
+    /// A selected command name is empty or contains a NUL byte.
+    #[error("`{field}` must be nonempty and contain no NUL bytes")]
+    InvalidRunnable {
+        /// The fixed installation field name; never the supplied value.
+        field: &'static str,
+    },
+    /// Git Cargo cannot infer the binary name from crates.io.
+    #[error("cargo source with `git` requires `executable` to be set (crates.io is not consulted)")]
+    MissingGitExecutable,
+    /// Global Cargo requires a binary name for PATH lookup.
+    #[error("cargo source with `global = true` requires `executable` to be set")]
+    MissingGlobalExecutable,
+    /// Global Cargo cannot resolve a managed shell-script path.
+    #[error("cargo source with `global = true` requires `executable` and cannot use `script`")]
+    GlobalScript,
+    /// A future source variant has no supported runnable policy.
+    #[error("unsupported installation source")]
+    UnsupportedSource,
+    /// An installation resolved during hook validation is unavailable.
+    #[error("resolved hook references an unavailable installation")]
+    MissingInstallation,
+}
+
+impl Installation {
+    pub(crate) fn runnable_spec<'a>(
+        &'a self,
+        override_executable: Option<&'a str>,
+        override_script: Option<&'a str>,
+    ) -> std::result::Result<Option<RunnableSpec<'a>>, RunnableSelectionError> {
+        let spec = match (
+            self.executable.as_deref(),
+            self.script.as_deref(),
+            override_executable,
+            override_script,
+        ) {
+            (Some(_), Some(_), _, _) => {
+                return Err(RunnableSelectionError::ConflictingInstallation);
+            }
+            (None, None, None, None) => None,
+            (Some(name), None, None, None) | (None, None, Some(name), None) => {
+                Some(RunnableSpec::Exec(name))
+            }
+            (None, Some(name), None, None) | (None, None, None, Some(name)) => {
+                Some(RunnableSpec::Script(name))
+            }
+            _ => return Err(RunnableSelectionError::ConflictingFields),
+        };
+        let selected = match spec {
+            Some(RunnableSpec::Exec(name)) => Some(("executable", name)),
+            Some(RunnableSpec::Script(name)) => Some(("script", name)),
+            None => None,
+        };
+        if let Some((field, name)) = selected
+            && (name.is_empty() || name.contains('\0'))
+        {
+            return Err(RunnableSelectionError::InvalidRunnable { field });
+        }
+        match self.source.as_ref() {
+            Some(Source::Cargo(source)) => {
+                if source.global {
+                    match spec {
+                        Some(RunnableSpec::Exec(_)) => {}
+                        Some(RunnableSpec::Script(_)) => {
+                            return Err(RunnableSelectionError::GlobalScript);
+                        }
+                        None => return Err(RunnableSelectionError::MissingGlobalExecutable),
+                    }
+                }
+                if source.git.is_some() && !matches!(spec, Some(RunnableSpec::Exec(_))) {
+                    return Err(RunnableSelectionError::MissingGitExecutable);
+                }
+            }
+            Some(Source::Github(_)) | None => {}
+            Some(_) => return Err(RunnableSelectionError::UnsupportedSource),
+        }
+        Ok(spec)
+    }
 }
 
 /// A validated custom predicate definition from a `[[predicate]]` entry.
@@ -584,35 +681,13 @@ fn validate_hook(
         .iter()
         .find(|i| i.name == command)
         .cloned()
-        .expect("just resolved");
-
-    // Across (hook.exec, hook.script, install.exec, install.script): at most
-    // one is set. The user's rule is "exactly one of executable/script" globally.
-    let mut runnables: Vec<&str> = Vec::new();
-    if install.executable.is_some() {
-        runnables.push("installation `executable`");
-    }
-    if install.script.is_some() {
-        runnables.push("installation `script`");
-    }
-    if hook_executable.is_some() {
-        runnables.push("hook `executable`");
-    }
-    if hook_script.is_some() {
-        runnables.push("hook `script`");
-    }
-    if runnables.len() > 1 {
-        bail!(
-            "hook `{hook_name}`: at most one of `executable` / `script` may be set across \
-             hook and installation, but {} are set",
-            runnables.join(", ")
-        );
-    }
+        .ok_or(RunnableSelectionError::MissingInstallation)?;
+    let runnable = install.runnable_spec(hook_executable.as_deref(), hook_script.as_deref())?;
 
     // The hook must end up runnable. Cargo can infer a single binary at
     // acquisition time, so it's allowed to omit the runnable; every other
     // case requires `executable` or `script` somewhere.
-    if runnables.is_empty() {
+    if runnable.is_none() {
         let cargo_inferable = matches!(install.source, Some(Source::Cargo(_)));
         if !cargo_inferable {
             bail!(
@@ -669,30 +744,7 @@ fn validate_hook(
 /// - cargo + `git` requires an explicit `executable`, since we can't query
 ///   crates.io to infer one.
 fn validate_installation(install: &Installation) -> Result<()> {
-    if install.executable.is_some() && install.script.is_some() {
-        bail!(
-            "installation `{}`: `executable` and `script` are mutually exclusive — \
-             pick one",
-            install.name
-        );
-    }
-    if let Some(Source::Cargo(c)) = &install.source {
-        if c.git.is_some() && install.executable.is_none() {
-            bail!(
-                "installation `{}`: cargo source with `git` requires `executable` to be set \
-                 (crates.io is not consulted, so the binary name is unknown)",
-                install.name
-            );
-        }
-        if c.global && install.executable.is_none() {
-            bail!(
-                "installation `{}`: cargo source with `global = true` requires `executable` to \
-                 be set (the binary is spawned by name via `$PATH` lookup, so we don't infer \
-                 it from crates.io)",
-                install.name
-            );
-        }
-    }
+    install.runnable_spec(None, None)?;
     Ok(())
 }
 
@@ -818,12 +870,34 @@ enum ManifestOrigin<'a> {
 /// `update` controls freshness checking behavior (see `UpdateLevel`).
 /// Only refreshes registries with `auto-update = true` (unless `update` is
 /// `Fetch`). Path-based registries are skipped (no fetching needed).
+///
+/// Legacy entry point retained until the root crate's 0.6 release. New callers
+/// should use [`try_ensure_registries`] to reject invalid source configuration.
 pub async fn ensure_registries(sym: &Symposium, update: UpdateLevel) {
+    ensure_registry_instances(sym.registry_instances(), update).await;
+}
+
+/// Refresh registries after validating the complete configured source set.
+///
+/// Individual refresh failures remain visible best-effort warnings.
+///
+/// # Errors
+/// Returns [`RegistryError`] before any refresh if a source cannot be resolved.
+pub async fn try_ensure_registries(
+    sym: &Symposium,
+    update: UpdateLevel,
+) -> std::result::Result<(), RegistryError> {
+    let instances = sym.try_registry_instances()?;
+    ensure_registry_instances(instances, update).await;
+    Ok(())
+}
+
+async fn ensure_registry_instances(instances: Vec<crate::pm::PmInstance>, update: UpdateLevel) {
     // `Fetch` forces even auto-update-disabled registries; otherwise each
     // registry's `refresh` honors its own auto-update flag (and a path registry
     // is a no-op).
     let force = matches!(update, UpdateLevel::Fetch);
-    for inst in sym.registry_instances() {
+    for inst in instances {
         if let Err(e) = inst.pm.refresh(update, force).await {
             tracing::warn!(registry = %inst.name, error = %e, "failed to refresh registry");
         }
@@ -834,10 +908,34 @@ pub async fn ensure_registries(sym: &Symposium, update: UpdateLevel) {
 ///
 /// If `provider` is Some, sync only that registry (ignores auto-update).
 /// If `provider` is None, sync all registries with auto-update = true.
+///
+/// Legacy entry point retained until the root crate's 0.6 release. New callers
+/// should use [`try_sync_registries`] to reject invalid source configuration.
 pub async fn sync_registries(sym: &Symposium, provider: Option<&str>) -> Result<Vec<String>> {
+    Ok(sync_registry_instances(sym.registry_instances(), provider).await)
+}
+
+/// Refresh selected registries after validating every configured source.
+///
+/// Individual refresh failures remain visible best-effort warnings.
+///
+/// # Errors
+/// Returns [`RegistryError`] before any refresh if a source cannot be resolved.
+pub async fn try_sync_registries(
+    sym: &Symposium,
+    provider: Option<&str>,
+) -> std::result::Result<Vec<String>, RegistryError> {
+    let instances = sym.try_registry_instances()?;
+    Ok(sync_registry_instances(instances, provider).await)
+}
+
+async fn sync_registry_instances(
+    instances: Vec<crate::pm::PmInstance>,
+    provider: Option<&str>,
+) -> Vec<String> {
     let mut synced = Vec::new();
 
-    for inst in sym.registry_instances() {
+    for inst in instances {
         // An explicit provider forces just that registry (ignoring its
         // auto-update flag); with no provider, every auto-update registry is
         // force-fetched. A path registry's `refresh` is a no-op, so it never
@@ -857,14 +955,32 @@ pub async fn sync_registries(sym: &Symposium, provider: Option<&str>) -> Result<
         }
     }
 
-    Ok(synced)
+    synced
 }
 
 /// List all providers and their plugins. Routed through the same package
 /// managers as registry loading, so what `plugin list` shows can't diverge
 /// from what `sync` sees.
+///
+/// Legacy entry point retained until the root crate's 0.6 release. New callers
+/// should use [`try_list_plugins`] to reject invalid source configuration.
 pub async fn list_plugins(sym: &Symposium) -> Vec<ProviderInfo> {
     let pms = sym.detached_managers();
+    list_plugins_with_managers(&pms).await
+}
+
+/// List providers after resolving the complete configured manager set.
+///
+/// # Errors
+/// Returns [`RegistryError`] before listing if a source cannot be resolved.
+pub async fn try_list_plugins(
+    sym: &Symposium,
+) -> std::result::Result<Vec<ProviderInfo>, RegistryError> {
+    let pms = sym.try_detached_managers()?;
+    Ok(list_plugins_with_managers(&pms).await)
+}
+
+async fn list_plugins_with_managers(pms: &crate::pm::PmRegistry) -> Vec<ProviderInfo> {
     let mut by_registry: std::collections::HashMap<String, Vec<PluginInfo>> =
         std::collections::HashMap::new();
 
@@ -906,8 +1022,27 @@ pub async fn list_plugins(sym: &Symposium) -> Vec<ProviderInfo> {
 }
 
 /// Find a plugin by name across all registries. First match wins.
+///
+/// Legacy entry point retained until the root crate's 0.6 release. New callers
+/// should use [`try_find_plugin`] to reject invalid source configuration.
 pub async fn find_plugin(sym: &Symposium, name: &str) -> Option<Plugin> {
     let pms = sym.detached_managers();
+    find_plugin_with_managers(&pms, name).await
+}
+
+/// Find the first matching plugin after validating every configured source.
+///
+/// # Errors
+/// Returns [`RegistryError`] before searching if a source cannot be resolved.
+pub async fn try_find_plugin(
+    sym: &Symposium,
+    name: &str,
+) -> std::result::Result<Option<Plugin>, RegistryError> {
+    let pms = sym.try_detached_managers()?;
+    Ok(find_plugin_with_managers(&pms, name).await)
+}
+
+async fn find_plugin_with_managers(pms: &crate::pm::PmRegistry, name: &str) -> Option<Plugin> {
     for inst in pms.instances().filter(|i| i.trusted) {
         for parsed in inst.registry_plugins().await.unwrap_or_default() {
             if parsed.manifest.name == name {
@@ -1068,25 +1203,61 @@ pub(crate) fn standalone_skill_manifest(skill_md: &Path) -> Result<RawPluginMani
 /// This form loads registries only; workspace-scoped callers use
 /// [`load_registry_with_workspace`] to also pick up plugins defined by the
 /// active workspace.
+///
+/// Legacy entry point retained until the root crate's 0.6 release. New callers
+/// should use [`try_load_registry`] to reject invalid source configuration.
 pub async fn load_registry(sym: &Symposium) -> PluginRegistry {
-    load_registry_impl(sym, None).await
+    let pms = sym.detached_managers();
+    load_registry_impl(sym, None, &pms).await
+}
+
+/// Load registries only after resolving the complete configured source set.
+///
+/// # Errors
+/// Returns [`RegistryError`] instead of an authoritative partial registry set
+/// when configuration is invalid. Individual unreadable registries retain
+/// their existing warnings and stale-cleanup protection.
+pub async fn try_load_registry(
+    sym: &Symposium,
+) -> std::result::Result<PluginRegistry, RegistryError> {
+    let pms = sym.try_detached_managers()?;
+    Ok(load_registry_impl(sym, None, &pms).await)
 }
 
 /// [`load_registry`] plus the plugins defined by the active workspace (the
 /// workspace root and every member directory), stamped as workspace
 /// members. `None` (not in a workspace) degrades to registries only.
+///
+/// Legacy entry point retained until the root crate's 0.6 release. New callers
+/// should use [`try_load_registry_with_workspace`].
 pub async fn load_registry_with_workspace(
     sym: &Symposium,
     workspace: Option<&crate::pm::LoadedWorkspace>,
 ) -> PluginRegistry {
-    load_registry_impl(sym, workspace).await
+    let pms = sym.detached_managers();
+    load_registry_impl(sym, workspace, &pms).await
+}
+
+/// Load validated registry sources plus plugins defined by the active workspace.
+///
+/// `None` loads registries only. Existing unreadable-registry warnings and
+/// workspace-plugin provenance are preserved.
+///
+/// # Errors
+/// Returns [`RegistryError`] before loading if a source cannot be resolved.
+pub async fn try_load_registry_with_workspace(
+    sym: &Symposium,
+    workspace: Option<&crate::pm::LoadedWorkspace>,
+) -> std::result::Result<PluginRegistry, RegistryError> {
+    let pms = sym.try_detached_managers()?;
+    Ok(load_registry_impl(sym, workspace, &pms).await)
 }
 
 async fn load_registry_impl(
     sym: &Symposium,
     workspace: Option<&crate::pm::LoadedWorkspace>,
+    pms: &crate::pm::PmRegistry,
 ) -> PluginRegistry {
-    let pms = sym.detached_managers();
     let mut plugins = Vec::new();
     let mut warnings = Vec::new();
     let mut unreadable_registries = Vec::new();
@@ -1931,6 +2102,86 @@ fn build_custom_predicate_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runnable_installation() -> Installation {
+        Installation {
+            name: "PRIVATE_RUNNABLE_CANARY".into(),
+            requirements: vec![],
+            install_commands: vec![],
+            source: None,
+            executable: None,
+            script: None,
+            args: vec![],
+        }
+    }
+
+    #[test]
+    fn runnable_selection_covers_all_four_field_combinations() {
+        for mask in 0u8..16 {
+            let mut install = runnable_installation();
+            install.executable = (mask & 1 != 0).then(|| "exec".into());
+            install.script = (mask & 2 != 0).then(|| "script".into());
+            let selected = install.runnable_spec(
+                (mask & 4 != 0).then_some("override-exec"),
+                (mask & 8 != 0).then_some("override-script"),
+            );
+            let expected = match mask {
+                0 => Some(None),
+                1 => Some(Some(RunnableSpec::Exec("exec"))),
+                2 => Some(Some(RunnableSpec::Script("script"))),
+                4 => Some(Some(RunnableSpec::Exec("override-exec"))),
+                8 => Some(Some(RunnableSpec::Script("override-script"))),
+                _ => None,
+            };
+            match expected {
+                Some(expected) => assert_eq!(selected.unwrap(), expected, "mask {mask}"),
+                None => assert!(
+                    !selected
+                        .unwrap_err()
+                        .to_string()
+                        .contains("PRIVATE_RUNNABLE_CANARY")
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn runnable_selection_preserves_source_modes_and_rejects_global_scripts() {
+        use symposium_install::{CargoSource, GithubSource};
+        let mut global = CargoSource::new("test");
+        global.global = true;
+        let git = CargoSource::new("test").with_git("https://example.invalid/test");
+        let sources = [
+            None,
+            Some(Source::Github(GithubSource::new(
+                "https://example.invalid/test",
+            ))),
+            Some(Source::Cargo(CargoSource::new("test"))),
+            Some(Source::Cargo(git)),
+            Some(Source::Cargo(global)),
+        ];
+        for source in sources {
+            let requires_exec = matches!(&source, Some(Source::Cargo(cargo)) if cargo.global || cargo.git.is_some());
+            let mut install = runnable_installation();
+            install.source = source;
+            assert_eq!(install.runnable_spec(None, None).is_err(), requires_exec);
+            assert_eq!(
+                install.runnable_spec(Some("tool"), None).unwrap(),
+                Some(RunnableSpec::Exec("tool"))
+            );
+            assert_eq!(
+                install
+                    .runnable_spec(None, Some("scripts/tool.sh"))
+                    .is_err(),
+                requires_exec
+            );
+            install.executable = Some("tool".into());
+            assert_eq!(
+                install.runnable_spec(None, None).unwrap(),
+                Some(RunnableSpec::Exec("tool"))
+            );
+        }
+    }
     use indoc::indoc;
     use std::collections::BTreeMap;
 

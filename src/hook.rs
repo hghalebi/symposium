@@ -1,5 +1,6 @@
 use crate::predicate::PredicateEval;
 use std::{
+    ffi::OsString,
     io::{Read, Write},
     path::PathBuf,
     process::{ExitCode, Stdio},
@@ -9,6 +10,8 @@ use symposium_install::Runnable;
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, process::Command};
 
+/// Typed acquisition and runnable-resolution failures used by [`HookError`].
+pub use crate::installation::InstallationError;
 use crate::installation::{
     AcquiredInstallation, AcquiredRunnable, acquire_installation, refresh_installation_if_present,
     resolve_runnable,
@@ -82,73 +85,70 @@ fn env_safe(name: &str) -> String {
 
 /// Build the env vars (including augmented PATH) for the spawn.
 ///
-/// Iterates `acquired` in order; the parent directory of each absolute
-/// `runnable` is prepended to `$PATH` so later entries take precedence over
+/// Iterates `acquired` in order; each resolved runnable's parent directory
+/// is prepended to `$PATH` so later entries take precedence over
 /// earlier ones (the command's own parent ends up first since it's pushed
 /// last and prepended).
-fn build_env(acquired: &[AcquiredInstallation]) -> Vec<(String, String)> {
+fn build_env(
+    acquired: &[AcquiredInstallation],
+) -> Result<Vec<(String, OsString)>, std::env::JoinPathsError> {
     let mut env = Vec::new();
-    let mut path_prefix: Vec<String> = Vec::new();
+    let mut path_prefix = Vec::new();
 
-    for a in acquired {
-        let key = env_safe(&a.name);
-        if let Some(base) = &a.base {
-            env.push((format!("SYMPOSIUM_DIR_{key}"), base.display().to_string()));
+    for installation in acquired {
+        let key = env_safe(&installation.name);
+        if let Some(base) = &installation.base {
+            env.push((format!("SYMPOSIUM_DIR_{key}"), base.as_os_str().to_owned()));
         }
         if let Some(
-            AcquiredRunnable::ResolvedScript { path, .. } | AcquiredRunnable::ResolvedExec { path },
-        ) = &a.runnable
+            AcquiredRunnable::ResolvedScript { path } | AcquiredRunnable::ResolvedExec { path },
+        ) = &installation.runnable
         {
-            env.push((format!("SYMPOSIUM_{key}"), path.display().to_string()));
-            if let Some(parent) = path.parent() {
-                let parent_str = parent.display().to_string();
-                if !parent_str.is_empty() {
-                    path_prefix.push(parent_str);
-                }
+            env.push((format!("SYMPOSIUM_{key}"), path.as_os_str().to_owned()));
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                path_prefix.push(parent.to_path_buf());
             }
         }
     }
 
-    // Command was pushed last into `acquired`; reverse so its bin dir wins
-    // PATH lookup over requirements' bin dirs.
+    // The command is acquired last, so its bin directory must precede requirements.
     path_prefix.reverse();
-
-    if let Some(joined) = prepend_to_path(&path_prefix) {
+    if let Some(joined) = prepend_to_path(&path_prefix)? {
         env.push(("PATH".to_string(), joined));
     }
-
-    env
+    Ok(env)
 }
 
-/// Prepend `dirs` to the current `PATH`, using the platform path-list
-/// separator (`:` on Unix, `;` on Windows). Returns `None` when `dirs` is
-/// empty. `join_paths` picks the separator, so this stays correct on Windows.
-fn prepend_to_path(dirs: &[String]) -> Option<String> {
+/// Prepend native directories to `PATH`, returning no override for an empty list.
+/// Unrepresentable path-list entries retain the actual platform join error.
+fn prepend_to_path(dirs: &[PathBuf]) -> Result<Option<OsString>, std::env::JoinPathsError> {
     if dirs.is_empty() {
-        return None;
+        return Ok(None);
     }
     let existing = std::env::var_os("PATH").unwrap_or_default();
-    let mut entries: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
-    entries.extend(std::env::split_paths(&existing).filter(|dir| !dir.as_os_str().is_empty()));
-    std::env::join_paths(entries)
-        .ok()
-        .map(|joined| joined.to_string_lossy().into_owned())
+    let entries = dirs
+        .iter()
+        .cloned()
+        .chain(std::env::split_paths(&existing).filter(|dir| !dir.as_os_str().is_empty()));
+    std::env::join_paths(entries).map(Some)
 }
 
 enum SpawnSpec {
     Exec {
         path: PathBuf,
         args: Vec<String>,
-        env: Vec<(String, String)>,
+        env: Vec<(String, OsString)>,
     },
     Script {
         path: PathBuf,
         args: Vec<String>,
-        env: Vec<(String, String)>,
+        env: Vec<(String, OsString)>,
     },
 }
 
-async fn build_spawn_spec(sym: &Symposium, hook: &ResolvedHook) -> anyhow::Result<SpawnSpec> {
+async fn build_spawn_spec(sym: &Symposium, hook: &ResolvedHook) -> Result<SpawnSpec, HookError> {
     // Dispatch-time acquisition serves the cache (git checks debounced); the
     // `SessionStart` prewarm is what forces a freshness check once per session.
     let update = symposium_install::UpdateLevel::None;
@@ -156,12 +156,7 @@ async fn build_spawn_spec(sym: &Symposium, hook: &ResolvedHook) -> anyhow::Resul
     // Acquire requirements first so the command's PATH sees them.
     let mut acquired: Vec<AcquiredInstallation> = Vec::new();
     for requirement in &hook.requirements {
-        match acquire_installation(sym, requirement, None, None, update).await {
-            Ok(a) => acquired.push(a),
-            Err(_error) => {
-                tracing::error!("failed to install hook requirement");
-            }
-        }
+        acquired.push(acquire_installation(sym, requirement, None, None, update).await?);
     }
 
     let command_acquired = acquire_installation(
@@ -174,7 +169,7 @@ async fn build_spawn_spec(sym: &Symposium, hook: &ResolvedHook) -> anyhow::Resul
     .await?;
 
     acquired.push(command_acquired.clone());
-    let env = build_env(&acquired);
+    let env = build_env(&acquired)?;
 
     let label = format!("hook `{}`", hook.hook_name);
     let runnable = resolve_runnable(command_acquired, &label)?;
@@ -231,6 +226,9 @@ pub use crate::hook_schema::{HookAgent, HookEvent, HookResponse};
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum HookError {
+    /// Registry configuration could not provide a complete source set.
+    #[error("failed to resolve hook registries")]
+    Registry(#[from] crate::config::RegistryError),
     /// An agent does not support the selected event.
     #[error("agent {agent:?} does not support hook event {event:?}")]
     UnsupportedEvent { agent: HookAgent, event: HookEvent },
@@ -266,8 +264,14 @@ pub enum HookError {
     /// A hook command could not be acquired or resolved.
     #[error("failed to prepare plugin hook command")]
     PluginPreparation {
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
+        #[from]
+        source: InstallationError,
+    },
+    /// A native installation directory cannot be represented in the platform PATH.
+    #[error("failed to build plugin hook environment")]
+    PluginEnvironment {
+        #[from]
+        source: std::env::JoinPathsError,
     },
     /// A plugin process could not be started.
     #[error("failed to spawn plugin hook")]
@@ -647,13 +651,26 @@ fn hook_dispatch_needs_deps(sym: &Symposium, registry_plugins: &[Plugin]) -> boo
 /// but never installs eagerly. Best-effort: failures are logged and skipped.
 async fn prewarm_hook_sources(sym: &Symposium, deps: &Arc<WorkspaceDeps>) {
     let workspace = deps.load().cloned();
-    let registry = crate::plugins::load_registry_with_workspace(sym, workspace.as_deref()).await;
+    let registry =
+        match crate::plugins::try_load_registry_with_workspace(sym, workspace.as_deref()).await {
+            Ok(registry) => registry,
+            Err(_) => {
+                tracing::warn!("prewarm: invalid registry configuration");
+                return;
+            }
+        };
 
     // Resolving the workspace runs cargo, so only do it when some hook's
     // gating references a concrete crate, or there is crate-plugin expansion to
     // perform (mirrors dispatch).
     let dep_ids = if hook_dispatch_needs_deps(sym, &registry.plugins) {
-        crate::pm::workspace_dep_ids(sym, deps).await
+        match crate::pm::try_workspace_dep_ids(sym, deps).await {
+            Ok(ids) => ids,
+            Err(_) => {
+                tracing::warn!("prewarm: dependency registry resolution failed");
+                return;
+            }
+        }
     } else {
         Vec::new()
     };
@@ -662,7 +679,13 @@ async fn prewarm_hook_sources(sym: &Symposium, deps: &Arc<WorkspaceDeps>) {
         .map(|ws| sym.config.plugins.used_names_in(&ws.root))
         .unwrap_or_default();
     let mut ctx = crate::predicate::PredicateContext::new(&dep_ids).with_used_names(&used_names);
-    let pms = sym.package_managers(deps);
+    let pms = match sym.try_package_managers(deps) {
+        Ok(pms) => pms,
+        Err(_) => {
+            tracing::warn!("prewarm: invalid registry configuration");
+            return;
+        }
+    };
     let plugins = crate::plugins::active_plugins(
         sym,
         &registry,
@@ -688,7 +711,7 @@ async fn prewarm_hook_sources(sym: &Symposium, deps: &Arc<WorkspaceDeps>) {
                 }
             };
             for req in &resolved.requirements {
-                if let Err(_error) = refresh_installation_if_present(sym, req, None).await {
+                if let Err(_error) = refresh_installation_if_present(sym, req, None, None).await {
                     tracing::debug!("prewarm: requirement refresh failed");
                 }
             }
@@ -696,6 +719,7 @@ async fn prewarm_hook_sources(sym: &Symposium, deps: &Arc<WorkspaceDeps>) {
                 sym,
                 &resolved.command,
                 resolved.hook_executable.as_deref(),
+                resolved.hook_script.as_deref(),
             )
             .await
             {
@@ -758,15 +782,34 @@ async fn handle_session_start(
 /// Reuses the help renderer's `applicable_subcommands`, so the hint fires only when there is actually something to discover; `None` otherwise.
 async fn discovery_hint(sym: &Symposium, deps: &Arc<WorkspaceDeps>) -> Option<String> {
     let workspace = deps.load().cloned();
-    let registry = crate::plugins::load_registry_with_workspace(sym, workspace.as_deref()).await;
-    let dep_ids = crate::pm::workspace_dep_ids(sym, deps).await;
+    let registry =
+        match crate::plugins::try_load_registry_with_workspace(sym, workspace.as_deref()).await {
+            Ok(registry) => registry,
+            Err(_) => {
+                tracing::warn!("discovery hint: invalid registry configuration");
+                return None;
+            }
+        };
+    let dep_ids = match crate::pm::try_workspace_dep_ids(sym, deps).await {
+        Ok(ids) => ids,
+        Err(_) => {
+            tracing::warn!("discovery hint: dependency registry resolution failed");
+            return None;
+        }
+    };
 
     let used = workspace
         .as_ref()
         .map(|ws| sym.config.plugins.used_names_in(&ws.root))
         .unwrap_or_default();
     let mut ctx = crate::predicate::PredicateContext::new(&dep_ids).with_used_names(&used);
-    let pms = sym.package_managers(deps);
+    let pms = match sym.try_package_managers(deps) {
+        Ok(pms) => pms,
+        Err(_) => {
+            tracing::warn!("discovery hint: invalid registry configuration");
+            return None;
+        }
+    };
     let active = crate::plugins::active_plugins(
         sym,
         &registry,
@@ -792,7 +835,13 @@ async fn discovery_hint(sym: &Symposium, deps: &Arc<WorkspaceDeps>) -> Option<St
 /// context, with a pointer at the interactive command that can actually ask.
 /// `None` when nothing is pending.
 async fn consent_hint(sym: &Symposium, deps: &Arc<WorkspaceDeps>) -> Option<String> {
-    let names = crate::discovery::pending_candidates(sym, deps).await;
+    let names = match crate::discovery::try_pending_candidates(sym, deps).await {
+        Ok(names) => names,
+        Err(_) => {
+            tracing::warn!("consent hint: invalid registry configuration");
+            return None;
+        }
+    };
     if names.is_empty() {
         return None;
     }
@@ -1037,7 +1086,9 @@ async fn try_dispatch_plugin_hooks(
     deps: &Arc<WorkspaceDeps>,
 ) -> Result<serde_json::Value, HookDispatchError> {
     let workspace = deps.load().cloned();
-    let registry = crate::plugins::load_registry_with_workspace(sym, workspace.as_deref()).await;
+    let registry = crate::plugins::try_load_registry_with_workspace(sym, workspace.as_deref())
+        .await
+        .map_err(HookError::Registry)?;
 
     // Resolving the workspace means running cargo, so only do it when some
     // plugin's hook gating references a concrete crate (a `depends-on(*)`
@@ -1045,7 +1096,9 @@ async fn try_dispatch_plugin_hooks(
     // when there is crate-plugin expansion to perform — that too evaluates
     // predicates against the crate graph.
     let dep_ids = if hook_dispatch_needs_deps(sym, &registry.plugins) {
-        crate::pm::workspace_dep_ids(sym, deps).await
+        crate::pm::try_workspace_dep_ids(sym, deps)
+            .await
+            .map_err(HookError::Registry)?
     } else {
         Vec::new()
     };
@@ -1056,7 +1109,9 @@ async fn try_dispatch_plugin_hooks(
     let mut ctx = crate::predicate::PredicateContext::new(&dep_ids).with_used_names(&used_names);
     // Dispatch over the active set — registry plugins plus crate-sourced ones —
     // so a crate plugin's hooks fire exactly like a registry plugin's.
-    let pms = sym.package_managers(deps);
+    let pms = sym
+        .try_package_managers(deps)
+        .map_err(HookError::Registry)?;
     let plugins = crate::plugins::active_plugins(
         sym,
         &registry,
@@ -1079,12 +1134,7 @@ async fn try_dispatch_plugin_hooks(
         let native = hook.format.as_agent() == Some(host_agent);
         let input: &dyn AgentHookInput = if native { original_input } else { sym_input };
         let stdin = input.try_to_string().map_err(HookError::from)?;
-        let spec =
-            build_spawn_spec(sym, &hook)
-                .await
-                .map_err(|source| HookError::PluginPreparation {
-                    source: source.into_boxed_dyn_error(),
-                })?;
+        let spec = build_spawn_spec(sym, &hook).await?;
         let child = spawn_from_spec(spec).map_err(|source| HookError::PluginSpawn { source })?;
         let child_output = collect_plugin_output(child, stdin.as_bytes()).await?;
         let exit_code = child_output.status.code();
@@ -1496,13 +1546,13 @@ mod tests {
 
     #[test]
     fn build_env_sets_dir_and_name_vars() {
-        // [req (rtk), command (no-source)] order — command was pushed last,
-        // so PATH should put its bin dir first.
+        use std::ffi::OsStr;
+
         let acquired = vec![
             AcquiredInstallation {
                 name: "rtk".to_string(),
                 base: Some(PathBuf::from("/cache/rtk/1.0")),
-                runnable: Some(AcquiredRunnable::ResolvedExec {
+                runnable: Some(AcquiredRunnable::ResolvedScript {
                     path: PathBuf::from("/cache/rtk/1.0/bin/rtk"),
                 }),
             },
@@ -1514,55 +1564,162 @@ mod tests {
                 }),
             },
         ];
-        let env: std::collections::HashMap<_, _> = build_env(&acquired).into_iter().collect();
+        let env: std::collections::HashMap<_, _> =
+            build_env(&acquired).unwrap().into_iter().collect();
         assert_eq!(
-            env.get("SYMPOSIUM_DIR_rtk").map(String::as_str),
-            Some("/cache/rtk/1.0")
+            env.get("SYMPOSIUM_DIR_rtk").map(OsString::as_os_str),
+            Some(OsStr::new("/cache/rtk/1.0")),
         );
         assert_eq!(
-            env.get("SYMPOSIUM_rtk").map(String::as_str),
-            Some("/cache/rtk/1.0/bin/rtk")
+            env.get("SYMPOSIUM_rtk").map(OsString::as_os_str),
+            Some(OsStr::new("/cache/rtk/1.0/bin/rtk")),
         );
-        // No source means no _DIR, but absolute runnable path → SYMPOSIUM_<name> set.
         assert_eq!(env.get("SYMPOSIUM_DIR_no_source"), None);
         assert_eq!(
-            env.get("SYMPOSIUM_no_source").map(String::as_str),
-            Some("/usr/local/bin/tool")
+            env.get("SYMPOSIUM_no_source").map(OsString::as_os_str),
+            Some(OsStr::new("/usr/local/bin/tool")),
         );
-        // Command (pushed last) wins PATH lookup, so its parent comes first.
-        let path = env.get("PATH").expect("PATH set");
-        assert!(path.starts_with("/usr/local/bin"), "PATH = {path}");
-        assert!(path.contains("/cache/rtk/1.0/bin"), "PATH = {path}");
+        let path = env.get("PATH").unwrap();
+        let prefix: Vec<_> = std::env::split_paths(path).take(2).collect();
+        assert_eq!(
+            prefix,
+            [
+                PathBuf::from("/usr/local/bin"),
+                PathBuf::from("/cache/rtk/1.0/bin")
+            ]
+        );
     }
 
     #[test]
     fn prepend_to_path_uses_platform_separator() {
-        assert!(prepend_to_path(&[]).is_none(), "empty input yields None");
+        assert!(prepend_to_path(&[]).unwrap().is_none());
+        let dirs = [PathBuf::from("/first"), PathBuf::from("/second")];
+        let joined = prepend_to_path(&dirs).unwrap().unwrap();
+        let prefix: Vec<_> = std::env::split_paths(&joined).take(2).collect();
+        assert_eq!(prefix, dirs);
+    }
 
-        let dirs = vec!["/first".to_string(), "/second".to_string()];
-        let joined = prepend_to_path(&dirs).expect("non-empty dirs yield Some");
+    #[test]
+    fn build_env_keeps_native_path_join_failure_as_a_source() {
+        use std::error::Error as _;
 
-        let sep = if cfg!(windows) { ';' } else { ':' };
-        assert!(
-            joined.starts_with(&format!("/first{sep}/second")),
-            "prepended dirs come first, joined by the platform separator: {joined}"
+        let directory = if cfg!(windows) {
+            PathBuf::from("C:/invalid\"directory")
+        } else {
+            PathBuf::from("/invalid:directory")
+        };
+        assert!(prepend_to_path(std::slice::from_ref(&directory)).is_err());
+        let acquired = [AcquiredInstallation {
+            name: "invalid".into(),
+            base: Some(directory.clone()),
+            runnable: Some(AcquiredRunnable::ResolvedExec {
+                path: directory.join("tool"),
+            }),
+        }];
+        let error = HookError::from(build_env(&acquired).unwrap_err());
+        assert!(matches!(error, HookError::PluginEnvironment { .. }));
+        assert!(error.source().unwrap().is::<std::env::JoinPathsError>());
+        assert_eq!(error.to_string(), "failed to build plugin hook environment");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_env_preserves_non_utf8_values_through_process_spawn() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join(OsString::from_vec(b"cache-\xff".to_vec()));
+        let runnable = base.join("bin/tool");
+        let acquired = [AcquiredInstallation {
+            name: "native-tool".into(),
+            base: Some(base.clone()),
+            runnable: Some(AcquiredRunnable::ResolvedScript {
+                path: runnable.clone(),
+            }),
+        }];
+        let env = build_env(&acquired).unwrap();
+        let path = env.iter().find(|(key, _)| key == "PATH").unwrap();
+        assert_eq!(
+            std::env::split_paths(&path.1).next().unwrap(),
+            base.join("bin")
         );
+        let script = temp.path().join("environment.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$SYMPOSIUM_DIR_native_tool\" \"$SYMPOSIUM_native_tool\"\n",
+        )
+        .unwrap();
+        let output = spawn_from_spec(SpawnSpec::Script {
+            path: script,
+            args: vec![],
+            env,
+        })
+        .unwrap()
+        .wait_with_output()
+        .await
+        .unwrap();
+        assert!(output.status.success());
+        let mut expected = base.as_os_str().as_bytes().to_vec();
+        expected.push(b'\n');
+        expected.extend_from_slice(runnable.as_os_str().as_bytes());
+        expected.push(b'\n');
+        assert_eq!(output.stdout, expected);
+    }
+
+    #[tokio::test]
+    async fn required_installation_failure_stops_command_preparation() {
+        let temp = tempfile::tempdir().unwrap();
+        let sym = Symposium::try_from_dir(temp.path()).unwrap();
+        let installation = |name: &str| Installation {
+            name: name.into(),
+            requirements: vec![],
+            install_commands: vec![],
+            source: None,
+            executable: None,
+            script: None,
+            args: vec![],
+        };
+        let mut required = installation("required");
+        required.executable = Some("required".into());
+        required.script = Some("required.sh".into());
+        let mut command = installation("command");
+        command.script = Some("command.sh".into());
+        command.install_commands.push("exit 99".into());
+        let hook = ResolvedHook {
+            hook_name: "required-failure".into(),
+            format: HookFormat::Symposium,
+            requirements: vec![required],
+            command,
+            hook_executable: None,
+            hook_script: None,
+            args: vec![],
+        };
+        let error = match build_spawn_spec(&sym, &hook).await {
+            Ok(_) => panic!("invalid required installation must stop preparation"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            HookError::PluginPreparation {
+                source: InstallationError::Selection(_),
+            }
+        ));
     }
 
     #[test]
     fn build_env_no_runnable_no_vars() {
-        // Pure-setup installation: no runnable means no SYMPOSIUM_<name>
-        // and no PATH contribution. SYMPOSIUM_DIR_<name> still gets set
-        // when there's a managed base dir.
+        use std::ffi::OsStr;
+
         let acquired = vec![AcquiredInstallation {
             name: "setup".to_string(),
             base: Some(PathBuf::from("/cache/setup")),
             runnable: None,
         }];
-        let env: std::collections::HashMap<_, _> = build_env(&acquired).into_iter().collect();
+        let env: std::collections::HashMap<_, _> =
+            build_env(&acquired).unwrap().into_iter().collect();
         assert_eq!(
-            env.get("SYMPOSIUM_DIR_setup").map(String::as_str),
-            Some("/cache/setup")
+            env.get("SYMPOSIUM_DIR_setup").map(OsString::as_os_str),
+            Some(OsStr::new("/cache/setup")),
         );
         assert!(!env.contains_key("SYMPOSIUM_setup"));
         assert!(!env.contains_key("PATH"));
@@ -1570,15 +1727,15 @@ mod tests {
 
     #[test]
     fn build_env_global_cargo_skips_env_and_path() {
-        // Global cargo: PathLookup runnable. Nothing exposed.
         let acquired = vec![AcquiredInstallation {
             name: "rg".to_string(),
             base: None,
             runnable: Some(AcquiredRunnable::GlobalExec {
-                path: PathBuf::from("rg".to_string()),
+                path: PathBuf::from("rg"),
             }),
         }];
-        let env: std::collections::HashMap<_, _> = build_env(&acquired).into_iter().collect();
+        let env: std::collections::HashMap<_, _> =
+            build_env(&acquired).unwrap().into_iter().collect();
         assert!(!env.contains_key("SYMPOSIUM_DIR_rg"));
         assert!(!env.contains_key("SYMPOSIUM_rg"));
         assert!(!env.contains_key("PATH"));

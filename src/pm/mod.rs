@@ -297,15 +297,37 @@ impl PmRegistry {
 /// ([`crate::predicate::PredicateContext`]). Failures are logged and yield an
 /// empty list so predicate evaluation degrades to "no deps" rather than
 /// aborting the caller.
+/// Legacy best-effort adapter retained through root 0.6. Use
+/// [`try_workspace_dep_ids`] before operations that rely on the configured set.
 pub async fn workspace_dep_ids(
     sym: &crate::config::Symposium,
     deps: &Arc<WorkspaceDeps>,
 ) -> Vec<PackageId> {
-    match sym.package_managers(deps).list_deps().await {
-        Ok(deps) => deps,
+    match try_workspace_dep_ids(sym, deps).await {
+        Ok(ids) => ids,
+        Err(_) => {
+            tracing::warn!("dependency discovery skipped: invalid registry configuration");
+            Vec::new()
+        }
+    }
+}
+
+/// The workspace dependency union, rejecting invalid configured registry sources.
+///
+/// Package-manager listing failures retain the existing visible best-effort
+/// behavior; an invalid source configuration always returns an error.
+///
+/// # Errors
+/// Returns [`crate::config::RegistryError`] when a configured source is invalid.
+pub async fn try_workspace_dep_ids(
+    sym: &crate::config::Symposium,
+    deps: &Arc<WorkspaceDeps>,
+) -> Result<Vec<PackageId>, crate::config::RegistryError> {
+    match sym.try_package_managers(deps)?.list_deps().await {
+        Ok(deps) => Ok(deps),
         Err(e) => {
             tracing::warn!(error = %e, "failed to list workspace dependencies");
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 }

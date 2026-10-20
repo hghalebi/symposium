@@ -55,7 +55,11 @@ async fn main() -> ExitCode {
     // `--help` / `-h` / `help` / no subcommand -> audience-grouped top-level help (or clap's
     // per-command help for `<built-in> --help`).
     // Plugin `<name> --help` returns `None` here and is forwarded to the child by dispatch below.
-    if let Some(text) = help_render::help_text(parse.as_ref(), &args_str, &sym, &cwd).await {
+    let help = match help_render::try_help_text(parse.as_ref(), &args_str, &sym, &cwd).await {
+        Ok(help) => help,
+        Err(error) => return startup_failure(startup_hook, &error),
+    };
+    if let Some(text) = help {
         print!("{text}");
         return ExitCode::SUCCESS;
     }
@@ -120,9 +124,6 @@ async fn main() -> ExitCode {
         None => {}
     }
 
-    // Stamp state.toml with the running binary version (silently updates on mismatch).
-    state::ensure_current(sym.config_dir());
-
     // Hook commands are quiet by default (they're invoked by the agent, not the user).
     // JSON mode also suppresses human output (only JSON goes to stdout).
     let out = if cli.quiet || is_hook || cli.json {
@@ -142,7 +143,12 @@ async fn main() -> ExitCode {
         }
         _ => cli.update,
     };
-    plugins::ensure_registries(&sym, source_update).await;
+    if let Err(error) = plugins::try_ensure_registries(&sym, source_update).await {
+        return startup_failure(startup_hook, &error);
+    }
+
+    // A rejected registry configuration must not stamp operational state.
+    state::ensure_current(sym.config_dir());
 
     // Auto-update = "on": check for updates and re-exec if a new binary was
     // installed.  Skipped for self-update (which always checks explicitly)
@@ -231,7 +237,7 @@ fn startup_failure(
 async fn handle_plugin_command(sym: &config::Symposium, command: PluginCommand) -> ExitCode {
     match command {
         PluginCommand::Sync { provider } => {
-            match plugins::sync_registries(sym, provider.as_deref()).await {
+            match plugins::try_sync_registries(sym, provider.as_deref()).await {
                 Ok(synced) => {
                     if synced.is_empty() {
                         if let Some(ref p) = provider {
@@ -253,7 +259,10 @@ async fn handle_plugin_command(sym: &config::Symposium, command: PluginCommand) 
             }
         }
         PluginCommand::List => {
-            let providers = plugins::list_plugins(sym).await;
+            let providers = match plugins::try_list_plugins(sym).await {
+                Ok(providers) => providers,
+                Err(error) => return startup_failure(None, &error),
+            };
             for provider in &providers {
                 tracing::info!(
                     report = %report::ReportEvent::ProviderListed {
@@ -344,10 +353,10 @@ async fn handle_plugin_command(sym: &config::Symposium, command: PluginCommand) 
                 }
             }
         }
-        PluginCommand::Show { plugin } => match plugins::find_plugin(sym, &plugin).await {
+        PluginCommand::Show { plugin } => match plugins::try_find_plugin(sym, &plugin).await {
             // A plugin is identified by its id; render its effective (resolved)
             // configuration rather than re-reading a manifest file.
-            Some(p) => {
+            Ok(Some(p)) => {
                 println!("# {}", p.canonical);
                 match toml::to_string_pretty(&p.manifest) {
                     Ok(rendered) => {
@@ -361,10 +370,11 @@ async fn handle_plugin_command(sym: &config::Symposium, command: PluginCommand) 
                     }
                 }
             }
-            None => {
+            Ok(None) => {
                 eprintln!("Plugin not found: {plugin}");
                 ExitCode::FAILURE
             }
+            Err(error) => startup_failure(None, &error),
         },
     }
 }

@@ -33,6 +33,9 @@ impl GitPm {
     /// A git registry named `name` for `git_url`, cached under
     /// [`REGISTRY_CACHE_SUBDIR`]. `None` if the URL can't be resolved to a
     /// cache path (a malformed URL) — the caller skips it with a warning.
+    ///
+    /// Legacy entry point retained until the root crate's 0.6 release.
+    /// New callers should use [`Self::try_new`].
     pub fn new(
         name: impl Into<String>,
         git_url: impl Into<String>,
@@ -45,6 +48,31 @@ impl GitPm {
             GitCacheManager::new(&ctx, REGISTRY_CACHE_SUBDIR).cache_path_for_url(&git_url)?;
         let inner = PathPm::new(name.clone(), content_dir);
         Some(Self {
+            name,
+            git_url,
+            auto_update,
+            ctx,
+            inner,
+        })
+    }
+
+    /// Resolve a Git registry's local cache path without fetching its contents.
+    ///
+    /// # Errors
+    /// Returns a structured Git source or HTTP-client construction error.
+    /// Source URL contents are not included in its diagnostic.
+    pub fn try_new(
+        name: impl Into<String>,
+        git_url: impl Into<String>,
+        auto_update: bool,
+        ctx: symposium_install::InstallContext,
+    ) -> std::result::Result<Self, symposium_install::git::GitError> {
+        let name = name.into();
+        let git_url = git_url.into();
+        let content_dir = GitCacheManager::try_new(&ctx, REGISTRY_CACHE_SUBDIR)?
+            .try_cache_path_for_url(&git_url)?;
+        let inner = PathPm::new(name.clone(), content_dir);
+        Ok(Self {
             name,
             git_url,
             auto_update,

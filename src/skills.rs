@@ -129,14 +129,18 @@ pub async fn skills_applicable_to(
     >,
     update: UpdateLevel,
 ) -> Vec<SkillWithGroupContext> {
-    let for_crates = crate::pm::workspace_dep_ids(sym, deps).await;
+    let for_crates = crate::pm::try_workspace_dep_ids(sym, deps)
+        .await
+        .expect("skill fixture has valid registry sources");
     let used_names = workspace_root
         .map(|root| sym.config.plugins.used_names_in(root))
         .unwrap_or_default();
     let mut ctx = PredicateContext::with_custom_predicates(&for_crates, custom_predicate_entries)
         .with_used_names(&used_names);
 
-    let pms = sym.package_managers(deps);
+    let pms = sym
+        .try_package_managers(deps)
+        .expect("skill fixture has valid registry sources");
     let active =
         crate::plugins::active_plugins(sym, registry, &pms, workspace_root, &mut ctx).await;
     collect_skills(sym, &active, &mut ctx, update).await

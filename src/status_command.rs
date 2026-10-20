@@ -82,8 +82,8 @@ pub async fn workspace_status(
     // Manifest plugins: workspace members and registry offerings. Both are
     // trust roots, so the only questions are the `use` gate for dormant
     // plugins and whether the predicates hold.
-    let registry = crate::plugins::load_registry_with_workspace(sym, Some(&ws)).await;
-    let dep_ids = crate::pm::workspace_dep_ids(sym, deps).await;
+    let registry = crate::plugins::try_load_registry_with_workspace(sym, Some(&ws)).await?;
+    let dep_ids = crate::pm::try_workspace_dep_ids(sym, deps).await?;
     let used_names = sym.config.plugins.used_names_in(&ws.root);
     let mut ctx = crate::predicate::PredicateContext::new(&dep_ids).with_used_names(&used_names);
     for parsed in &registry.plugins {
@@ -113,7 +113,7 @@ pub async fn workspace_status(
 
     // Dependency-embedded plugins, with the decision the config made about
     // each. This is the same view the consent prompt works from.
-    let discovery = crate::discovery::discover(sym, deps).await;
+    let discovery = crate::discovery::try_discover(sym, deps).await?;
     let mut declined_names = Vec::new();
     for found in discovery
         .active

@@ -340,6 +340,7 @@ async fn resolve_custom_predicate_entries(
 /// Run the full sync: discover applicable skills, install into agent dirs,
 /// clean up stale installations.
 pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLevel) -> Result<()> {
+    let pms = sym.try_package_managers(deps)?;
     let out = &Output::quiet();
     let loaded = deps
         .load()
@@ -351,7 +352,7 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
     tracing::debug!(root = %project_root.display(), "resolved workspace root");
 
     // Load plugin registry (registry sources + workspace plugins)
-    let registry = plugins::load_registry_with_workspace(sym, Some(&loaded)).await;
+    let registry = plugins::try_load_registry_with_workspace(sym, Some(&loaded)).await?;
 
     for warning in &registry.warnings {
         tracing::info!(
@@ -374,7 +375,7 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
     // skill resolution and MCP-server filtering. Attach the on-disk cache so
     // custom predicate results survive across sync runs; results are persisted
     // at the end of this evaluation pass.
-    let dep_ids = crate::pm::workspace_dep_ids(sym, deps).await;
+    let dep_ids = crate::pm::try_workspace_dep_ids(sym, deps).await?;
     let used_names = sym.config.plugins.used_names_in(&project_root);
     let predicate_cache_path =
         crate::predicate_cache::PredicateCache::path_for_workspace(sym.cache_dir(), &project_root);
@@ -387,7 +388,6 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
     // reached through `[[plugins]]` chained references and dependency
     // enablement. Every facet resolves over this one set, so a crate plugin's
     // skills and MCP servers install exactly like a registry plugin's.
-    let pms = sym.package_managers(deps);
     let active = plugins::active_plugins(sym, &registry, &pms, Some(&project_root), &mut ctx).await;
 
     // Find all applicable skills.
@@ -677,7 +677,7 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
 /// Register hooks for all configured agents. Uses `home_dir` (global scope).
 /// Called from `init` after writing the user config.
 pub async fn register_hooks(sym: &Symposium, out: &Output) -> Result<()> {
-    let registry = plugins::load_registry(sym).await;
+    let registry = plugins::try_load_registry(sym).await?;
     let mcp_servers: Vec<sacp::schema::McpServer> = registry
         .plugins
         .iter()

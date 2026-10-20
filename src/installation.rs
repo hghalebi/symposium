@@ -1,184 +1,518 @@
 //! Shared installation resolution for hooks and subcommands.
 //!
-//! Wraps `symposium_install` primitives with main-crate types (`Symposium`,
-//! `plugins::Installation`) so both hook dispatch and subcommand dispatch can
-//! resolve an installation to a runnable without duplicating the logic.
+//! Validate the public installation fields before any acquisition or setup
+//! effects, then resolve the validated runnable through the installer's typed API.
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use thiserror::Error;
 
 use crate::config::Symposium;
-use crate::plugins::Installation;
-use symposium_install::{Runnable, acquire_source, make_executable};
+use crate::plugins::{Installation, RunnableSelectionError, RunnableSpec};
+use symposium_install::{AcquiredLocation, Runnable, try_acquire_source, try_make_executable};
 
-/// Run a list of post-install shell commands sequentially. Stops at the first
-/// failure.
-///
-/// Their stdout goes to stderr: these commands also run while dispatching a
-/// hook, where stdout carries the agent's protocol.
-pub async fn run_install_commands(commands: &[String]) -> Result<()> {
-    for cmd in commands {
+/// Installation failures retain structured causes without displaying command bodies.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum InstallationError {
+    /// The public installation/override fields violate the runnable contract.
+    #[error(transparent)]
+    Selection(#[from] RunnableSelectionError),
+    /// Source acquisition, resolution, or executable preparation failed.
+    #[error(transparent)]
+    Installer(#[from] symposium_install::InstallError),
+    /// A post-install command could not be started; the source is retained.
+    #[error("failed to start installation command {index}")]
+    CommandIo {
+        index: usize,
+        #[source]
+        source: std::io::Error,
+    },
+    /// A post-install command completed unsuccessfully.
+    #[error("installation command {index} failed with {status}")]
+    CommandExit {
+        index: usize,
+        status: std::process::ExitStatus,
+    },
+    /// A caller attempted to run a pure setup installation.
+    #[error("installation has no executable or script")]
+    MissingRunnable,
+    /// An acquired location cannot represent the selected command form.
+    #[error("acquired source does not support the selected runnable")]
+    InvalidAcquiredRunnable,
+}
+
+/// Run post-install shell commands sequentially, stopping at the first failure.
+/// Their stdout goes to stderr because hook stdout belongs to the agent protocol.
+pub(crate) async fn run_install_commands(commands: &[String]) -> Result<(), InstallationError> {
+    for (index, cmd) in commands.iter().enumerate() {
+        let index = index + 1;
         let status = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(cmd)
             .stdout(std::io::stderr())
             .status()
-            .await?;
+            .await
+            .map_err(|source| InstallationError::CommandIo { index, source })?;
         if !status.success() {
-            bail!("install command `{cmd}` exited with {status}");
+            return Err(InstallationError::CommandExit { index, status });
         }
     }
     Ok(())
 }
 
-/// Per-installation snapshot the dispatcher builds for the command and each
-/// requirement. Drives env-var wiring for the spawned hook process:
-/// `$SYMPOSIUM_DIR_<name>`, `$SYMPOSIUM_<name>`, and the `$PATH` prefix.
-///
-/// One layer above [`AcquiredSource`]: that's the raw source-acquisition
-/// result (where the bits landed + how to resolve names within them);
-/// `AcquiredInstallation` is what we keep after layering on the installation's
-/// `install_commands`, `executable`/`script` resolution, and the no-source
-/// case where there's nothing to acquire at all. The dispatcher only cares
-/// about the resolved form, so this is what flows from
-/// [`acquire_installation`] into [`build_env`] and [`build_spawn_spec`].
+/// Installation snapshot used to wire hook environment variables and PATH.
 #[derive(Clone, Debug)]
 pub struct AcquiredInstallation {
-    /// Installation name as declared in the manifest. Sanitized via
-    /// [`env_safe`] when used in env var keys.
+    /// Installation name; sanitized before it becomes an environment key.
     pub name: String,
-    /// Cache or clone directory the source landed in. `None` for no-source
-    /// installations and for global cargo (which lives in the user's
-    /// `~/.cargo/bin`, outside symposium's management).
+    /// Managed cache/clone directory; absent for no-source and global Cargo.
     pub base: Option<PathBuf>,
-    /// What this installation resolves to at spawn time, or `None` when the
-    /// installation has nothing runnable (pure setup).
+    /// Resolved command, or absent for pure setup or a source without a binary.
     pub runnable: Option<AcquiredRunnable>,
 }
 
-/// How `Command::new` should be invoked for an installation that resolved
-/// to *something* runnable.
+/// The concrete command form used by a dispatcher.
 #[derive(Clone, Debug)]
 pub enum AcquiredRunnable {
-    /// Symposium-resolved absolute path. Exposed as `$SYMPOSIUM_<name>` and
-    /// its parent dir is prepended to `$PATH`.
+    /// Run a resolved path through the shell.
     ResolvedScript { path: PathBuf },
-    /// Symposium-resolved absolute path. Exposed as `$SYMPOSIUM_<name>` and
-    /// its parent dir is prepended to `$PATH`.
+    /// Run a resolved executable path directly.
     ResolvedExec { path: PathBuf },
-    /// Bare binary name, relying on `$PATH` lookup at spawn time (global
-    /// cargo). Not exposed in env vars and doesn't contribute to `$PATH` —
-    /// the installation is intentionally outside symposium's view.
+    /// Run a global Cargo binary by name through PATH without adding hook variables.
     GlobalExec { path: PathBuf },
 }
 
-/// Acquire an installation: run its source step (if any), run
-/// `install_commands`, and resolve its runnable using the installation's
-/// own `executable`/`script` plus any hook-level overrides.
+/// Acquire and prepare an installation after validating all runnable fields.
 ///
-/// `update` is forwarded to the source step: hook dispatch acquires with
-/// `None` (serve cache, debounced), while the `SessionStart` prewarm uses
-/// `Check` to force a refresh of git/cargo sources once per session.
-///
-/// `plugin_dir` is the directory containing the plugin's manifest;
-/// relative `executable` / `script` paths on no-source installations
-/// resolve against it.
-pub async fn acquire_installation(
+/// Source and hook overrides participate in one exclusive choice. No-source
+/// paths retain process-current-directory/PATH resolution; there is no plugin
+/// directory rebasing. `update` controls the existing source freshness policy.
+pub(crate) async fn acquire_installation(
     sym: &Symposium,
     installation: &Installation,
     override_executable: Option<&str>,
     override_script: Option<&str>,
     update: symposium_install::UpdateLevel,
-) -> anyhow::Result<AcquiredInstallation> {
-    let exec_choice = installation.executable.as_deref().or(override_executable);
-    let script_choice = installation.script.as_deref().or(override_script);
-
+) -> Result<AcquiredInstallation, InstallationError> {
+    let spec = installation.runnable_spec(override_executable, override_script)?;
+    let (executable_hint, script_hint) = match spec {
+        Some(RunnableSpec::Exec(name)) => (Some(name), None),
+        Some(RunnableSpec::Script(name)) => (None, Some(name)),
+        None => (None, None),
+    };
     let acquired = match &installation.source {
         Some(source) => {
-            Some(acquire_source(&sym.install_context(), source, exec_choice, update).await?)
+            symposium_install::validate_source_runnable(source, executable_hint, script_hint)?;
+            Some(try_acquire_source(&sym.install_context(), source, executable_hint, update).await?)
         }
         None => None,
     };
-
-    run_install_commands(&installation.install_commands).await?;
-
-    let runnable = match (&acquired, exec_choice, script_choice) {
-        // Unmanaged source (global cargo): bare name, $PATH lookup at spawn.
-        // Validation guarantees `exec_choice` is set for cargo + global.
-        (Some(a), _, _) if a.base.is_none() => {
-            let name = exec_choice
-                .or(a.resolved_executable.as_deref())
-                .expect("global cargo validation enforces an executable name")
-                .to_string();
-            Some(AcquiredRunnable::GlobalExec {
-                path: PathBuf::from(name),
-            })
+    let (base, runnable) = match acquired.as_ref() {
+        Some(source) => match source.try_location()? {
+            AcquiredLocation::GlobalCargo { .. } => {
+                let Some(RunnableSpec::Exec(name)) = spec else {
+                    return Err(InstallationError::InvalidAcquiredRunnable);
+                };
+                (
+                    None,
+                    Some(AcquiredRunnable::GlobalExec {
+                        path: source.try_executable_named(name)?,
+                    }),
+                )
+            }
+            AcquiredLocation::Managed { base, .. } => {
+                let runnable = match spec {
+                    Some(RunnableSpec::Exec(name)) => Some(AcquiredRunnable::ResolvedExec {
+                        path: source.try_executable_named(name)?,
+                    }),
+                    Some(RunnableSpec::Script(name)) => Some(AcquiredRunnable::ResolvedScript {
+                        path: source.try_script_named(name)?,
+                    }),
+                    None => source
+                        .try_executable()?
+                        .map(|path| AcquiredRunnable::ResolvedExec { path }),
+                };
+                (Some(base.to_path_buf()), runnable)
+            }
+            _ => return Err(InstallationError::InvalidAcquiredRunnable),
+        },
+        None => {
+            let runnable = match spec {
+                Some(RunnableSpec::Exec(name)) => Some(AcquiredRunnable::ResolvedExec {
+                    path: PathBuf::from(name),
+                }),
+                Some(RunnableSpec::Script(name)) => Some(AcquiredRunnable::ResolvedScript {
+                    path: PathBuf::from(name),
+                }),
+                None => None,
+            };
+            (None, runnable)
         }
-        (Some(a), Some(name), None) => Some(AcquiredRunnable::ResolvedExec {
-            path: a.executable_named(name),
-        }),
-        (Some(a), None, Some(name)) => Some(AcquiredRunnable::ResolvedScript {
-            path: a.script_named(name),
-        }),
-        (Some(a), None, None) if let Some(path) = a.executable() => {
-            Some(AcquiredRunnable::ResolvedExec { path })
-        }
-        (Some(_), None, None) => None,
-        // For both of these: if there is no source, then the exec/script must *obviously* be global
-        (None, Some(name), None) => Some(AcquiredRunnable::ResolvedExec {
-            path: PathBuf::from(name),
-        }),
-        (None, None, Some(name)) => Some(AcquiredRunnable::ResolvedScript {
-            path: PathBuf::from(name),
-        }),
-        (None, None, None) => None,
-        (_, Some(_), Some(_)) => unreachable!("validation forbids both executable and script"),
     };
-
+    run_install_commands(&installation.install_commands).await?;
     if let Some(AcquiredRunnable::ResolvedExec { path }) = &runnable {
-        make_executable(path).ok();
+        try_make_executable(path)?;
     }
-
     Ok(AcquiredInstallation {
         name: installation.name.clone(),
-        base: acquired.as_ref().and_then(|a| a.base.clone()),
+        base,
         runnable,
     })
 }
 
-/// Refresh an installation's already-acquired source in place (a freshness
-/// `Check`), running its `install_commands` only when a refresh actually ran.
-/// A source that was never acquired — or a no-source installation — is left
-/// untouched. This backs the `SessionStart` prewarm: it keeps installed hook
-/// tools current without eagerly installing ones a hook may never use (those
-/// install lazily on first dispatch).
-pub async fn refresh_installation_if_present(
+/// Refresh an already-acquired source without eagerly installing an absent one.
+/// Runnable validation happens before refresh or setup effects. Setup commands
+/// run only when the existing source was actually refreshed.
+pub(crate) async fn refresh_installation_if_present(
     sym: &Symposium,
     installation: &Installation,
     override_executable: Option<&str>,
-) -> anyhow::Result<()> {
+    override_script: Option<&str>,
+) -> Result<(), InstallationError> {
+    let spec = installation.runnable_spec(override_executable, override_script)?;
     let Some(source) = &installation.source else {
         return Ok(());
     };
-    let exec_choice = installation.executable.as_deref().or(override_executable);
-    let refreshed =
-        symposium_install::refresh_source_if_present(&sym.install_context(), source, exec_choice)
-            .await?;
+    let (executable_hint, script_hint) = match spec {
+        Some(RunnableSpec::Exec(name)) => (Some(name), None),
+        Some(RunnableSpec::Script(name)) => (None, Some(name)),
+        None => (None, None),
+    };
+    symposium_install::validate_source_runnable(source, executable_hint, script_hint)?;
+    let refreshed = symposium_install::try_refresh_source_if_present(
+        &sym.install_context(),
+        source,
+        executable_hint,
+    )
+    .await?;
     if refreshed {
         run_install_commands(&installation.install_commands).await?;
     }
     Ok(())
 }
 
-pub fn resolve_runnable(installation: AcquiredInstallation, label: &str) -> Result<Runnable> {
-    let Some(runnable) = installation.runnable else {
-        bail!("{label} has no executable or script");
-    };
-    let runnable = match runnable {
+pub(crate) fn resolve_runnable(
+    installation: AcquiredInstallation,
+    _label: &str,
+) -> Result<Runnable, InstallationError> {
+    let runnable = installation
+        .runnable
+        .ok_or(InstallationError::MissingRunnable)?;
+    Ok(match runnable {
         AcquiredRunnable::ResolvedScript { path } => Runnable::Script(path),
-        AcquiredRunnable::ResolvedExec { path } => Runnable::Exec(path),
-        AcquiredRunnable::GlobalExec { path } => Runnable::Exec(path),
-    };
-    Ok(runnable)
+        AcquiredRunnable::ResolvedExec { path } | AcquiredRunnable::GlobalExec { path } => {
+            Runnable::Exec(path)
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use symposium_install::{CargoSource, Source, UpdateLevel};
+
+    fn installation() -> Installation {
+        Installation {
+            name: "test".into(),
+            requirements: vec![],
+            install_commands: vec![],
+            source: None,
+            executable: None,
+            script: None,
+            args: vec![],
+        }
+    }
+
+    fn shell_path(path: &std::path::Path) -> String {
+        let path = path.to_string_lossy().replace('\\', "/");
+        let path = if cfg!(windows) && path.as_bytes().get(1) == Some(&b':') {
+            format!("/{}{rest}", path[..1].to_lowercase(), rest = &path[2..])
+        } else {
+            path
+        };
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
+
+    #[tokio::test]
+    async fn invalid_runnable_fields_never_run_install_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        let marker = tmp.path().join("must-not-run");
+        for mask in 0u8..16 {
+            if mask.count_ones() < 2 {
+                continue;
+            }
+            let mut install = installation();
+            install.executable = (mask & 1 != 0).then(|| "exec".into());
+            install.script = (mask & 2 != 0).then(|| "script".into());
+            install
+                .install_commands
+                .push(format!(": > {}", shell_path(&marker)));
+            let error = acquire_installation(
+                &sym,
+                &install,
+                (mask & 4 != 0).then_some("override-exec"),
+                (mask & 8 != 0).then_some("override-script"),
+                UpdateLevel::None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, InstallationError::Selection(_)),
+                "mask {mask}: {error}"
+            );
+            assert!(!marker.exists(), "mask {mask} ran setup before validation");
+            assert!(matches!(
+                refresh_installation_if_present(
+                    &sym,
+                    &install,
+                    (mask & 4 != 0).then_some("override-exec"),
+                    (mask & 8 != 0).then_some("override-script")
+                )
+                .await,
+                Err(InstallationError::Selection(_))
+            ));
+            assert!(!marker.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_no_source_runnables_never_run_setup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        let marker = tmp.path().join("must-not-run");
+        for value in ["", "PRIVATE_RUNNABLE_CANARY\0tool"] {
+            for field in 0..4 {
+                let mut install = installation();
+                install
+                    .install_commands
+                    .push(format!(": > {}", shell_path(&marker)));
+                install.executable = (field == 0).then(|| value.into());
+                install.script = (field == 1).then(|| value.into());
+                let executable = (field == 2).then_some(value);
+                let script = (field == 3).then_some(value);
+                let error =
+                    acquire_installation(&sym, &install, executable, script, UpdateLevel::None)
+                        .await
+                        .unwrap_err();
+                assert!(matches!(
+                    error,
+                    InstallationError::Selection(RunnableSelectionError::InvalidRunnable { .. })
+                ));
+                assert!(!error.to_string().contains("PRIVATE_RUNNABLE_CANARY"));
+                assert!(matches!(
+                    refresh_installation_if_present(&sym, &install, executable, script).await,
+                    Err(InstallationError::Selection(
+                        RunnableSelectionError::InvalidRunnable { .. }
+                    ))
+                ));
+                assert!(!marker.exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_managed_paths_are_rejected_before_acquisition_refresh_or_setup() {
+        use symposium_install::{GithubSource, InstallError};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        sym.set_cargo_override(tmp.path().join("cargo-must-not-run"));
+        std::fs::create_dir_all(sym.cache_dir()).unwrap();
+        // Cache parents are files so a regression stops at local I/O instead of fetching.
+        for cache in ["plugins", "binaries"] {
+            std::fs::write(sym.cache_dir().join(cache), b"preserve").unwrap();
+        }
+        let marker = tmp.path().join("must-not-run");
+        let sources = [
+            Source::Cargo(CargoSource::new("test").with_version("1.0.0")),
+            Source::Github(GithubSource::new("https://github.com/example/test")),
+        ];
+        for source in sources {
+            for field in 0..4 {
+                let mut install = installation();
+                install.source = Some(source.clone());
+                install
+                    .install_commands
+                    .push(format!(": > {}", shell_path(&marker)));
+                let value = "../PRIVATE_RUNNABLE_CANARY";
+                install.executable = (field == 0).then(|| value.into());
+                install.script = (field == 1).then(|| value.into());
+                let executable = (field == 2).then_some(value);
+                let script = (field == 3).then_some(value);
+                let error =
+                    acquire_installation(&sym, &install, executable, script, UpdateLevel::None)
+                        .await
+                        .unwrap_err();
+                assert!(matches!(
+                    error,
+                    InstallationError::Installer(InstallError::InvalidInput {
+                        field: "executable or script"
+                    })
+                ));
+                assert!(!error.to_string().contains("PRIVATE_RUNNABLE_CANARY"));
+                assert!(matches!(
+                    refresh_installation_if_present(&sym, &install, executable, script).await,
+                    Err(InstallationError::Installer(InstallError::InvalidInput {
+                        field: "executable or script"
+                    }))
+                ));
+                assert!(!marker.exists());
+                for cache in ["plugins", "binaries"] {
+                    assert_eq!(
+                        std::fs::read(sym.cache_dir().join(cache)).unwrap(),
+                        b"preserve"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_cargo_modes_are_rejected_before_acquisition_or_setup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        sym.set_cargo_override(tmp.path().join("cargo-must-not-run"));
+        let marker = tmp.path().join("must-not-run");
+        for global in [false, true] {
+            for script in [None, Some("script.sh")] {
+                let mut source = CargoSource::new("test");
+                source.global = global;
+                if !global {
+                    source.git = Some("https://example.invalid/test".into());
+                }
+                let mut install = installation();
+                install.source = Some(Source::Cargo(source));
+                install.script = script.map(str::to_string);
+                install
+                    .install_commands
+                    .push(format!(": > {}", shell_path(&marker)));
+                assert!(matches!(
+                    acquire_installation(&sym, &install, None, None, UpdateLevel::None).await,
+                    Err(InstallationError::Selection(_))
+                ));
+                assert!(!marker.exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_and_no_source_overrides_preserve_current_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        let marker = tmp.path().join("setup-ran");
+        let mut install = installation();
+        install
+            .install_commands
+            .push(format!(": > {}", shell_path(&marker)));
+        let setup = acquire_installation(&sym, &install, None, None, UpdateLevel::None)
+            .await
+            .unwrap();
+        assert!(setup.runnable.is_none());
+        assert!(setup.base.is_none());
+        assert!(marker.exists());
+        assert!(matches!(
+            resolve_runnable(setup, "setup"),
+            Err(InstallationError::MissingRunnable)
+        ));
+        install.install_commands.clear();
+        let exec = acquire_installation(&sym, &install, Some("sh"), None, UpdateLevel::None)
+            .await
+            .unwrap();
+        let runnable = resolve_runnable(exec, "PATH command").unwrap();
+        let Runnable::Exec(path) = runnable else {
+            panic!("expected exec");
+        };
+        assert_eq!(path, PathBuf::from("sh"));
+        assert!(
+            tokio::process::Command::new(path)
+                .args(["-c", "exit 0"])
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        let script = acquire_installation(
+            &sym,
+            &install,
+            None,
+            Some("relative/script.sh"),
+            UpdateLevel::None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(resolve_runnable(script, "script").unwrap(), Runnable::Script(path) if path == *"relative/script.sh")
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_cargo_exec_inference_and_script_use_existing_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        sym.set_cargo_override(tmp.path().join("cargo-must-not-run"));
+        let registry = sym.cache_dir().join("binaries/test");
+        let base = registry.join("1.0.0");
+        std::fs::create_dir_all(base.join("bin")).unwrap();
+        let binary = if cfg!(windows) { "tool.exe" } else { "tool" };
+        std::fs::write(base.join("bin").join(binary), b"cached binary").unwrap();
+        std::fs::write(registry.join("current"), "1.0.0").unwrap();
+        for (executable, script) in [
+            (None, None),
+            (Some("tool"), None),
+            (None, Some("scripts/tool.sh")),
+        ] {
+            let mut install = installation();
+            install.source = Some(Source::Cargo(CargoSource::new("test")));
+            install.executable = executable.map(str::to_string);
+            install.script = script.map(str::to_string);
+            let acquired = acquire_installation(&sym, &install, None, None, UpdateLevel::None)
+                .await
+                .unwrap();
+            assert_eq!(acquired.base.as_ref(), Some(&base));
+            match resolve_runnable(acquired, "cached").unwrap() {
+                Runnable::Exec(path) => assert_eq!(path, base.join("bin").join(binary)),
+                Runnable::Script(path) => assert_eq!(path, base.join("bin/scripts/tool.sh")),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_metadata_failure_preserves_the_io_source() {
+        use std::error::Error as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        let parent = tmp.path().join("not-a-directory");
+        std::fs::write(&parent, b"preserve").unwrap();
+        let mut install = installation();
+        install.executable = Some(parent.join("tool").to_str().unwrap().into());
+        let error = acquire_installation(&sym, &install, None, None, UpdateLevel::None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, InstallationError::Installer(_)));
+        let mut source = error.source();
+        let mut found_io = false;
+        while let Some(error) = source {
+            if let Some(error) = error.downcast_ref::<std::io::Error>() {
+                assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+                found_io = true;
+            }
+            source = error.source();
+        }
+        assert!(found_io);
+        assert_eq!(std::fs::read(parent).unwrap(), b"preserve");
+    }
+
+    #[tokio::test]
+    async fn install_command_error_never_displays_command_contents() {
+        let error = run_install_commands(&["# PRIVATE_COMMAND_CANARY\nexit 23".into()])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            InstallationError::CommandExit { index: 1, .. }
+        ));
+        assert!(!error.to_string().contains("PRIVATE_COMMAND_CANARY"));
+    }
 }

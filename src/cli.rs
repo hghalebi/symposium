@@ -218,6 +218,8 @@ pub async fn run(
     out: &Output,
     update: symposium_install::UpdateLevel,
 ) -> Result<()> {
+    sym.try_registry_instances()?;
+
     // Periodic update check (skipped for self-update, which always checks).
     // In the binary, re-exec happens if auto-update = "on" succeeds.
     // Here in the library we just run the warn check; the binary wraps

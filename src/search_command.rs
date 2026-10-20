@@ -17,7 +17,7 @@
 
 use anyhow::Result;
 
-use crate::config::Symposium;
+use crate::config::{RegistryError, Symposium};
 use crate::report::ReportEvent;
 
 /// One search hit, in display form.
@@ -37,10 +37,29 @@ fn name_matches(name: &str, query: &str) -> bool {
 }
 
 /// Collect matches from the loaded registry and from every package manager.
+/// Legacy best-effort adapter retained through root 0.6. New callers should use
+/// [`try_find_matches`] so invalid configuration cannot look like no matches.
 pub async fn find_matches(sym: &Symposium, query: &str) -> Vec<SearchMatch> {
+    match try_find_matches(sym, query).await {
+        Ok(matches) => matches,
+        Err(_) => {
+            tracing::warn!("search skipped: invalid registry configuration");
+            Vec::new()
+        }
+    }
+}
+
+/// Collect matches after validating all configured registry sources.
+///
+/// # Errors
+/// Returns [`RegistryError`] before searching when a configured source is invalid.
+pub async fn try_find_matches(
+    sym: &Symposium,
+    query: &str,
+) -> Result<Vec<SearchMatch>, RegistryError> {
     let mut matches = Vec::new();
 
-    let registry = crate::plugins::load_registry(sym).await;
+    let registry = crate::plugins::try_load_registry(sym).await?;
     for parsed in &registry.plugins {
         if name_matches(&parsed.manifest.name, query) {
             matches.push(SearchMatch {
@@ -55,7 +74,7 @@ pub async fn find_matches(sym: &Symposium, query: &str) -> Vec<SearchMatch> {
         }
     }
     // Search is workspace-independent; a detached resolver stands in.
-    for (instance, info) in sym.detached_managers().search(query).await {
+    for (instance, info) in sym.try_detached_managers()?.search(query).await {
         matches.push(SearchMatch {
             origin: instance,
             name: info.id.name.clone(),
@@ -64,13 +83,13 @@ pub async fn find_matches(sym: &Symposium, query: &str) -> Vec<SearchMatch> {
         });
     }
 
-    matches
+    Ok(matches)
 }
 
 /// The `cargo agents search` entry point: report every match grouped by the
 /// instance it came from, or a nothing-found message.
 pub async fn search(sym: &Symposium, query: &str) -> Result<()> {
-    let matches = find_matches(sym, query).await;
+    let matches = try_find_matches(sym, query).await?;
     if matches.is_empty() {
         tracing::info!(
             report = %ReportEvent::Info {

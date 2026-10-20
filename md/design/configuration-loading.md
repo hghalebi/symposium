@@ -26,6 +26,31 @@ original I/O error. Missing required home discovery returns `DirectoryError`.
 Malformed TOML still warns and falls back to defaults without rewriting the
 file; its diagnostic does not echo configuration contents.
 
+## Registry resolution
+
+Persisted `RegistryConfig` fields and the `[[plugin-source]]` alias remain
+compatible. At each operation, the canonical `Symposium::try_registry_instances`
+checks the current public configuration and converts each source to one Git or
+Path alternative. Relative paths still resolve against the configuration
+directory. `try_package_managers` and `try_detached_managers` use the complete
+validated registry set; they do not return a partial set after a failure.
+
+Both `git` and `path`, neither field, an invalid Git source, or a failed probe of
+the built-in `plugins/` directory returns `RegistryError`. Only `NotFound` means
+that optional built-in directory is absent. An existing broken symlink remains
+a registry so its later read failure can inhibit cleanup. These checks do not
+fetch a source or rewrite configuration. Diagnostics identify the registry or
+filesystem path without echoing Git URLs.
+
+Rejecting both source fields replaces the old implicit Git precedence for
+maintained operations. This prevents invalid configuration from looking like a
+smaller authoritative source set during stale-skill cleanup. The public
+infallible registry and manager methods retain their previous precedence and
+best-effort behavior until the root crate's 0.6 release; new callers must use
+the typed `try_*` methods. The same applies to `GitPm::try_new` versus its legacy
+`Option` constructor. Keep raw persistence compatibility separate from runtime
+source validity, especially when public fields can be changed after startup.
+
 ## Logging and startup diagnostics
 
 `Symposium::try_init_logging` returns `LoggingError` if it cannot create the

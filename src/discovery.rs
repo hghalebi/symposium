@@ -39,7 +39,7 @@ use crate::pm::WorkspaceDeps;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
-use crate::config::Symposium;
+use crate::config::{RegistryError, Symposium};
 use crate::crate_sources::normalize_crate_name;
 use crate::output::Output;
 use crate::pm::{CARGO_PM, PackageId};
@@ -116,11 +116,30 @@ impl Discovery {
 /// cache-only — for a workspace dependency, into the source `cargo metadata`
 /// already extracted (no probe, no network) — so every dependency-embedded
 /// plugin is discoverable, registry crates included.
+/// This legacy best-effort adapter remains through root 0.6. New callers should
+/// use [`try_discover`] so invalid registries cannot appear to be empty.
 pub async fn discover(sym: &Symposium, deps: &Arc<WorkspaceDeps>) -> Discovery {
+    match try_discover(sym, deps).await {
+        Ok(discovery) => discovery,
+        Err(_) => {
+            tracing::warn!("discovery skipped: invalid registry configuration");
+            Discovery::default()
+        }
+    }
+}
+
+/// Discover dependency-embedded plugins after validating all registry sources.
+///
+/// # Errors
+/// Returns [`RegistryError`] before discovery when a configured source is invalid.
+pub async fn try_discover(
+    sym: &Symposium,
+    deps: &Arc<WorkspaceDeps>,
+) -> Result<Discovery, RegistryError> {
+    let pms = sym.try_package_managers(deps)?;
     let Some(workspace_root) = deps.workspace_root().map(Path::to_path_buf) else {
-        return Discovery::default();
+        return Ok(Discovery::default());
     };
-    let pms = sym.package_managers(deps);
     let dep_ids = pms.list_deps().await.unwrap_or_default();
 
     let mut discovery = Discovery::default();
@@ -147,7 +166,7 @@ pub async fn discover(sym: &Symposium, deps: &Arc<WorkspaceDeps>) -> Discovery {
             }
         }
     }
-    discovery
+    Ok(discovery)
 }
 
 /// The crate names whose embedded plugins the user has enabled, to load at
@@ -197,23 +216,54 @@ pub fn enabled_dependencies(
 
 /// Run [`discover`] for the workspace `deps` points at, or an empty
 /// [`Discovery`] when there is no workspace.
+/// Legacy best-effort alias for [`discover`], retained through root 0.6.
 pub async fn discover_for(sym: &Symposium, deps: &Arc<WorkspaceDeps>) -> Discovery {
     discover(sym, deps).await
+}
+
+/// Checked discovery for the workspace `deps` points at.
+///
+/// # Errors
+/// Returns [`RegistryError`] when a configured source is invalid.
+pub async fn try_discover_for(
+    sym: &Symposium,
+    deps: &Arc<WorkspaceDeps>,
+) -> Result<Discovery, RegistryError> {
+    try_discover(sym, deps).await
 }
 
 /// The names of the discovered offers still awaiting consent, deduplicated
 /// and sorted — what a consent prompt would ask about, and what the
 /// non-interactive hint names.
+/// Legacy best-effort adapter retained through root 0.6. New callers should use
+/// [`try_pending_candidates`] to distinguish invalid sources from no candidates.
 pub async fn pending_candidates(sym: &Symposium, deps: &Arc<WorkspaceDeps>) -> Vec<String> {
-    let mut names: Vec<String> = discover_for(sym, deps)
-        .await
+    match try_pending_candidates(sym, deps).await {
+        Ok(names) => names,
+        Err(_) => {
+            tracing::warn!("candidate hints skipped: invalid registry configuration");
+            Vec::new()
+        }
+    }
+}
+
+/// Names of undecided dependency plugins, after validating registry sources.
+///
+/// # Errors
+/// Returns [`RegistryError`] when a configured source is invalid.
+pub async fn try_pending_candidates(
+    sym: &Symposium,
+    deps: &Arc<WorkspaceDeps>,
+) -> Result<Vec<String>, RegistryError> {
+    let mut names: Vec<String> = try_discover_for(sym, deps)
+        .await?
         .candidates
         .into_iter()
         .map(|c| c.id.name)
         .collect();
     names.sort();
     names.dedup();
-    names
+    Ok(names)
 }
 
 /// Record consent decisions: approvals into `[plugins] auto-enable`,
@@ -225,6 +275,7 @@ pub fn apply_consent(sym: &mut Symposium, approved: &[String], declined: &[Strin
     if approved.is_empty() && declined.is_empty() {
         return Ok(());
     }
+    sym.try_registry_instances()?;
     let plugins = &mut sym.config.plugins;
     for name in approved {
         if !plugins.is_auto_enabled(name) {
@@ -277,7 +328,7 @@ pub async fn prompt_for_consent(
     if !out.is_interactive() {
         return Ok(());
     }
-    let candidates = discover_for(sym, deps).await.candidates;
+    let candidates = try_discover_for(sym, deps).await?.candidates;
     if candidates.is_empty() {
         return Ok(());
     }

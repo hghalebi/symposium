@@ -43,7 +43,7 @@ pub async fn use_plugin(
     // A configured registry is a trust root: what it offers is already
     // enabled by configuration, so there is nothing to record. The exception
     // is a dormant plugin, for which `use` is exactly the wake-up call.
-    let registry = crate::plugins::load_registry(sym).await;
+    let registry = crate::plugins::try_load_registry(sym).await?;
     let normalized = normalize_crate_name(name);
     let registry_plugin = registry
         .plugins
@@ -121,6 +121,7 @@ pub async fn remove_plugin(
     let deps = sym.workspace_deps(cwd);
     let workspace_root = deps.load().map(|ws| ws.root.clone());
 
+    sym.try_registry_instances()?;
     let used = &mut sym.config.plugins.used;
     let before = used.len();
     used.retain(|entry| {
@@ -174,7 +175,7 @@ async fn resolve_name(
     }
 
     let found = sym
-        .package_managers(deps)
+        .try_package_managers(deps)?
         .search(name)
         .await
         .iter()

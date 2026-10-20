@@ -234,7 +234,7 @@ or package version was changed.
 
 ### Step 3: Validate agent config mutations and safe diagnostics
 
-Status: completed locally; hosted correction checkpoint pending.
+Status: completed locally; all platform test jobs have passed in a subsequent checkpoint. Separate macOS compilation allocation remains pending.
 
 The first hosted run at `fe10ede6` found four Linux fixture failures: the new
 diagnostic fixtures used lowercase `symposium.toml` instead of the documented
@@ -242,8 +242,7 @@ diagnostic fixtures used lowercase `symposium.toml` instead of the documented
 Checkpoint `40c68e92` corrects that filename; all eight diagnostic tests,
 formatting and diff checks pass against an isolated Step 3 checkout. The
 correction passes hosted tests on Ubuntu, macOS, Windows and musl. GitHub could
-not allocate the separate macOS compilation runner; that infrastructure failure
-is being retried at the same commit before the full hosted checkpoint is closed.
+not allocate the separate macOS compilation runner; that infrastructure failure remains an explicit hosted qualification gap.
 
 Validate JSON shapes at the shared boundary and each agent-specific nested
 container before editing. Preserve unknown valid settings and original bytes on
@@ -270,7 +269,12 @@ Original structured error sources remain available to library callers.
 
 ### Step 4: Make hook transport failures explicit
 
-Status: completed locally; checkpoint and hosted validation pending.
+Status: completed locally and pushed; hosted validation pending.
+
+Checkpoint: `70a4833602acdcb428e4ee735a856a89b9b9c9b2` (including the Linux input-closure correction). The preceding
+checkpoint's platform tests passed, but its separate macOS compilation job
+could not acquire a runner after retry. The next checkpoint supersedes that
+queued run; this is an infrastructure gap, not a claimed hosted pass.
 
 Use typed parse, event/input mismatch, translation, serialization, and stream
 errors through the hook path. Handle stdin/stdout/stderr failures deliberately,
@@ -317,6 +321,12 @@ closes stdin explicitly with a 2 MiB input to make the case deterministic.
 
 ### Step 5: Validate registry and installation alternatives once
 
+Status: completed locally. The typed standalone installer acquisition errors from
+Step 6 were implemented with this boundary because registry/runnable validation
+needs their concrete sources; this avoids a temporary untyped error layer. Other
+library and SDK error work remains Step 6. Hosted qualification is tracked on
+the pushed checkpoint; runner allocation is not a passing result.
+
 Keep raw config/manifests unchanged; introduce runtime `Git | Path` and
 `Exec | Script` alternatives at validation/shared resolution boundaries. Preserve
 pure setup, inferred binaries, overrides, requirements and environment wiring.
@@ -331,8 +341,23 @@ Tests: both/neither source, relative paths and roundtrips, missing global execut
 conflicting runnable fields, non-UTF-8 Unix cache paths using fake Cargo, and every
 supported runnable mode. Document public API and invalid-input behavior changes.
 
-- [ ] Runtime impossible states are removed without changing persisted valid forms.
-- [ ] Installer library validation works without relying on its parent application.
+- [x] Runtime impossible states are removed without changing persisted valid forms.
+- [x] Installer library validation works without relying on its parent application.
+
+Observed: all seven local workspace/documentation gates pass, as do the twelve
+standalone SDK/installer minimal and `clap` compilation, Clippy and test gates.
+Invalid registry alternatives preserve installed skills and consent state;
+invalid runnable selections fail before setup or acquisition effects. Native
+paths survive environment wiring and Cargo argument construction. Linux tests
+cover full non-UTF-8 cache acquisition; macOS rejects those filesystem names,
+so its native-path regression exercises the actual Cargo command builder.
+
+The installer stages cache replacement and metadata before commit, keeps old
+content on failure, and preserves recovery backups if rollback fails. Typed
+`try_*` APIs are canonical; exact root 0.6 and independently versioned installer
+0.2 compatibility adapters retain existing public signatures. Raw TOML and
+supported valid runnable modes remain compatible. Internal registry consumers
+use checked resolution, including help, search, consent, sync and hook paths.
 
 ### Step 6: Complete typed library and SDK error boundaries
 

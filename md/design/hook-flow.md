@@ -29,12 +29,22 @@ The payload is then parsed, and the agent's parser can declare it not an occurre
 3. **Dispatch to plugin hooks** — for each enabled plugin that defines a hook handler for the incoming event:
    - **Select format**: for each plugin, pick the best hook to deliver (see [Hooks](./hooks.md) for priority rules). If the plugin has a hook matching the current agent's format, deliver the input unmodified. Otherwise deliver in symposium canonical format (or convert to the declared format if only one non-symposium hook exists).
    - **Acquire and run**:
-     - Ensure any `requirements` for the hook are acquired (on-demand, best-effort).
+     - Acquire every declared `requirements` entry before the command. A required
+       installation failure stops dispatch and follows the native failure policy;
+       refresh-only prewarming remains visible best effort.
      - Resolve the hook's `command` (a named installation reference or inline declaration) into a runnable form:
        - If the installation declares a `source`, acquire it (install / cache / clone) and resolve the `executable` / `script` against the cached location. Dispatch acquires with `UpdateLevel::None` — it serves the cache (git checks debounced) rather than hitting the network on every event. Freshness comes from the `SessionStart` prewarm (step 1), which re-acquires every applicable hook's source with `Check` once per session.
        - If no source, the `executable` / `script` is taken as a path on disk (relative paths resolve against the plugin directory, so a refreshed plugin-source repo updates these for free).
        - Run the installation's `install_commands` (post-source) before invoking the runnable.
        - Spawn `path args…` directly for `Exec`, or `sh path args…` for `Script`.
+     - Preserve installation directories and resolved runnable paths as native
+       operating-system values in `SYMPOSIUM_DIR_<name>`, `SYMPOSIUM_<name>`, and
+       `PATH`, including Unix paths that are not UTF-8. Sanitize names as before.
+       The command's directory precedes requirement directories in reverse
+       acquisition order, followed by the inherited nonempty `PATH` entries.
+       An unrepresentable platform path-list entry returns a typed environment
+       error with the original join error; it never silently drops the override.
+       These environment values do not change the UTF-8 JSON protocol.
      - Pass the event JSON (in the selected format) on stdin to the plugin's hook.
        Input writing and stdout/stderr collection run concurrently: a plugin may
        produce more than a pipe buffer before reading its input. Close the input
@@ -81,8 +91,8 @@ remain root-0.5 compatibility adapters until the root-0.6 transition. Maintained
 runtime and test-library callers use the typed path. Valid native payloads,
 context ordering, final denials and unknown native extension fields retain their
 existing behavior. A plugin's ordinary nonzero exit other than 2 continues to be
-a visible best-effort failure; requirement refresh/acquisition keeps its existing
-separate best-effort policy.
+a visible best-effort failure. Declared requirements must acquire successfully
+before the command runs; optional refresh-only prewarming remains best effort.
 
 Plugin hooks can respond to agent-specific events (e.g., `pre-tool-use`, `post-tool-use`, `user-prompt-submit` for Claude Code). The available events depend on which agent is in use.
 
