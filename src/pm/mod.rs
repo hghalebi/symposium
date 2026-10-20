@@ -41,7 +41,8 @@ mod git;
 pub mod layout;
 mod path;
 pub use cargo::{
-    CargoPm, LoadedWorkspace, WorkspaceCrate, WorkspaceDeps, file_mtime, workspace_dir_name,
+    CargoPm, LoadedWorkspace, WorkspaceCrate, WorkspaceDeps, WorkspaceError, file_mtime,
+    try_file_mtime, try_find_workspace_root, workspace_dir_name,
 };
 pub use git::GitPm;
 pub use path::PathPm;
@@ -66,6 +67,12 @@ pub struct FetchedPackage {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PackageManagerError {
+    /// Required workspace metadata could not be resolved.
+    #[error("failed to resolve workspace dependencies")]
+    Workspace {
+        /// The original shared workspace failure.
+        source: Arc<WorkspaceError>,
+    },
     /// No registered manager owns the package's manager tag.
     #[error("unknown package manager `{manager}`")]
     UnknownManager {

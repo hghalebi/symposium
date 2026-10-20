@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `Input::try_matches_matcher` with a concrete regex source and safe
+  diagnostics. The legacy Boolean matcher keeps its invalid-pattern `false`
+  contract through SDK 0.2; maintained hook dispatch uses the checked API.
+
 - Add `PredicateSyntaxError` and canonical `try_*` parsers that retain concrete
   version-parser sources without echoing predicate input. Existing parser
   signatures remain SDK 0.2 compatibility adapters.

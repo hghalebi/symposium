@@ -134,6 +134,23 @@ pub fn check_upgrade(sym: &Symposium) -> anyhow::Result<Option<semver::Version>>
     try_check_upgrade(sym).map_err(Into::into)
 }
 
+// Optional update checks may proceed when state is unreadable; never claim a failed stamp.
+fn should_check_for_update(sym: &Symposium) -> bool {
+    match state::try_should_check_for_update(sym.config_dir()) {
+        Ok(should_check) => should_check,
+        Err(error) => {
+            tracing::warn!(error = %error, "update throttle state unavailable (continuing)");
+            true
+        }
+    }
+}
+
+fn record_update_check(sym: &Symposium) {
+    if let Err(error) = state::try_record_update_check(sym.config_dir()) {
+        tracing::warn!(error = %error, "update check timestamp was not saved (continuing)");
+    }
+}
+
 /// Warn-only update check for the library path (`cli::run`).
 ///
 /// Respects config and the 24-hour throttle.  Prints a nudge when
@@ -143,10 +160,10 @@ pub fn maybe_warn_for_update(sym: &Symposium, out: &Output) {
     if sym.config.auto_update != AutoUpdate::Warn {
         return;
     }
-    if !state::should_check_for_update(sym.config_dir()) {
+    if !should_check_for_update(sym) {
         return;
     }
-    state::record_update_check(sym.config_dir());
+    record_update_check(sym);
 
     match try_check_upgrade(sym) {
         Ok(Some(latest)) => out.warn(format!(
@@ -167,10 +184,10 @@ pub async fn maybe_check_for_update(sym: &Symposium, out: &Output) -> bool {
     if sym.config.auto_update == AutoUpdate::Off {
         return false;
     }
-    if !state::should_check_for_update(sym.config_dir()) {
+    if !should_check_for_update(sym) {
         return false;
     }
-    state::record_update_check(sym.config_dir());
+    record_update_check(sym);
 
     let latest = match try_check_upgrade(sym) {
         Ok(Some(v)) => v,
@@ -265,7 +282,11 @@ fn cargo_install(sym: &Symposium) -> Result<(), UpdateError> {
 pub fn re_exec() -> ! {
     let mut args = std::env::args_os();
     let Some(program) = args.next() else {
-        eprintln!("failed to re-exec: current program is unavailable");
+        crate::output::write_line_best_effort(
+            std::io::stderr(),
+            "failed to re-exec: current program is unavailable",
+            "stderr",
+        );
         std::process::exit(1);
     };
 
@@ -273,7 +294,11 @@ pub fn re_exec() -> ! {
     {
         use std::os::unix::process::CommandExt;
         let err = Command::new(program).args(args).exec();
-        eprintln!("failed to re-exec: {err}");
+        crate::output::write_line_best_effort(
+            std::io::stderr(),
+            &format!("failed to re-exec ({:?})", err.kind()),
+            "stderr",
+        );
         std::process::exit(1);
     }
 
@@ -282,7 +307,11 @@ pub fn re_exec() -> ! {
         let status = match Command::new(program).args(args).status() {
             Ok(status) => status,
             Err(error) => {
-                eprintln!("failed to re-exec: {error}");
+                crate::output::write_line_best_effort(
+                    std::io::stderr(),
+                    &format!("failed to re-exec ({:?})", error.kind()),
+                    "stderr",
+                );
                 std::process::exit(1);
             }
         };

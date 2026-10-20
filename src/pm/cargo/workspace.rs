@@ -5,13 +5,93 @@
 //! [`SymposiumDirs::workspace_deps`](crate::dirs::SymposiumDirs::workspace_deps).
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
-use std::{fmt::Write as _, fs};
 
 use cargo_metadata::{CargoOpt, MetadataCommand};
 use serde::{Deserialize, Serialize};
+
+/// A workspace, metadata, timestamp, or derived-cache operation failed.
+///
+/// Parser and subprocess sources may contain untrusted content. Display reports
+/// only the operation and path; inspect sources structurally instead of printing
+/// an unrestricted error chain.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum WorkspaceError {
+    /// A required filesystem operation failed.
+    #[error("failed to {operation} at {}", path.display())]
+    Io {
+        /// The fixed operation label.
+        operation: &'static str,
+        /// The affected filesystem path.
+        path: PathBuf,
+        /// The original filesystem error.
+        source: std::io::Error,
+    },
+    /// A derived workspace cache was not valid JSON/schema input.
+    #[error("failed to parse workspace cache at {}", path.display())]
+    CacheParse {
+        /// The rejected cache file.
+        path: PathBuf,
+        /// The original parser failure.
+        source: serde_json::Error,
+    },
+    /// Cache data could not be serialized before touching its destination.
+    #[error("failed to serialize workspace cache at {}", path.display())]
+    CacheSerialize {
+        /// The destination cache file.
+        path: PathBuf,
+        /// The original serializer failure.
+        source: serde_json::Error,
+    },
+    /// A cache referred to a different workspace than the requested one.
+    #[error("workspace cache refers to a different workspace")]
+    CacheRootMismatch,
+    /// Cargo could not be invoked.
+    #[error("failed to invoke cargo workspace discovery")]
+    CargoInvoke {
+        /// The requested working directory.
+        cwd: PathBuf,
+        /// The original process-creation failure.
+        source: std::io::Error,
+    },
+    /// Cargo rejected workspace discovery despite a present manifest.
+    #[error("cargo workspace discovery failed ({status})")]
+    CargoLocate {
+        /// Cargo's unsuccessful process status.
+        status: std::process::ExitStatus,
+    },
+    /// Cargo discovery returned non-UTF-8 text.
+    #[error("cargo workspace discovery returned non-UTF-8 output")]
+    CargoOutput {
+        /// The original decoding failure.
+        source: std::string::FromUtf8Error,
+    },
+    /// Cargo discovery did not return one manifest path.
+    #[error("cargo workspace discovery returned an invalid manifest path")]
+    InvalidCargoOutput,
+    /// Cargo could not resolve or decode workspace metadata.
+    #[error("failed to resolve cargo workspace metadata")]
+    Metadata {
+        /// The original metadata failure.
+        source: Box<cargo_metadata::Error>,
+    },
+    /// Metadata omitted the dependency graph required for resolution.
+    #[error("cargo workspace metadata omitted its dependency graph")]
+    MissingResolve,
+    /// A file timestamp precedes the supported Unix-epoch representation.
+    #[error("file timestamp precedes the Unix epoch at {}", path.display())]
+    Timestamp {
+        /// The file whose timestamp could not be represented.
+        path: PathBuf,
+        /// The original timestamp-range failure.
+        source: std::time::SystemTimeError,
+    },
+}
 
 /// A crate in the workspace's direct dependency graph.
 #[non_exhaustive]
@@ -89,7 +169,7 @@ struct DiskCache {
 pub struct WorkspaceDeps {
     cwd: PathBuf,
     dirs: crate::dirs::SymposiumDirs,
-    cached: OnceLock<Option<Arc<LoadedWorkspace>>>,
+    cached: OnceLock<Result<Option<Arc<LoadedWorkspace>>, Arc<WorkspaceError>>>,
 }
 
 impl WorkspaceDeps {
@@ -106,12 +186,11 @@ impl WorkspaceDeps {
     #[cfg(test)]
     pub(crate) fn fixture(root: impl Into<PathBuf>, crates: Vec<WorkspaceCrate>) -> Arc<Self> {
         let root = root.into();
-        let cached = OnceLock::new();
-        let _ = cached.set(Some(Arc::new(LoadedWorkspace {
+        let cached = OnceLock::from(Ok(Some(Arc::new(LoadedWorkspace {
             root: root.clone(),
             crates,
             members: Vec::new(),
-        })));
+        }))));
         Arc::new(Self {
             cwd: root,
             dirs: crate::dirs::SymposiumDirs::new(PathBuf::new(), PathBuf::new(), None),
@@ -124,12 +203,10 @@ impl WorkspaceDeps {
     /// for workspace-independent operations (registry listing, crates.io
     /// search).
     pub fn detached() -> Self {
-        let cached = OnceLock::new();
-        let _ = cached.set(None);
         Self {
             cwd: PathBuf::new(),
             dirs: crate::dirs::SymposiumDirs::new(PathBuf::new(), PathBuf::new(), None),
-            cached,
+            cached: OnceLock::from(Ok(None)),
         }
     }
 
@@ -140,13 +217,44 @@ impl WorkspaceDeps {
 
     /// Load (or return cached) workspace metadata.
     /// Returns `None` if not inside a Cargo workspace.
+    ///
+    /// Legacy best-effort adapter retained until root 0.6. Operational failures
+    /// are diagnosed safely; new callers should use [`Self::try_load`].
     pub fn load(&self) -> Option<&Arc<LoadedWorkspace>> {
-        self.cached.get_or_init(|| self.resolve()).as_ref()
+        match self.try_load() {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                tracing::warn!(%error, "workspace resolution failed");
+                None
+            }
+        }
+    }
+
+    /// Resolve once, distinguishing no workspace from an operational failure.
+    ///
+    /// # Errors
+    /// Returns the shared typed failure from the memoized resolution. Sharing
+    /// preserves the original source without cloning filesystem errors or
+    /// resolving the same instance concurrently. Optional cache failures are
+    /// safely diagnosed and rebuilt from Cargo metadata.
+    pub fn try_load(&self) -> Result<Option<&Arc<LoadedWorkspace>>, Arc<WorkspaceError>> {
+        match self.cached.get_or_init(|| self.resolve().map_err(Arc::new)) {
+            Ok(workspace) => Ok(workspace.as_ref()),
+            Err(error) => Err(Arc::clone(error)),
+        }
     }
 
     /// Convenience: workspace root, or `None` if not in a workspace.
     pub fn workspace_root(&self) -> Option<&Path> {
         self.load().map(|w| w.root.as_path())
+    }
+
+    /// Resolve the workspace root without hiding resolution failures.
+    ///
+    /// # Errors
+    /// Returns the same shared failure as [`Self::try_load`].
+    pub fn try_workspace_root(&self) -> Result<Option<&Path>, Arc<WorkspaceError>> {
+        Ok(self.try_load()?.map(|workspace| workspace.root.as_path()))
     }
 
     /// Convenience: crate list (empty slice if not in a workspace).
@@ -157,62 +265,96 @@ impl WorkspaceDeps {
         }
     }
 
-    /// The one-time resolution: disk cache, then `cargo metadata` on miss.
-    fn resolve(&self) -> Option<Arc<LoadedWorkspace>> {
-        let cache_dir = self.workspace_cache_dir();
-
-        if let Some(dir) = &cache_dir
-            && let Some(loaded) = try_disk_cache(dir)
-        {
-            return Some(Arc::new(loaded));
-        }
-
-        let loaded = load_workspace(&self.cwd, self.dirs.cargo_override.as_deref())?;
-
-        if let Some(dir) = &cache_dir {
-            write_disk_cache(dir, &loaded);
-        }
-
-        Some(Arc::new(loaded))
+    /// Resolve dependency crates, using an empty slice only outside a workspace.
+    ///
+    /// # Errors
+    /// Returns the same shared failure as [`Self::try_load`].
+    pub fn try_crates(&self) -> Result<&[WorkspaceCrate], Arc<WorkspaceError>> {
+        Ok(match self.try_load()? {
+            Some(workspace) => &workspace.crates,
+            None => &[],
+        })
     }
 
-    /// The workspace-specific cache directory, via `cargo locate-project
-    /// --workspace` (~10ms, no dep resolution). `None` when not in a workspace.
-    fn workspace_cache_dir(&self) -> Option<PathBuf> {
-        let root = locate_workspace_root(&self.cwd, self.dirs.cargo_override.as_deref())?;
-        let canonical = fs::canonicalize(&root).unwrap_or(root);
-        Some(
-            self.dirs
-                .cache_dir
-                .join("workspaces")
-                .join(workspace_dir_name(&canonical)),
-        )
+    /// The one-time resolution: disk cache, then `cargo metadata` on miss.
+    fn resolve(&self) -> Result<Option<Arc<LoadedWorkspace>>, WorkspaceError> {
+        let Some(root) = try_find_workspace_root(&self.cwd, self.dirs.cargo_override.as_deref())?
+        else {
+            return Ok(None);
+        };
+        let canonical = fs::canonicalize(&root).map_err(|source| WorkspaceError::Io {
+            operation: "canonicalize workspace root",
+            path: root,
+            source,
+        })?;
+        let cache_dir = self
+            .dirs
+            .cache_dir
+            .join("workspaces")
+            .join(workspace_dir_name(&canonical));
+        match try_disk_cache(&cache_dir, &canonical) {
+            Ok(Some(loaded)) => return Ok(Some(Arc::new(loaded))),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "workspace cache rejected; resolving metadata"),
+        }
+        let loaded = load_workspace(&self.cwd, self.dirs.cargo_override.as_deref())?;
+        if let Err(error) = write_disk_cache(&cache_dir, &loaded) {
+            tracing::warn!(%error, "failed to persist derived workspace cache");
+        }
+        Ok(Some(Arc::new(loaded)))
     }
 }
 
-fn try_disk_cache(ws_cache_dir: &Path) -> Option<LoadedWorkspace> {
+fn try_disk_cache(
+    ws_cache_dir: &Path,
+    workspace_root: &Path,
+) -> Result<Option<LoadedWorkspace>, WorkspaceError> {
     let cache_file = ws_cache_dir.join("workspace-deps.json");
-    let contents = fs::read_to_string(&cache_file).ok()?;
-    let cached: DiskCache = serde_json::from_str(&contents).ok()?;
+    let contents = match fs::read_to_string(&cache_file) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(WorkspaceError::Io {
+                operation: "read workspace cache",
+                path: cache_file,
+                source,
+            });
+        }
+    };
+    let cached: DiskCache =
+        serde_json::from_str(&contents).map_err(|source| WorkspaceError::CacheParse {
+            path: cache_file,
+            source,
+        })?;
+    let cached_root = fs::canonicalize(&cached.root).map_err(|source| WorkspaceError::Io {
+        operation: "canonicalize cached workspace root",
+        path: cached.root.clone(),
+        source,
+    })?;
+    if cached_root != workspace_root {
+        return Err(WorkspaceError::CacheRootMismatch);
+    }
 
     // Validate: Cargo.lock mtime must match.
     let lock_path = cached.root.join("Cargo.lock");
-    let current_mtime = file_mtime(&lock_path)?;
+    let Some(current_mtime) = try_file_mtime(&lock_path)? else {
+        return Ok(None);
+    };
     if current_mtime != cached.lock_mtime {
-        return None;
+        return Ok(None);
     }
 
-    Some(LoadedWorkspace {
+    Ok(Some(LoadedWorkspace {
         root: cached.root,
         crates: cached.crates,
         members: cached.members,
-    })
+    }))
 }
 
-fn write_disk_cache(ws_cache_dir: &Path, loaded: &LoadedWorkspace) {
+fn write_disk_cache(ws_cache_dir: &Path, loaded: &LoadedWorkspace) -> Result<(), WorkspaceError> {
     let lock_path = loaded.root.join("Cargo.lock");
-    let Some(mtime) = file_mtime(&lock_path) else {
-        return;
+    let Some(mtime) = try_file_mtime(&lock_path)? else {
+        return Ok(());
     };
 
     let disk = DiskCache {
@@ -222,16 +364,85 @@ fn write_disk_cache(ws_cache_dir: &Path, loaded: &LoadedWorkspace) {
         members: loaded.members.clone(),
     };
 
-    let _ = fs::create_dir_all(ws_cache_dir);
-    let _ = fs::write(
-        ws_cache_dir.join("workspace-deps.json"),
-        serde_json::to_string_pretty(&disk).unwrap_or_default(),
-    );
+    let path = ws_cache_dir.join("workspace-deps.json");
+    let contents =
+        serde_json::to_vec_pretty(&disk).map_err(|source| WorkspaceError::CacheSerialize {
+            path: path.clone(),
+            source,
+        })?;
+    fs::create_dir_all(ws_cache_dir).map_err(|source| WorkspaceError::Io {
+        operation: "create workspace cache directory",
+        path: ws_cache_dir.into(),
+        source,
+    })?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(ws_cache_dir).map_err(|source| WorkspaceError::Io {
+            operation: "create workspace cache temporary file",
+            path: ws_cache_dir.into(),
+            source,
+        })?;
+    temporary
+        .write_all(&contents)
+        .map_err(|source| WorkspaceError::Io {
+            operation: "write workspace cache temporary file",
+            path: path.clone(),
+            source,
+        })?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|source| WorkspaceError::Io {
+            operation: "synchronize workspace cache temporary file",
+            path: path.clone(),
+            source,
+        })?;
+    temporary
+        .persist(&path)
+        .map_err(|error| WorkspaceError::Io {
+            operation: "replace workspace cache",
+            path,
+            source: error.error,
+        })?;
+    Ok(())
 }
 
 /// Find workspace root via `cargo locate-project --workspace`.
 /// Fast (~10-50ms), no dep resolution.
-fn locate_workspace_root(cwd: &Path, cargo_path: Option<&Path>) -> Option<PathBuf> {
+///
+/// # Errors
+/// Returns a typed failure for inaccessible ancestor manifests, Cargo invocation,
+/// rejected discovery, or invalid output. A directory with no ancestor Cargo
+/// manifest is the ordinary `Ok(None)` case.
+pub fn try_find_workspace_root(
+    cwd: &Path,
+    cargo_path: Option<&Path>,
+) -> Result<Option<PathBuf>, WorkspaceError> {
+    let canonical = fs::canonicalize(cwd).map_err(|source| WorkspaceError::Io {
+        operation: "canonicalize workspace discovery directory",
+        path: cwd.into(),
+        source,
+    })?;
+    let mut has_manifest = false;
+    for ancestor in canonical.ancestors() {
+        let path = ancestor.join("Cargo.toml");
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                has_manifest = true;
+                break;
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(WorkspaceError::Io {
+                    operation: "inspect ancestor Cargo manifest",
+                    path,
+                    source,
+                });
+            }
+        }
+    }
+    if !has_manifest {
+        return Ok(None);
+    }
     let cargo = cargo_path.unwrap_or(Path::new("cargo"));
     let output = std::process::Command::new(cargo)
         .args(["locate-project", "--workspace", "--message-format=plain"])
@@ -239,14 +450,34 @@ fn locate_workspace_root(cwd: &Path, cargo_path: Option<&Path>) -> Option<PathBu
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
-        .ok()?;
+        .map_err(|source| WorkspaceError::CargoInvoke {
+            cwd: cwd.into(),
+            source,
+        })?;
 
     if !output.status.success() {
-        return None;
+        return Err(WorkspaceError::CargoLocate {
+            status: output.status,
+        });
     }
 
-    let manifest = String::from_utf8(output.stdout).ok()?;
-    Path::new(manifest.trim()).parent().map(|p| p.to_path_buf())
+    let manifest = String::from_utf8(output.stdout)
+        .map_err(|source| WorkspaceError::CargoOutput { source })?;
+    let manifest = manifest.trim();
+    if manifest.lines().count() != 1
+        || Path::new(manifest).file_name() != Some(std::ffi::OsStr::new("Cargo.toml"))
+    {
+        return Err(WorkspaceError::InvalidCargoOutput);
+    }
+    let manifest = if Path::new(manifest).is_absolute() {
+        PathBuf::from(manifest)
+    } else {
+        canonical.join(manifest)
+    };
+    manifest
+        .parent()
+        .map(|parent| Some(parent.to_path_buf()))
+        .ok_or(WorkspaceError::InvalidCargoOutput)
 }
 
 /// Compute a human-readable, unique directory name for a workspace root.
@@ -264,7 +495,7 @@ pub fn workspace_dir_name(workspace_root: &Path) -> String {
     let digest = Sha256::digest(workspace_root.as_os_str().as_encoded_bytes());
     let mut hash = String::with_capacity(8);
     for byte in &digest[..4] {
-        write!(hash, "{byte:02x}").unwrap();
+        hash.push_str(&format!("{byte:02x}"));
     }
 
     format!("{tail}-{hash}")
@@ -272,29 +503,72 @@ pub fn workspace_dir_name(workspace_root: &Path) -> String {
 
 /// Get a file's mtime as seconds since the Unix epoch.
 /// Returns `None` if the file doesn't exist or its metadata can't be read.
+/// Legacy adapter retained until root 0.6; use [`try_file_mtime`] for freshness.
 pub fn file_mtime(path: &Path) -> Option<u64> {
-    let meta = fs::metadata(path).ok()?;
-    let mtime = meta.modified().ok()?;
-    Some(
-        mtime
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    )
+    match try_file_mtime(path) {
+        Ok(mtime) => mtime,
+        Err(error @ WorkspaceError::Timestamp { .. }) => {
+            tracing::warn!(%error, "legacy file timestamp was rounded to the Unix epoch");
+            Some(0)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "file timestamp probe failed");
+            None
+        }
+    }
+}
+
+/// Probe a file timestamp while distinguishing absence from an operational error.
+///
+/// # Errors
+/// Returns the original metadata/modification/range failure; only NotFound is
+/// represented as `Ok(None)`.
+pub fn try_file_mtime(path: &Path) -> Result<Option<u64>, WorkspaceError> {
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(WorkspaceError::Io {
+                operation: "read file metadata",
+                path: path.into(),
+                source,
+            });
+        }
+    };
+    let mtime = meta.modified().map_err(|source| WorkspaceError::Io {
+        operation: "read modification time",
+        path: path.into(),
+        source,
+    })?;
+    let duration = mtime
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|source| WorkspaceError::Timestamp {
+            path: path.into(),
+            source,
+        })?;
+    Ok(Some(duration.as_secs()))
 }
 
 /// Run `cargo metadata` and extract workspace root + direct deps.
-fn load_workspace(cwd: &Path, cargo_path: Option<&Path>) -> Option<LoadedWorkspace> {
+fn load_workspace(
+    cwd: &Path,
+    cargo_path: Option<&Path>,
+) -> Result<LoadedWorkspace, WorkspaceError> {
     let mut cmd = MetadataCommand::new();
     cmd.features(CargoOpt::AllFeatures).current_dir(cwd);
     if let Some(path) = cargo_path {
         cmd.cargo_path(path);
     }
-    let metadata = cmd.exec().ok()?;
+    let metadata = cmd.exec().map_err(|source| WorkspaceError::Metadata {
+        source: Box::new(source),
+    })?;
 
     let root = metadata.workspace_root.clone().into_std_path_buf();
 
-    let resolve = metadata.resolve.as_ref()?;
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .ok_or(WorkspaceError::MissingResolve)?;
 
     let ws_members: HashSet<_> = metadata.workspace_members.iter().collect();
     let mut direct_dep_ids: HashSet<&cargo_metadata::PackageId> = HashSet::new();
@@ -322,15 +596,11 @@ fn load_workspace(cwd: &Path, cargo_path: Option<&Path>) -> Option<LoadedWorkspa
         .packages
         .iter()
         .filter(|p| direct_dep_ids.contains(&p.id) && !ws_members.contains(&p.id))
-        .filter_map(|p| {
-            semver::Version::parse(&p.version.to_string())
-                .ok()
-                .map(|v| WorkspaceCrate {
-                    path: path_overrides.get(&p.name).cloned(),
-                    source_dir: p.manifest_path.parent().map(|dir| dir.into()),
-                    name: p.name.to_string(),
-                    version: v,
-                })
+        .map(|p| WorkspaceCrate {
+            path: path_overrides.get(&p.name).cloned(),
+            source_dir: p.manifest_path.parent().map(|dir| dir.into()),
+            name: p.name.to_string(),
+            version: p.version.clone(),
         })
         .collect();
 
@@ -346,9 +616,186 @@ fn load_workspace(cwd: &Path, cargo_path: Option<&Path>) -> Option<LoadedWorkspa
     members.sort();
     members.dedup();
 
-    Some(LoadedWorkspace {
+    Ok(LoadedWorkspace {
         root,
         crates,
         members,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    fn loaded(root: &Path) -> LoadedWorkspace {
+        fs::create_dir_all(root).unwrap();
+        fs::write(root.join("Cargo.lock"), "# synthetic lock\n").unwrap();
+        LoadedWorkspace {
+            root: fs::canonicalize(root).unwrap(),
+            crates: Vec::new(),
+            members: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cache_roundtrip_distinguishes_missing_stale_and_wrong_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let loaded = loaded(&temp.path().join("workspace"));
+        let cache = temp.path().join("cache");
+        assert!(try_disk_cache(&cache, &loaded.root).unwrap().is_none());
+        write_disk_cache(&cache, &loaded).unwrap();
+        assert_eq!(
+            try_disk_cache(&cache, &loaded.root).unwrap().unwrap().root,
+            loaded.root
+        );
+        let other = temp.path().join("other");
+        fs::create_dir(&other).unwrap();
+        assert!(matches!(
+            try_disk_cache(&cache, &other),
+            Err(WorkspaceError::CacheRootMismatch)
+        ));
+        fs::remove_file(loaded.root.join("Cargo.lock")).unwrap();
+        assert!(try_disk_cache(&cache, &loaded.root).unwrap().is_none());
+    }
+
+    #[test]
+    fn invalid_cache_preserves_source_and_safe_display_without_rewriting_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workspace-deps.json");
+        let bytes = b"\"synthetic-secret-canary\"";
+        fs::write(&path, bytes).unwrap();
+        let error = try_disk_cache(temp.path(), temp.path()).unwrap_err();
+        assert!(matches!(error, WorkspaceError::CacheParse { .. }));
+        assert!(error.source().unwrap().is::<serde_json::Error>());
+        assert!(!error.to_string().contains("synthetic-secret-canary"));
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn failed_cache_replace_keeps_the_existing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let loaded = loaded(&temp.path().join("workspace"));
+        let cache = temp.path().join("cache");
+        let destination = cache.join("workspace-deps.json");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep"), b"existing bytes").unwrap();
+        let error = write_disk_cache(&cache, &loaded).unwrap_err();
+        assert!(matches!(
+            error,
+            WorkspaceError::Io {
+                operation: "replace workspace cache",
+                ..
+            }
+        ));
+        assert_eq!(
+            fs::read(destination.join("keep")).unwrap(),
+            b"existing bytes"
+        );
+        assert_eq!(fs::read_dir(cache).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn file_mtime_distinguishes_absence_from_a_failed_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(
+            try_file_mtime(&temp.path().join("missing"))
+                .unwrap()
+                .is_none()
+        );
+        let file = temp.path().join("file");
+        fs::write(&file, b"present").unwrap();
+        assert!(try_file_mtime(&file).unwrap().is_some());
+        let error = try_file_mtime(&file.join("child")).unwrap_err();
+        assert!(error.source().unwrap().is::<std::io::Error>());
+    }
+
+    #[test]
+    fn detached_and_nonworkspace_are_normal_absence_without_running_cargo() {
+        assert!(WorkspaceDeps::detached().try_load().unwrap().is_none());
+        let temp = tempfile::tempdir().unwrap();
+        assert!(
+            try_find_workspace_root(temp.path(), Some(Path::new("missing-cargo")))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn required_package_dependencies_preserve_a_failed_workspace_lookup() {
+        use crate::pm::{CargoPm, PackageManager, PackageManagerError};
+        let temp = tempfile::tempdir().unwrap();
+        let dirs =
+            crate::dirs::SymposiumDirs::new(temp.path().into(), temp.path().join("cache"), None);
+        let resolver = Arc::new(WorkspaceDeps::new(
+            temp.path().join("missing-project"),
+            &dirs,
+        ));
+        let manager = CargoPm::new(Arc::clone(&resolver));
+        let error = manager.try_list_deps().await.unwrap_err();
+        let PackageManagerError::Workspace { source } = error else {
+            panic!("required lookup lost its concrete workspace failure");
+        };
+        assert!(matches!(source.as_ref(), WorkspaceError::Io { .. }));
+        assert!(Arc::ptr_eq(&source, &resolver.try_load().unwrap_err()));
+        assert!(!dirs.cache_dir.exists());
+    }
+
+    #[cfg(unix)]
+    fn cargo_stub(root: &Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let path = root.join("cargo-stub");
+        fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_discovery_distinguishes_spawn_status_encoding_and_shape_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let missing = temp.path().join("missing-cargo");
+        let error = try_find_workspace_root(temp.path(), Some(&missing)).unwrap_err();
+        assert!(matches!(error, WorkspaceError::CargoInvoke { .. }));
+        assert!(error.source().unwrap().is::<std::io::Error>());
+        let path = cargo_stub(temp.path(), "exit 37");
+        assert!(matches!(
+            try_find_workspace_root(temp.path(), Some(&path)),
+            Err(WorkspaceError::CargoLocate { .. })
+        ));
+        let path = cargo_stub(temp.path(), "printf '\\377'");
+        assert!(matches!(
+            try_find_workspace_root(temp.path(), Some(&path)),
+            Err(WorkspaceError::CargoOutput { .. })
+        ));
+        let path = cargo_stub(temp.path(), "printf 'unexpected-output\\n'");
+        assert!(matches!(
+            try_find_workspace_root(temp.path(), Some(&path)),
+            Err(WorkspaceError::InvalidCargoOutput)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_failure_remains_memoized_as_a_typed_error_instead_of_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let cargo = cargo_stub(
+            temp.path(),
+            "case \"$1\" in\nlocate-project) printf '%s/Cargo.toml\\n' \"$PWD\";;\nmetadata) printf 'synthetic-secret-canary\\n';;\nesac",
+        );
+        let dirs = crate::dirs::SymposiumDirs::new(
+            temp.path().into(),
+            temp.path().join("cache"),
+            Some(cargo),
+        );
+        let resolver = WorkspaceDeps::new(temp.path(), &dirs);
+        let first = resolver.try_load().unwrap_err();
+        assert!(matches!(first.as_ref(), WorkspaceError::Metadata { .. }));
+        assert!(!first.to_string().contains("synthetic-secret-canary"));
+        let second = resolver.try_load().unwrap_err();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(resolver.load().is_none());
+    }
 }

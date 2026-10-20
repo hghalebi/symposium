@@ -33,6 +33,14 @@ context at system boundaries. Distinguish absent optional input from permission,
 format and I/O failures. Make partial outcomes and best-effort failures visible.
 
 Do not add production panics, `unwrap`, `expect`, `todo!` or `unimplemented!`.
+Production crate guards enforce the explicit panic and unwrap lints while leaving
+test conveniences outside that scope. Existing published infallible contracts
+have only the function-scoped, versioned exceptions listed in the
+[alignment implementation record](../rfds/rust-engineering-alignment/README.md).
+Owned callers use their checked replacements. New sites and broad lint
+allowances are forbidden; remove an expectation when its debt disappears.
+Compiler lints supplement source review: assertions, indexing, macros, and
+stream operations still need explicit failure-policy review.
 Propagate errors or remove invalid states. Validate untrusted data once at the
 responsible boundary before mutation or execution. Keep the original user file
 intact on validation failure; hook stdout belongs to the agent protocol.

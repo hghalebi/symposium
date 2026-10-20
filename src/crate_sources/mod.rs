@@ -8,8 +8,9 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitStatus;
+use std::sync::Arc;
 
-use crate::pm::WorkspaceCrate;
+use crate::pm::{WorkspaceCrate, WorkspaceDeps, WorkspaceError};
 
 mod probe;
 
@@ -20,6 +21,13 @@ mod probe;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CrateSourceError {
+    /// Workspace resolution failed before the registry probe could begin.
+    #[error("failed to resolve workspace dependencies before fetching crate sources")]
+    Workspace {
+        /// The shared, concrete workspace-resolution failure.
+        #[source]
+        source: Arc<WorkspaceError>,
+    },
     /// The blocking probe task did not complete.
     #[error("cargo probe task failed")]
     JoinProbe {
@@ -162,12 +170,12 @@ pub struct FetchResult {
 pub struct RustCrateFetch<'a> {
     crate_name: String,
     version_spec: Option<String>,
-    workspace: &'a [WorkspaceCrate],
+    workspace: &'a WorkspaceDeps,
 }
 
 impl<'a> RustCrateFetch<'a> {
     /// Create a new fetch request for the given crate name.
-    pub fn new(name: &str, workspace: &'a [WorkspaceCrate]) -> Self {
+    pub fn new(name: &str, workspace: &'a WorkspaceDeps) -> Self {
         Self {
             crate_name: name.to_string(),
             version_spec: None,
@@ -191,11 +199,19 @@ impl<'a> RustCrateFetch<'a> {
     /// 2. Otherwise, run `cargo fetch` in a temporary dummy package to
     ///    populate cargo's registry cache, then read `cargo metadata` to get
     ///    the extracted source path under `~/.cargo/registry/src/`.
+    ///
+    /// # Errors
+    /// Workspace resolution failures propagate before any registry probe.
+    /// Otherwise returns the probe's typed acquisition failure.
     pub async fn fetch(self) -> Result<FetchResult, CrateSourceError> {
+        let workspace = self
+            .workspace
+            .try_crates()
+            .map_err(|source| CrateSourceError::Workspace { source })?;
         // Serve a workspace dependency from its already-extracted source.
         if self.version_spec.is_none() {
             let normalized = normalize_crate_name(&self.crate_name);
-            if let Some((wc, dir)) = self.workspace.iter().find_map(|wc| {
+            if let Some((wc, dir)) = workspace.iter().find_map(|wc| {
                 (normalize_crate_name(&wc.name) == normalized)
                     .then(|| wc.source_dir.as_ref().map(|d| (wc, d)))
                     .flatten()
@@ -209,7 +225,7 @@ impl<'a> RustCrateFetch<'a> {
             }
         }
 
-        let (name, version_req) = self.resolve_registry_spec();
+        let (name, version_req) = self.resolve_registry_spec(workspace);
         probe::fetch_via_cargo(&name, &version_req).await
     }
 
@@ -221,14 +237,13 @@ impl<'a> RustCrateFetch<'a> {
     /// 2. If the crate is a direct dependency of the current workspace, pin
     ///    to that exact resolved version (`=x.y.z`).
     /// 3. Otherwise, `"*"` — cargo picks the latest compatible version.
-    fn resolve_registry_spec(&self) -> (String, String) {
+    fn resolve_registry_spec(&self, workspace: &[WorkspaceCrate]) -> (String, String) {
         if let Some(spec) = &self.version_spec {
             return (self.crate_name.clone(), spec.clone());
         }
 
         let normalized = normalize_crate_name(&self.crate_name);
-        if let Some(wc) = self
-            .workspace
+        if let Some(wc) = workspace
             .iter()
             .find(|wc| normalize_crate_name(&wc.name) == normalized)
         {
@@ -256,7 +271,10 @@ mod tests {
     #[tokio::test]
     async fn fetch_uses_path_override_for_path_dep() {
         let tmp = tempfile::tempdir().unwrap();
-        let workspace = vec![wc("my-crate", "0.1.0", Some(tmp.path().to_path_buf()))];
+        let workspace = WorkspaceDeps::fixture(
+            tmp.path(),
+            vec![wc("my-crate", "0.1.0", Some(tmp.path().to_path_buf()))],
+        );
 
         let result = RustCrateFetch::new("my-crate", &workspace)
             .fetch()
@@ -271,7 +289,10 @@ mod tests {
     #[tokio::test]
     async fn fetch_path_override_normalizes_hyphens() {
         let tmp = tempfile::tempdir().unwrap();
-        let workspace = vec![wc("my_crate", "0.1.0", Some(tmp.path().to_path_buf()))];
+        let workspace = WorkspaceDeps::fixture(
+            tmp.path(),
+            vec![wc("my_crate", "0.1.0", Some(tmp.path().to_path_buf()))],
+        );
 
         // Query with hyphen, workspace entry uses underscore.
         let result = RustCrateFetch::new("my-crate", &workspace)
@@ -287,27 +308,28 @@ mod tests {
 
     #[test]
     fn registry_spec_prefers_explicit_version() {
-        let workspace = vec![wc("foo", "1.0.0", None)];
+        let workspace = WorkspaceDeps::fixture(PathBuf::new(), vec![wc("foo", "1.0.0", None)]);
         let fetch = RustCrateFetch::new("foo", &workspace).version("^2.0");
-        let (name, req) = fetch.resolve_registry_spec();
+        let (name, req) = fetch.resolve_registry_spec(workspace.try_crates().unwrap());
         assert_eq!(name, "foo");
         assert_eq!(req, "^2.0");
     }
 
     #[test]
     fn registry_spec_pins_workspace_version_exactly() {
-        let workspace = vec![wc("foo", "1.2.3", None)];
+        let workspace = WorkspaceDeps::fixture(PathBuf::new(), vec![wc("foo", "1.2.3", None)]);
         let fetch = RustCrateFetch::new("foo", &workspace);
-        let (name, req) = fetch.resolve_registry_spec();
+        let (name, req) = fetch.resolve_registry_spec(workspace.try_crates().unwrap());
         assert_eq!(name, "foo");
         assert_eq!(req, "=1.2.3");
     }
 
     #[test]
     fn registry_spec_normalizes_hyphens_against_workspace() {
-        let workspace = vec![wc("serde_json", "1.0.0", None)];
+        let workspace =
+            WorkspaceDeps::fixture(PathBuf::new(), vec![wc("serde_json", "1.0.0", None)]);
         let fetch = RustCrateFetch::new("serde-json", &workspace);
-        let (name, req) = fetch.resolve_registry_spec();
+        let (name, req) = fetch.resolve_registry_spec(workspace.try_crates().unwrap());
         // Canonical name from the workspace wins.
         assert_eq!(name, "serde_json");
         assert_eq!(req, "=1.0.0");
@@ -315,9 +337,9 @@ mod tests {
 
     #[test]
     fn registry_spec_falls_back_to_wildcard() {
-        let workspace: Vec<WorkspaceCrate> = Vec::new();
+        let workspace = WorkspaceDeps::fixture(PathBuf::new(), Vec::new());
         let fetch = RustCrateFetch::new("foo", &workspace);
-        let (name, req) = fetch.resolve_registry_spec();
+        let (name, req) = fetch.resolve_registry_spec(workspace.try_crates().unwrap());
         assert_eq!(name, "foo");
         assert_eq!(req, "*");
     }
@@ -327,10 +349,45 @@ mod tests {
         // Explicit version → path override is skipped → registry spec uses
         // the explicit version.
         let tmp = tempfile::tempdir().unwrap();
-        let workspace = vec![wc("serde", "1.0.210", Some(tmp.path().to_path_buf()))];
+        let workspace = WorkspaceDeps::fixture(
+            tmp.path(),
+            vec![wc("serde", "1.0.210", Some(tmp.path().to_path_buf()))],
+        );
         let fetch = RustCrateFetch::new("serde", &workspace).version("=99.99.99");
-        let (name, req) = fetch.resolve_registry_spec();
+        let (name, req) = fetch.resolve_registry_spec(workspace.try_crates().unwrap());
         assert_eq!(name, "serde");
         assert_eq!(req, "=99.99.99");
+    }
+
+    #[tokio::test]
+    async fn missing_workspace_cargo_propagates_before_a_registry_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let dirs = crate::dirs::SymposiumDirs::new(
+            tmp.path().join("config"),
+            tmp.path().join("cache"),
+            Some(tmp.path().join("missing-cargo")),
+        );
+        let workspace = WorkspaceDeps::new(tmp.path(), &dirs);
+        // An invalid requirement also prevents registry I/O if a regression reaches the probe.
+        let error = RustCrateFetch::new("missing-crate", &workspace)
+            .version("\n")
+            .fetch()
+            .await
+            .unwrap_err();
+        let CrateSourceError::Workspace { source } = &error else {
+            panic!("workspace failure must propagate before the registry probe");
+        };
+        assert!(matches!(
+            source.as_ref(),
+            WorkspaceError::CargoInvoke { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(Arc::ptr_eq(source, &workspace.try_load().unwrap_err()));
+        assert_eq!(
+            error.to_string(),
+            "failed to resolve workspace dependencies before fetching crate sources"
+        );
+        assert!(!tmp.path().join("cache").exists());
     }
 }

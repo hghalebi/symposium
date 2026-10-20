@@ -29,7 +29,7 @@ mod public_row_budget;
 mod session_counts;
 
 fn set_len<T>(sessions: &BTreeSet<T>) -> u64 {
-    u64::try_from(sessions.len()).expect("BUG: usize must fit in u64 on supported targets")
+    sessions.len() as u64
 }
 
 pub(in crate::telemetry) use codec::{StateContentError, StateDecodeError, decode, encode};

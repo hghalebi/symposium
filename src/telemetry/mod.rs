@@ -11,6 +11,13 @@
 //! Every entry point here is best-effort: a failure to read or write the log
 //! must never break a hook, so errors are logged and swallowed.
 
+#[cfg(not(any(
+    target_pointer_width = "16",
+    target_pointer_width = "32",
+    target_pointer_width = "64"
+)))]
+compile_error!("telemetry identity framing requires a 16-, 32-, or 64-bit pointer width");
+
 mod identity;
 mod schema;
 mod state;
@@ -103,8 +110,8 @@ fn file_for(dir: &Path, at: DateTime<Utc>) -> PathBuf {
 /// Append one event to today's log file. Best-effort.
 pub fn record(config_dir: &Path, event: &TelemetryEvent) {
     let dir = telemetry_dir(config_dir);
-    if let Err(e) = fs::create_dir_all(&dir) {
-        tracing::debug!(error = %e, "telemetry: failed to create telemetry dir");
+    if let Err(error) = fs::create_dir_all(&dir) {
+        tracing::warn!(operation = "create_directory", category = ?error.kind(), "telemetry: event not recorded");
         return;
     }
     let line = match serde_json::to_string(event) {
@@ -112,19 +119,21 @@ pub fn record(config_dir: &Path, event: &TelemetryEvent) {
             s.push('\n');
             s
         }
-        Err(e) => {
-            tracing::debug!(error = %e, "telemetry: failed to serialize event");
+        Err(error) => {
+            tracing::warn!(operation = "serialize_event", category = ?error.classify(), "telemetry: event not recorded");
             return;
         }
     };
     let path = file_for(&dir, event.at);
     match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(mut f) => {
-            if let Err(e) = f.write_all(line.as_bytes()) {
-                tracing::debug!(error = %e, "telemetry: failed to append event");
+            if let Err(error) = f.write_all(line.as_bytes()) {
+                tracing::warn!(operation = "append_event", category = ?error.kind(), "telemetry: event not recorded completely");
             }
         }
-        Err(e) => tracing::debug!(error = %e, "telemetry: failed to open event file"),
+        Err(error) => {
+            tracing::warn!(operation = "open_event", category = ?error.kind(), "telemetry: event not recorded")
+        }
     }
 }
 
@@ -140,52 +149,121 @@ fn file_date(path: &Path) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
 }
 
+#[derive(Debug, thiserror::Error)]
+enum RetentionError {
+    #[error("negative_retention")]
+    NegativeDays,
+    #[error("retention_duration_out_of_range")]
+    DurationOutOfRange,
+    #[error("retention_cutoff_out_of_range")]
+    CutoffOutOfRange,
+}
+
+fn retention_cutoff(today: NaiveDate, retention_days: i64) -> Result<NaiveDate, RetentionError> {
+    if retention_days < 0 {
+        return Err(RetentionError::NegativeDays);
+    }
+    let duration =
+        chrono::Duration::try_days(retention_days).ok_or(RetentionError::DurationOutOfRange)?;
+    today
+        .checked_sub_signed(duration)
+        .ok_or(RetentionError::CutoffOutOfRange)
+}
+
 /// Delete daily files older than `retention_days`. Best-effort.
+///
+/// Negative or unrepresentable retention ranges leave every file untouched.
 pub fn roll_off(config_dir: &Path, retention_days: i64) {
-    let dir = telemetry_dir(config_dir);
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return;
-    };
-    let cutoff = Utc::now().date_naive() - chrono::Duration::days(retention_days);
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if let Some(date) = file_date(&path)
-            && date < cutoff
-            && let Err(e) = fs::remove_file(&path)
-        {
-            tracing::debug!(error = %e, "telemetry: failed to roll off old file");
-        }
+    if let Err(error) = roll_off_at(config_dir, retention_days, Utc::now().date_naive()) {
+        tracing::warn!(operation = "retention", category = %error, "telemetry: retention skipped");
     }
 }
 
-/// All event files, sorted by date (oldest first).
-fn event_files(config_dir: &Path) -> Vec<PathBuf> {
+fn roll_off_at(
+    config_dir: &Path,
+    retention_days: i64,
+    today: NaiveDate,
+) -> Result<(), RetentionError> {
+    let cutoff = retention_cutoff(today, retention_days)?;
     let dir = telemetry_dir(config_dir);
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Vec::new();
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            tracing::warn!(operation = "read_retention_directory", category = ?error.kind(), "telemetry: retention incomplete");
+            return Ok(());
+        }
     };
-    let mut files: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| file_date(p).is_some())
-        .collect();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(operation = "read_retention_entry", category = ?error.kind(), "telemetry: retention incomplete");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if let Some(date) = file_date(&path)
+            && date < cutoff
+            && let Err(error) = fs::remove_file(&path)
+        {
+            tracing::warn!(operation = "remove_retained_file", category = ?error.kind(), "telemetry: retention incomplete");
+        }
+    }
+    Ok(())
+}
+
+/// All event files, sorted by date (oldest first).
+fn event_files(config_dir: &Path, operation: &'static str) -> Vec<PathBuf> {
+    let dir = telemetry_dir(config_dir);
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            tracing::warn!(operation, category = ?error.kind(), "telemetry: file listing incomplete");
+            return Vec::new();
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                let path = entry.path();
+                if file_date(&path).is_some() {
+                    files.push(path);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(operation, category = ?error.kind(), "telemetry: file listing incomplete");
+            }
+        }
+    }
     files.sort_by_key(|p| file_date(p));
     files
 }
 
 /// Read all recorded events, oldest first.
+///
+/// Unreadable files and invalid event lines are skipped with safe warnings.
 pub fn read_events(config_dir: &Path) -> Vec<TelemetryEvent> {
     let mut events = Vec::new();
-    for path in event_files(config_dir) {
-        let Ok(contents) = fs::read_to_string(&path) else {
-            continue;
+    for path in event_files(config_dir, "list_events") {
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                tracing::warn!(operation = "read_events", category = ?error.kind(), "telemetry: partial event read");
+                continue;
+            }
         };
-        for line in contents.lines() {
+        for (index, line) in contents.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(event) = serde_json::from_str::<TelemetryEvent>(line) {
-                events.push(event);
+            match serde_json::from_str::<TelemetryEvent>(line) {
+                Ok(event) => events.push(event),
+                Err(error) => {
+                    tracing::warn!(operation = "parse_event", category = ?error.classify(), line = index + 1, "telemetry: partial event read");
+                }
             }
         }
     }
@@ -212,18 +290,29 @@ pub struct Usage {
 }
 
 /// Summarize what is stored on disk.
+///
+/// Counts nonblank event-file lines, including invalid events. Read failures
+/// produce safe warnings and a partial summary.
 pub fn usage(config_dir: &Path) -> Usage {
-    let files = event_files(config_dir);
+    let files = event_files(config_dir, "list_usage");
     let mut u = Usage {
         files: files.len(),
         ..Usage::default()
     };
     for path in &files {
-        if let Ok(meta) = fs::metadata(path) {
-            u.bytes += meta.len();
+        match fs::metadata(path) {
+            Ok(meta) => u.bytes += meta.len(),
+            Err(error) => {
+                tracing::warn!(operation = "read_usage_metadata", category = ?error.kind(), "telemetry: partial usage summary");
+            }
         }
-        if let Ok(contents) = fs::read_to_string(path) {
-            u.events += contents.lines().filter(|l| !l.trim().is_empty()).count();
+        match fs::read_to_string(path) {
+            Ok(contents) => {
+                u.events += contents.lines().filter(|l| !l.trim().is_empty()).count();
+            }
+            Err(error) => {
+                tracing::warn!(operation = "read_usage_events", category = ?error.kind(), "telemetry: partial usage summary");
+            }
         }
         if let Some(date) = file_date(path) {
             u.oldest = Some(u.oldest.map_or(date, |o| o.min(date)));
@@ -235,31 +324,23 @@ pub fn usage(config_dir: &Path) -> Usage {
 
 /// Render `telemetry status` output.
 pub fn status_text(config_dir: &Path, enabled: bool) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "Telemetry: {}",
-        if enabled { "enabled" } else { "disabled" }
-    );
-    let _ = writeln!(
-        out,
-        "  data directory: {}",
+    let mut out = format!(
+        "Telemetry: {}\n  data directory: {}\n",
+        if enabled { "enabled" } else { "disabled" },
         telemetry_dir(config_dir).display()
     );
     let u = usage(config_dir);
     if u.events == 0 {
-        let _ = writeln!(out, "  stored:         nothing yet");
+        out.push_str("  stored:         nothing yet\n");
     } else {
-        let _ = writeln!(
-            out,
-            "  stored:         {} file(s), {} event(s), {}",
+        out.push_str(&format!(
+            "  stored:         {} file(s), {} event(s), {}\n",
             u.files,
             u.events,
             human_bytes(u.bytes)
-        );
+        ));
         if let (Some(o), Some(n)) = (u.oldest, u.newest) {
-            let _ = writeln!(out, "  range:          {o} … {n}");
+            out.push_str(&format!("  range:          {o} … {n}\n"));
         }
     }
     out
@@ -341,16 +422,177 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = telemetry_dir(tmp.path());
         fs::create_dir_all(&dir).unwrap();
-        // One file well past retention, one recent.
-        let old = dir.join("events-2000-01-01.jsonl");
-        let recent = file_for(&dir, Utc::now());
-        fs::write(&old, "{}\n").unwrap();
-        fs::write(&recent, "{}\n").unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let old = dir.join("events-2026-09-19.jsonl");
+        let retained = [
+            "events-2026-09-20.jsonl",
+            "events-2026-10-20.jsonl",
+            "events-2026-10-21.jsonl",
+            ".telemetry-tmp-retention-canary",
+            "unrelated.txt",
+        ];
+        fs::write(&old, "old\n").unwrap();
+        for name in retained {
+            fs::write(dir.join(name), "retained\n").unwrap();
+        }
 
-        roll_off(tmp.path(), RETENTION_DAYS);
+        roll_off_at(tmp.path(), RETENTION_DAYS, today).unwrap();
 
         assert!(!old.exists(), "old file should be removed");
-        assert!(recent.exists(), "recent file should remain");
+        for name in retained {
+            assert_eq!(fs::read(dir.join(name)).unwrap(), b"retained\n");
+        }
+        roll_off_at(tmp.path(), 0, today).unwrap();
+        assert!(!dir.join("events-2026-09-20.jsonl").exists());
+        assert!(dir.join("events-2026-10-20.jsonl").exists());
+        assert!(dir.join("events-2026-10-21.jsonl").exists());
+    }
+
+    #[test]
+    fn retention_cutoff_checks_duration_and_calendar_boundaries() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        assert_eq!(retention_cutoff(today, 0).unwrap(), today);
+        assert_eq!(
+            retention_cutoff(today, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 10, 19).unwrap()
+        );
+        assert!(matches!(
+            retention_cutoff(today, -1),
+            Err(RetentionError::NegativeDays)
+        ));
+        assert!(matches!(
+            retention_cutoff(today, i64::MAX),
+            Err(RetentionError::DurationOutOfRange)
+        ));
+        assert!(matches!(
+            retention_cutoff(NaiveDate::MIN, 1),
+            Err(RetentionError::CutoffOutOfRange)
+        ));
+    }
+
+    #[test]
+    fn invalid_retention_preserves_all_filenames_and_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = telemetry_dir(tmp.path());
+        fs::create_dir_all(&dir).unwrap();
+        for (name, contents) in [
+            ("events-2000-01-01.jsonl", "old\n"),
+            ("events-2026-10-20.jsonl", "today\n"),
+            ("events-2026-10-21.jsonl", "future\n"),
+            (".telemetry-tmp-retention-canary", "temporary\n"),
+            ("unrelated.txt", "unrelated\n"),
+        ] {
+            fs::write(dir.join(name), contents).unwrap();
+        }
+        let snapshot = || {
+            let mut files: Vec<_> = fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        let before = snapshot();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        for days in [-1, i64::MIN, i64::MAX, 200_000_000] {
+            assert!(roll_off_at(tmp.path(), days, today).is_err());
+            assert_eq!(snapshot(), before, "retention_days = {days}");
+            roll_off(tmp.path(), days);
+            assert_eq!(snapshot(), before, "public retention_days = {days}");
+        }
+        assert!(roll_off_at(tmp.path(), 1, NaiveDate::MIN).is_err());
+        assert_eq!(snapshot(), before);
+    }
+
+    #[test]
+    fn missing_storage_is_quiet_and_failures_have_safe_partial_diagnostics() {
+        const CANARY: &str = "PRIVATE_TELEMETRY_CANARY";
+        symposium_testlib::install_tracing_baseline();
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(log.reopen().unwrap())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let tmp = tempfile::tempdir().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        assert!(read_events(tmp.path()).is_empty());
+        assert_eq!(usage(tmp.path()).files, 0);
+        roll_off_at(tmp.path(), RETENTION_DAYS, today).unwrap();
+        assert!(fs::read_to_string(log.path()).unwrap().is_empty());
+
+        let event = TelemetryEvent {
+            at: DateTime::parse_from_rfc3339("2026-10-20T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            kind: EventKind::ToolUse {
+                session_id: Some(CANARY.into()),
+                tool: CANARY.into(),
+            },
+        };
+        let blocked = tmp.path().join(format!("blocked-{CANARY}"));
+        fs::write(&blocked, CANARY).unwrap();
+        record(&blocked, &event);
+        roll_off(&blocked, -1);
+        let blocked_storage = tmp.path().join(format!("storage-{CANARY}"));
+        fs::create_dir(&blocked_storage).unwrap();
+        fs::write(telemetry_dir(&blocked_storage), CANARY).unwrap();
+        assert!(read_events(&blocked_storage).is_empty());
+        assert_eq!(usage(&blocked_storage).files, 0);
+        roll_off_at(&blocked_storage, RETENTION_DAYS, today).unwrap();
+
+        let config_dir = tmp.path().join(CANARY);
+        let dir = telemetry_dir(&config_dir);
+        fs::create_dir_all(&dir).unwrap();
+        let valid = serde_json::to_string(&event).unwrap();
+        let following = "{\"at\":\"2026-10-20T12:00:01Z\",\"kind\":\"user_prompt\"}";
+        fs::write(
+            file_for(&dir, event.at),
+            format!("{valid}\n\n{{\"at\":\"2026-10-20T12:00:00Z\",\"kind\":\"{CANARY}\"}}\n{following}\n"),
+        )
+        .unwrap();
+        fs::write(dir.join("events-2026-10-21.jsonl"), [0xff, 0xfe]).unwrap();
+        let events = read_events(&config_dir);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind_name(), "tool_use");
+        assert_eq!(events[1].kind_name(), "user_prompt");
+        let stored = usage(&config_dir);
+        assert_eq!(stored.files, 2);
+        assert_eq!(stored.events, 3);
+
+        fs::remove_file(file_for(&dir, event.at)).unwrap();
+        fs::create_dir(file_for(&dir, event.at)).unwrap();
+        record(&config_dir, &event);
+        roll_off_at(&config_dir, 0, today.succ_opt().unwrap()).unwrap();
+        drop(guard);
+
+        let diagnostics = fs::read_to_string(log.path()).unwrap();
+        for expected in [
+            "create_directory",
+            "list_events",
+            "list_usage",
+            "read_retention_directory",
+            "negative_retention",
+            "retention skipped",
+            "parse_event",
+            "category=Data",
+            "line=3",
+            "partial event read",
+            "read_usage_events",
+            "partial usage summary",
+            "open_event",
+            "remove_retained_file",
+            "retention incomplete",
+        ] {
+            assert!(diagnostics.contains(expected), "missing {expected}");
+        }
+        assert!(!diagnostics.contains(CANARY));
+        assert!(!diagnostics.contains(&valid));
     }
 
     #[test]
@@ -358,12 +600,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let empty = status_text(dir, false);
-        assert!(empty.contains("Telemetry: disabled"));
-        assert!(empty.contains("nothing yet"));
+        assert_eq!(
+            empty,
+            format!(
+                "Telemetry: disabled\n  data directory: {}\n  stored:         nothing yet\n",
+                telemetry_dir(dir).display()
+            )
+        );
 
-        record_kind(dir, EventKind::UserPrompt { session_id: None });
+        let line = "{\"at\":\"2026-10-20T12:00:00Z\",\"kind\":\"user_prompt\"}\n";
+        fs::create_dir_all(telemetry_dir(dir)).unwrap();
+        fs::write(telemetry_dir(dir).join("events-2026-10-20.jsonl"), line).unwrap();
         let filled = status_text(dir, true);
-        assert!(filled.contains("Telemetry: enabled"));
-        assert!(filled.contains("1 event(s)"));
+        assert_eq!(
+            filled,
+            format!(
+                "Telemetry: enabled\n  data directory: {}\n  stored:         1 file(s), 1 event(s), {} B\n  range:          2026-10-20 … 2026-10-20\n",
+                telemetry_dir(dir).display(),
+                line.len()
+            )
+        );
     }
 }

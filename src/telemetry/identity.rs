@@ -162,8 +162,7 @@ impl<'a> DimensionWriter<'a> {
 
     /// Write a counted sequence whose items own their recursive encoding.
     pub(super) fn sequence<T>(&mut self, items: &[T], mut write_item: impl FnMut(&mut Self, &T)) {
-        let count = u64::try_from(items.len())
-            .expect("BUG: a slice length must fit the telemetry sequence format");
+        let count = items.len() as u64;
         (self.write)(&count.to_be_bytes());
 
         for item in items {
@@ -285,8 +284,10 @@ where
     I: IdentityDimension,
     I::Domain: ScopedIdDomain,
 {
-    let mut hmac =
-        HmacSha256::new_from_slice(&key.0).expect("BUG: HMAC-SHA-256 must accept a 32-byte key");
+    // HMAC pads this 32-byte secret to SHA-256's 64-byte block key.
+    let mut padded_key = hmac::digest::Key::<HmacSha256>::default();
+    padded_key[..IDENTITY_KEY_BYTES].copy_from_slice(&key.0);
+    let mut hmac = HmacSha256::new(&padded_key);
     hmac.update(b"telemetry:");
     hmac.update(I::Domain::HMAC_DOMAIN.as_bytes());
     hmac.update(b":v1\0");
@@ -303,8 +304,7 @@ where
 
 /// Write one unambiguous variable-length value to an HMAC input or buffer.
 fn write_frame(value: &[u8], mut write: impl FnMut(&[u8])) {
-    let length = u64::try_from(value.len())
-        .expect("BUG: a slice length must fit the telemetry frame format");
+    let length = value.len() as u64;
     write(&length.to_be_bytes());
     write(value);
 }
@@ -471,7 +471,9 @@ pub(super) mod state_key_hex {
         S: Serializer,
     {
         let mut encoded = String::with_capacity(ENCODED_KEY_DIGITS);
-        write_lower_hex(&key.0, &mut encoded).expect("BUG: writing to a String cannot fail");
+        write_lower_hex(&key.0, &mut encoded).map_err(|_| {
+            <S::Error as serde::ser::Error>::custom("failed to encode telemetry identity key")
+        })?;
 
         serializer.serialize_str(&encoded)
     }
@@ -735,6 +737,36 @@ mod tests {
             identifier.to_string(),
             "sess_ec1c11acdcca37eb4ab17f381c80df52"
         );
+    }
+
+    #[test]
+    fn fixed_block_key_preserves_original_hmac_derivation() {
+        for key_bytes in [
+            [0x00; IDENTITY_KEY_BYTES],
+            [0x42; IDENTITY_KEY_BYTES],
+            [0xff; IDENTITY_KEY_BYTES],
+        ] {
+            let key = IdentityKey::from_bytes(key_bytes);
+            for window in [b"".as_slice(), b"window-1".as_slice(), b"a\0b".as_slice()] {
+                let dimension = TestDimension::<TestDomain>::from_fields([
+                    b"dimension-1".as_slice(),
+                    b"\0field".as_slice(),
+                ]);
+                let actual = derive_scoped_id(&key, window, &dimension);
+
+                let mut original = HmacSha256::new_from_slice(&key_bytes).unwrap();
+                original.update(b"telemetry:test_subject:v1\0");
+                original.update(&(window.len() as u64).to_be_bytes());
+                original.update(window);
+                for field in &dimension.fields {
+                    original.update(&(field.len() as u64).to_be_bytes());
+                    original.update(field);
+                }
+                let expected = original.finalize().into_bytes();
+
+                assert_eq!(actual.bytes, expected[..IDENTIFIER_BYTES]);
+            }
+        }
     }
 
     #[test]

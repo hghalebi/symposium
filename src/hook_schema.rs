@@ -223,6 +223,28 @@ pub trait AgentHookOutput: Debug {
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
 }
 
+/// Legacy infallible serialization for built-in macro adapters until root 0.6.
+///
+/// Keeping this operation outside macro expansion lets Clippy check its scoped
+/// compatibility exception. Use [`AgentHookOutput::try_to_hook_output`] for typed
+/// failures; built-in typed implementations serialize directly.
+///
+/// # Panics
+/// Panics if the output cannot be serialized as JSON.
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::unwrap_used,
+        reason = "legacy infallible serialization retained until root 0.6; use try_to_hook_output"
+    )
+)]
+fn legacy_to_hook_output<T>(output: &T) -> serde_json::Value
+where
+    T: serde::Serialize + ?Sized,
+{
+    serde_json::to_value(output).unwrap()
+}
+
 /// Represents the "handler" for a specific kind of hook event
 /// (e.g., a `PreToolUse` event coming from `claude`),
 /// capable of parsing the native payloads and outputs
@@ -282,6 +304,19 @@ pub trait AgentHookEvent {
 
     /// Serialize the final output Value to bytes for stdout.
     /// Default: JSON. Override for agents with different output formats (e.g., Kiro plain text).
+    ///
+    /// This infallible method is retained until root 0.6. Use
+    /// [`Self::try_respond`] for typed serialization failures.
+    ///
+    /// # Panics
+    /// Panics if the output cannot be serialized as JSON.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unwrap_used,
+            reason = "legacy infallible serialization retained until root 0.6; use try_respond"
+        )
+    )]
     fn serialize_output(&self, output: &serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(output).unwrap()
     }
@@ -382,13 +417,13 @@ pub trait ErasedAgentHookEvent {
     fn respond(&self, output: &serde_json::Value) -> HookResponse;
 }
 
-struct ErasedAgentHookEventImpl<E: AgentHookEvent + 'static>(E);
+struct ErasedAgentHookEventImpl<E>(E);
 
 impl<E> ErasedAgentHookEvent for ErasedAgentHookEventImpl<E>
 where
     E: AgentHookEvent + 'static,
-    E::Input: AgentHookInput + 'static,
-    E::Output: AgentHookOutput + 'static,
+    E::Input: 'static,
+    E::Output: 'static,
 {
     fn try_parse_input(&self, payload: &str) -> Result<Box<dyn AgentHookInput>, HookSchemaError> {
         Ok(Box::new(self.0.try_parse_input(payload)?))
@@ -442,8 +477,8 @@ where
 pub fn erase_agent_hook_event<E>(e: E) -> Box<dyn ErasedAgentHookEvent>
 where
     E: AgentHookEvent + 'static,
-    E::Input: AgentHookInput + 'static,
-    E::Output: AgentHookOutput + 'static,
+    E::Input: 'static,
+    E::Output: 'static,
 {
     Box::new(ErasedAgentHookEventImpl(e))
 }

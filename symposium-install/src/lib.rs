@@ -1,3 +1,15 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable
+    )
+)]
+
 //! Acquisition and caching of tool binaries for symposium plugins.
 //!
 //! This crate provides the machinery to install cargo binaries and clone GitHub
@@ -1159,6 +1171,9 @@ impl AcquiredSource {
     /// Returns `None` if no executable name was resolved (e.g., a GitHub
     /// source with no hint).
     /// Legacy 0.1.x API; use [`Self::try_executable`] before installer 0.2.
+    ///
+    /// # Panics
+    /// Panics when an executable name is present but `base` is `None`.
     pub fn executable(&self) -> Option<PathBuf> {
         let name = self.resolved_executable.as_deref()?;
         Some(self.executable_named(name))
@@ -1166,6 +1181,16 @@ impl AcquiredSource {
 
     /// Path of an `executable` declared on installation/hook.
     /// Legacy 0.1.x API; requires a managed base. Prefer [`Self::try_executable_named`].
+    ///
+    /// # Panics
+    /// Panics when `base` is `None`, including global Cargo acquisitions.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::expect_used,
+            reason = "Legacy infallible public resolver retained until installer 0.2; use try_executable_named"
+        )
+    )]
     pub fn executable_named(&self, name: &str) -> PathBuf {
         let base = self
             .base
@@ -1180,6 +1205,16 @@ impl AcquiredSource {
 
     /// Path of a `script` declared on installation/hook.
     /// Legacy 0.1.x API; requires a managed base. Prefer [`Self::try_script_named`].
+    ///
+    /// # Panics
+    /// Panics when `base` is `None`, including global Cargo acquisitions.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::expect_used,
+            reason = "Legacy infallible public resolver retained until installer 0.2; use try_script_named"
+        )
+    )]
     pub fn script_named(&self, name: &str) -> PathBuf {
         let base = self
             .base
@@ -1366,6 +1401,30 @@ pub fn try_make_executable(path: &Path) -> Result<(), InstallError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_unmanaged_resolvers_keep_their_panicking_contract() {
+        let source = AcquiredSource {
+            base: None,
+            resolved_executable: Some("tool".into()),
+            kind: AcquiredKind::Cargo,
+        };
+        for resolve in [
+            AcquiredSource::executable_named,
+            AcquiredSource::script_named,
+        ] {
+            assert!(std::panic::catch_unwind(|| resolve(&source, "tool")).is_err());
+        }
+        assert!(std::panic::catch_unwind(|| source.executable()).is_err());
+        assert_eq!(
+            source.try_executable().unwrap(),
+            Some(PathBuf::from("tool"))
+        );
+        assert!(matches!(
+            source.try_script_named("tool"),
+            Err(InstallError::GlobalScript)
+        ));
+    }
 
     #[test]
     fn invalid_paths_are_rejected_before_acquisition() {

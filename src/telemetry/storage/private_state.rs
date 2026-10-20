@@ -207,8 +207,7 @@ fn read_bounded(path: &Path) -> Result<Option<Vec<u8>>, LoadStateError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let limit = u64::try_from(MAX_PRIVATE_STATE_BYTES + 1)
-        .expect("BUG: private-state read limit must fit in u64");
+    let limit = MAX_PRIVATE_STATE_BYTES as u64 + 1;
     let mut bytes = Vec::new();
     file.take(limit).read_to_end(&mut bytes)?;
     if bytes.len() > MAX_PRIVATE_STATE_BYTES {

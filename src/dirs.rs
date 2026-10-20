@@ -54,8 +54,26 @@ impl SymposiumDirs {
     ///
     /// Legacy infallible entry point retained until the root crate's 0.6 release.
     /// New callers should use [`Self::try_from_environment`].
+    ///
+    /// # Panics
+    /// Panics when no Unicode override or home directory is available.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::expect_used,
+            reason = "legacy infallible directory resolution; removed in root 0.6"
+        )
+    )]
     pub fn from_environment() -> Self {
-        let config_dir = resolve_config_dir();
+        let config_dir = if let Ok(home) = env::var("SYMPOSIUM_HOME") {
+            PathBuf::from(home)
+        } else if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
+            PathBuf::from(xdg).join("symposium")
+        } else {
+            dirs::home_dir()
+                .expect("could not determine home directory")
+                .join(".symposium")
+        };
         let cache_dir = resolve_cache_dir(&config_dir);
         let cargo_override = env::var("SYMPOSIUM_CARGO").ok().map(PathBuf::from);
 
@@ -111,18 +129,6 @@ fn try_resolve_config_dir(
         Ok(home_dir
             .ok_or(DirectoryError::HomeUnavailable)?
             .join(".symposium"))
-    }
-}
-
-fn resolve_config_dir() -> PathBuf {
-    if let Ok(home) = env::var("SYMPOSIUM_HOME") {
-        PathBuf::from(home)
-    } else if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg).join("symposium")
-    } else {
-        dirs::home_dir()
-            .expect("could not determine home directory")
-            .join(".symposium")
     }
 }
 

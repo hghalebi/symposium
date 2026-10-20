@@ -40,6 +40,13 @@ pub enum UseError {
     /// No recorded enablement matches the requested name and scope.
     #[error("no `use` entry matches the requested scope; see `cargo agents status`")]
     NoUseEntry,
+    /// Workspace discovery or metadata resolution failed.
+    #[error("failed to load Rust workspace")]
+    Workspace {
+        /// The shared discovery/metadata failure, including its concrete source.
+        #[from]
+        source: std::sync::Arc<crate::pm::WorkspaceError>,
+    },
     /// Registry configuration could not be resolved completely.
     #[error("could not resolve configured registries")]
     Registry(#[from] RegistryError),
@@ -106,7 +113,7 @@ pub async fn try_use_plugin(
     }
 
     let deps = sym.workspace_deps(cwd);
-    let workspace_root = deps.load().map(|ws| ws.root.clone());
+    let workspace_root = deps.try_load()?.map(|ws| ws.root.clone());
     let entry = match (global, &workspace_root) {
         (true, _) => UseEntry::Global(name.to_string()),
         (false, Some(root)) => UseEntry::Workspace {
@@ -175,7 +182,7 @@ pub async fn try_remove_plugin(
     update: UpdateLevel,
 ) -> std::result::Result<(), UseError> {
     let deps = sym.workspace_deps(cwd);
-    let workspace_root = deps.load().map(|ws| ws.root.clone());
+    let workspace_root = deps.try_load()?.map(|ws| ws.root.clone());
 
     sym.try_registry_instances()?;
     let used = &mut sym.config.plugins.used;
@@ -220,7 +227,7 @@ async fn resolve_name(
     name: &str,
 ) -> std::result::Result<(), UseError> {
     let normalized = normalize_crate_name(name);
-    let is_workspace_dep = deps.load().is_some_and(|ws| {
+    let is_workspace_dep = deps.try_load()?.is_some_and(|ws| {
         ws.crates
             .iter()
             .any(|c| normalize_crate_name(&c.name) == normalized)
@@ -294,5 +301,55 @@ mod tests {
         assert!(config_error.is::<ConfigError>());
         assert!(config_error.source().unwrap().is::<std::io::Error>());
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "preserve");
+    }
+
+    #[tokio::test]
+    async fn malformed_workspace_remains_a_typed_failure_before_consent_or_dispatch() {
+        use crate::status_command::{StatusError, try_workspace_status};
+        use crate::subcommand_dispatch::{SubcommandError, try_dispatch_external};
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let manifest = project.join("Cargo.toml");
+        let original = "[workspace\n# synthetic-private-workspace-canary\n";
+        std::fs::write(&manifest, original).unwrap();
+        let mut sym = isolated_symposium(&home);
+        sym.config
+            .plugins
+            .used
+            .push(UseEntry::Global("existing".into()));
+        let before = sym.config.plugins.used.clone();
+
+        let use_error = try_use_plugin(&mut sym, &project, "new", false, UpdateLevel::None)
+            .await
+            .unwrap_err();
+        assert!(matches!(&use_error, UseError::Workspace { source }
+            if matches!(source.as_ref(), crate::pm::WorkspaceError::CargoLocate { .. })));
+        assert!(use_error.source().is_some());
+        assert!(
+            !use_error
+                .to_string()
+                .contains("synthetic-private-workspace-canary")
+        );
+        let remove_error =
+            try_remove_plugin(&mut sym, &project, "existing", true, UpdateLevel::None)
+                .await
+                .unwrap_err();
+        assert!(matches!(remove_error, UseError::Workspace { .. }));
+        assert_eq!(sym.config.plugins.used, before);
+        assert!(!home.join("config.toml").exists());
+
+        let deps = sym.workspace_deps(&project);
+        assert!(matches!(
+            try_workspace_status(&sym, &deps).await,
+            Err(StatusError::Workspace { .. })
+        ));
+        assert!(matches!(
+            try_dispatch_external(&sym, &project, vec!["anything".into()]).await,
+            Err(SubcommandError::Workspace { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(manifest).unwrap(), original);
     }
 }

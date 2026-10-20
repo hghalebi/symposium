@@ -73,6 +73,13 @@ pub enum SubcommandError {
     /// A plugin references an installation absent from its manifest.
     #[error("subcommand references an unknown installation")]
     UnknownInstallation,
+    /// Workspace discovery or metadata resolution failed.
+    #[error("failed to load Rust workspace")]
+    Workspace {
+        /// The shared discovery/metadata failure, including its concrete source.
+        #[from]
+        source: std::sync::Arc<crate::pm::WorkspaceError>,
+    },
     /// The complete registry set could not be resolved.
     #[error("could not resolve configured registries for subcommand dispatch")]
     Registry(#[from] crate::config::RegistryError),
@@ -160,7 +167,7 @@ pub async fn try_dispatch_external(
     let forwarded = argv.collect::<Vec<_>>();
 
     let deps = sym.workspace_deps(cwd);
-    let workspace = deps.load().cloned();
+    let workspace = deps.try_load()?.cloned();
     let registry = plugins::try_load_registry_with_workspace(sym, workspace.as_deref()).await?;
 
     let dep_ids = crate::pm::try_workspace_dep_ids(sym, &deps).await?;

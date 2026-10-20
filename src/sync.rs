@@ -41,6 +41,13 @@ pub enum SyncError {
     /// Sync needs a resolved Rust workspace.
     #[error("not in a Rust workspace")]
     WorkspaceRequired,
+    /// Workspace discovery failed instead of proving that no workspace exists.
+    #[error("failed to resolve Rust workspace: {source}")]
+    WorkspaceLookup {
+        /// The shared concrete workspace failure from the memoized resolver.
+        #[source]
+        source: Arc<crate::pm::WorkspaceError>,
+    },
     /// An agent name, configuration, or registration could not be processed.
     #[error("failed to update agent configuration: {0}")]
     Agent(#[from] AgentConfigError),
@@ -69,6 +76,25 @@ pub enum SyncError {
     /// An agent skill path unexpectedly has no parent directory.
     #[error("agent skill path has no parent directory")]
     MissingSkillParent,
+    /// A user-managed entry appeared at a skill's destination before publication.
+    #[error("refusing to replace a user-managed skill at {}", path.display())]
+    UnmanagedDestination {
+        /// The protected user-managed path.
+        path: PathBuf,
+    },
+    /// Publication and rollback both failed; the previous skill remains in backup.
+    #[error("skill replacement and rollback failed; recover {} from {}", destination.display(), backup.display())]
+    Restore {
+        /// The intended installation directory.
+        destination: PathBuf,
+        /// The preserved previous directory, which needs manual recovery.
+        backup: PathBuf,
+        /// The original publication failure.
+        #[source]
+        source: std::io::Error,
+        /// The additional failure restoring the previous installation.
+        restore_source: std::io::Error,
+    },
     /// The external MCP schema introduced an unsupported server variant.
     #[error("unsupported MCP server variant")]
     UnsupportedMcpServer,
@@ -294,8 +320,9 @@ fn dir_contents_differ(source_dir: &Path, dest_dir: &Path) -> SyncResult<bool> {
 ///    — if so, skips entirely.
 /// 2. Compares source and dest content — if identical, touches the marker
 ///    to reset the debounce window and returns without modifying content.
-/// 3. Otherwise removes `dest_dir`, re-creates it with the source content,
-///    and writes the marker + gitignore.
+/// 3. Otherwise copies and marks a temporary sibling completely, then publishes
+///    it with a same-filesystem rename, retaining a backup until publication
+///    succeeds. Publication failure restores the previous installation.
 ///
 /// Returns `Ok(true)` if the destination was created or updated (callers
 /// record it as installed). Returns `Ok(false)` if skipped (no-op).
@@ -314,9 +341,7 @@ fn sync_skill_dir(
         .try_exists()
         .map_err(|source| SyncError::io("inspect skill destination", dest_dir, source))?
     {
-        create_managed_dir_all(dest_dir, project_root)?;
-        copy_dir_recursive(source_dir, dest_dir)?;
-        mark_generated_skill_directory(dest_dir)?;
+        replace_skill_contents(source_dir, dest_dir, project_root)?;
         return Ok(true);
     }
 
@@ -352,13 +377,92 @@ fn sync_skill_dir(
         return Ok(false);
     }
 
-    // Content changed: replace entirely.
-    fs::remove_dir_all(dest_dir)
-        .map_err(|source| SyncError::io("remove skill directory", dest_dir, source))?;
-    create_managed_dir_all(dest_dir, project_root)?;
-    copy_dir_recursive(source_dir, dest_dir)?;
-    mark_generated_skill_directory(dest_dir)?;
+    replace_skill_contents(source_dir, dest_dir, project_root)?;
     Ok(true)
+}
+
+/// Prepare all bytes and managed metadata before moving the installed artifact.
+fn replace_skill_contents(
+    source: &Path,
+    destination: &Path,
+    project_root: &Path,
+) -> SyncResult<()> {
+    let parent = destination.parent().ok_or(SyncError::MissingSkillParent)?;
+    create_managed_dir_all(parent, project_root)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".symposium-stage-")
+        .tempdir_in(parent)
+        .map_err(|source| SyncError::io("create skill staging directory", parent, source))?;
+    // The wrapper itself has no managed marker. A retained recovery copy must
+    // not look like a stale installation to a later cleanup pass.
+    let prepared = staging.path().join("prepared");
+    let previous = staging.path().join("previous");
+    let outcome = (|| {
+        copy_dir_recursive(source, &prepared)?;
+        mark_generated_skill_directory(&prepared)?;
+        publish_skill(&prepared, destination, &previous)
+    })();
+    if matches!(&outcome, Err(SyncError::Restore { .. })) {
+        let retained = staging.keep();
+        tracing::info!(report = %crate::report::ReportEvent::Warning {
+            message: format!("skill rollback failed; previous installation preserved at {}", display_path(&retained.join("previous"))),
+        });
+    } else {
+        close_skill_staging(staging);
+    }
+    outcome
+}
+
+/// Keep the previous installation until the completed replacement is published.
+/// The two renames are recoverable on ordinary I/O failure, not a crash-safe
+/// transaction or a lock against simultaneous sync processes.
+fn publish_skill(prepared: &Path, destination: &Path, previous: &Path) -> SyncResult<()> {
+    let had_previous = match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            // Recheck after staging: an entry created by the user while
+            // preparing must not be overwritten by a managed installation.
+            if !has_symposium_marker(destination)? {
+                return Err(SyncError::UnmanagedDestination {
+                    path: destination.to_path_buf(),
+                });
+            }
+            fs::rename(destination, previous)
+                .map_err(|source| SyncError::io("back up installed skill", destination, source))?;
+            true
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => false,
+        Err(source) => {
+            return Err(SyncError::io(
+                "inspect installed skill",
+                destination,
+                source,
+            ));
+        }
+    };
+    // Once the previous entry moves, handle both publication and compensation
+    // explicitly. A relative symlink may appear broken in its temporary slot;
+    // successful rename, rather than existence probing, decides rollback.
+    if let Err(source) = fs::rename(prepared, destination) {
+        if had_previous && let Err(restore_source) = fs::rename(previous, destination) {
+            return Err(SyncError::Restore {
+                destination: destination.to_path_buf(),
+                backup: previous.to_path_buf(),
+                source,
+                restore_source,
+            });
+        }
+        return Err(SyncError::io("publish prepared skill", destination, source));
+    }
+    Ok(())
+}
+
+/// Cleanup is best effort after publication, and every failure is reported.
+fn close_skill_staging(directory: tempfile::TempDir) {
+    let path = directory.path().to_path_buf();
+    if let Err(source) = directory.close() {
+        let error = SyncError::io("clean skill staging directory", &path, source);
+        tracing::info!(report = %crate::report::ReportEvent::Warning { message: error.to_string() });
+    }
 }
 
 /// Update the marker file's mtime to now without changing content.
@@ -546,7 +650,10 @@ pub async fn try_sync(
 ) -> SyncResult<()> {
     let pms = sym.try_package_managers(deps)?;
     let out = &Output::quiet();
-    let loaded = deps.load().ok_or(SyncError::WorkspaceRequired)?;
+    let loaded = deps
+        .try_load()
+        .map_err(|source| SyncError::WorkspaceLookup { source })?
+        .ok_or(SyncError::WorkspaceRequired)?;
     let project_root = loaded.root.clone();
     let workspace: Vec<_> = loaded.crates.clone();
     let loaded = loaded.clone();
@@ -1225,6 +1332,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_workspace_lookup_preserves_its_cause_before_agent_effects() {
+        use std::error::Error;
+        let temp = tempfile::tempdir().unwrap();
+        let sym = isolated_symposium(temp.path());
+        let missing_project = temp.path().join("missing-project");
+        let deps = Arc::new(WorkspaceDeps::new(&missing_project, sym.dirs()));
+
+        let error = try_sync(&sym, &deps, UpdateLevel::None).await.unwrap_err();
+
+        let SyncError::WorkspaceLookup { source } = error else {
+            panic!("workspace failure must remain distinct from optional absence");
+        };
+        assert!(
+            matches!(source.as_ref(), crate::pm::WorkspaceError::Io { path, source, .. }
+            if path == &missing_project && source.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert!(source.source().unwrap().is::<std::io::Error>());
+        assert!(!temp.path().join(".claude").exists());
+        assert!(!temp.path().join("config.toml").exists());
+    }
+
+    #[tokio::test]
     async fn unreadable_skill_retains_previous_installation_and_skips_stale_cleanup() {
         use tracing_subscriber::prelude::*;
         let temp = tempfile::tempdir().unwrap();
@@ -1429,5 +1558,150 @@ mod tests {
                 .iter()
                 .any(|report| report["kind"] == "skill_removed")
         );
+    }
+
+    fn previous_skill(destination: &Path) {
+        fs::create_dir(destination).unwrap();
+        fs::write(destination.join("SKILL.md"), "previous advice").unwrap();
+        mark_generated_skill_directory(destination).unwrap();
+        fs::write(destination.join(MARKER_FILE), "previous marker bytes").unwrap();
+    }
+
+    fn assert_previous_skill(destination: &Path) {
+        assert_eq!(
+            fs::read_to_string(destination.join("SKILL.md")).unwrap(),
+            "previous advice"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join(MARKER_FILE)).unwrap(),
+            "previous marker bytes"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join(".gitignore")).unwrap(),
+            "*\n"
+        );
+    }
+
+    #[test]
+    fn failed_staged_marker_write_preserves_previous_artifact_and_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("installed");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("SKILL.md"), "new advice").unwrap();
+        // Copy succeeds, but managed metadata cannot replace this directory.
+        // This is a real deterministic I/O failure after content preparation.
+        fs::create_dir(source.join(MARKER_FILE)).unwrap();
+        previous_skill(&destination);
+
+        let error = sync_skill_dir(&source, &destination, temp.path(), Duration::ZERO).unwrap_err();
+
+        assert!(
+            matches!(&error, SyncError::Io { operation: "write marker", path, .. }
+            if path.file_name().unwrap() == MARKER_FILE)
+        );
+        assert_previous_skill(&destination);
+        assert_eq!(
+            fs::read_dir(temp.path()).unwrap().count(),
+            2,
+            "staging must be cleaned"
+        );
+    }
+
+    #[test]
+    fn failed_skill_publication_restores_previous_artifact_and_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("installed");
+        previous_skill(&destination);
+
+        let error = publish_skill(
+            &temp.path().join("missing-prepared"),
+            &destination,
+            &temp.path().join("previous"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SyncError::Io {
+                operation: "publish prepared skill",
+                ..
+            }
+        ));
+        assert_previous_skill(&destination);
+        assert_eq!(
+            fs::read_dir(temp.path()).unwrap().count(),
+            1,
+            "rollback must remove its empty backup"
+        );
+    }
+
+    #[test]
+    fn successful_staged_replacement_publishes_complete_skill_and_removes_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("installed");
+        fs::create_dir_all(source.join("empty")).unwrap();
+        fs::write(source.join("SKILL.md"), "new advice").unwrap();
+        previous_skill(&destination);
+
+        assert!(sync_skill_dir(&source, &destination, temp.path(), Duration::ZERO).unwrap());
+
+        assert_eq!(
+            fs::read_to_string(destination.join("SKILL.md")).unwrap(),
+            "new advice"
+        );
+        assert!(destination.join("empty").is_dir());
+        assert_eq!(
+            fs::read_to_string(destination.join(MARKER_FILE)).unwrap(),
+            ""
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join(".gitignore")).unwrap(),
+            "*\n"
+        );
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn publication_preserves_a_user_managed_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("installed");
+        let prepared = temp.path().join("prepared");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("SKILL.md"), "user advice").unwrap();
+        fs::create_dir(&prepared).unwrap();
+        fs::write(prepared.join("SKILL.md"), "managed advice").unwrap();
+        mark_generated_skill_directory(&prepared).unwrap();
+
+        let error =
+            publish_skill(&prepared, &destination, &temp.path().join("previous")).unwrap_err();
+
+        assert!(matches!(error, SyncError::UnmanagedDestination { path } if path == destination));
+        assert_eq!(
+            fs::read_to_string(destination.join("SKILL.md")).unwrap(),
+            "user advice"
+        );
+        assert!(!destination.join(MARKER_FILE).exists());
+        assert!(prepared.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn failed_fresh_staging_does_not_publish_a_partial_installation() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("installed");
+
+        assert!(
+            sync_skill_dir(
+                &temp.path().join("missing"),
+                &destination,
+                temp.path(),
+                Duration::ZERO
+            )
+            .is_err()
+        );
+
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 }

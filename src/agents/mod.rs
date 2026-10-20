@@ -121,8 +121,8 @@ impl Agent {
 
     /// Project-level skill directory for a given skill name.
     ///
-    /// Claude Code requires `.claude/skills/`, while Antigravity, Copilot and
-    /// Antigravity, Codex and Copilot support the vendor-neutral
+    /// Claude Code requires `.claude/skills/`; Antigravity, Codex and Copilot
+    /// support the vendor-neutral
     /// `.agents/skills/` path.
     ///
     /// Legacy infallible adapter retained until the root crate's 0.6 release.

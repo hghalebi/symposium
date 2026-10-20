@@ -12,6 +12,8 @@ use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
+use crate::output::{lock_output_buffer, write_line_best_effort};
+
 /// The output mode for the report layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportMode {
@@ -168,7 +170,8 @@ pub enum ReportEvent {
 
 impl std::fmt::Display for ReportEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&serde_json::to_string(self).unwrap())
+        let json = serde_json::to_string(self).map_err(|_| std::fmt::Error)?;
+        f.write_str(&json)
     }
 }
 
@@ -379,12 +382,17 @@ pub struct ReportHandle {
 
 impl ReportHandle {
     /// Drain accumulated JSON events. Only meaningful in `Json` mode.
+    ///
+    /// Recovers a poisoned buffer without discarding already collected events.
     pub fn drain(&self) -> Vec<serde_json::Value> {
-        std::mem::take(&mut *self.buffer.lock().unwrap())
+        std::mem::take(&mut *lock_output_buffer(&self.buffer))
     }
 }
 
 /// Tracing layer that captures events with a `report` field.
+///
+/// Human output is best effort. Stream failures are diagnosed directly on
+/// stderr, never through tracing, so this layer cannot recursively report itself.
 pub struct ReportLayer {
     mode: ReportMode,
     buffer: Arc<Mutex<Vec<serde_json::Value>>>,
@@ -445,19 +453,61 @@ where
         match self.mode {
             ReportMode::Normal => {
                 if let Ok(evt) = serde_json::from_str::<ReportEvent>(&json_str) {
-                    println!("{}", evt.format_human());
+                    write_line_best_effort(std::io::stdout().lock(), &evt.format_human(), "stdout");
                 }
             }
             ReportMode::Verbose => {
                 if let Ok(evt) = serde_json::from_str::<ReportEvent>(&json_str) {
-                    eprintln!("{}", evt.format_human());
+                    write_line_best_effort(std::io::stderr().lock(), &evt.format_human(), "stderr");
                 }
             }
             ReportMode::Json => {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                    self.buffer.lock().unwrap().push(val);
+                    lock_output_buffer(&self.buffer).push(val);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn event_display_preserves_json_encoding() {
+        let event = ReportEvent::Info {
+            message: "quoted \"value\" and Unicode λ".to_owned(),
+        };
+        assert_eq!(event.to_string(), serde_json::to_string(&event).unwrap());
+    }
+
+    #[test]
+    fn poisoned_report_buffer_preserves_events_and_accepts_later_reports() {
+        symposium_testlib::install_tracing_baseline();
+        let (layer, handle) = ReportLayer::new(ReportMode::Json, tracing::Level::INFO);
+        let existing = serde_json::json!({"kind": "info", "message": "before"});
+        handle.buffer.lock().unwrap().push(existing.clone());
+        let buffer = Arc::clone(&handle.buffer);
+        assert!(
+            std::panic::catch_unwind(move || {
+                let _guard = buffer.lock().unwrap();
+                panic!("poison report buffer for recovery test");
+            })
+            .is_err()
+        );
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(report = %ReportEvent::Info { message: "after".to_owned() });
+        });
+        assert_eq!(
+            handle.drain(),
+            vec![
+                existing,
+                serde_json::json!({"kind": "info", "message": "after"})
+            ]
+        );
+        assert!(handle.drain().is_empty());
     }
 }

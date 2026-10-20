@@ -74,6 +74,13 @@ pub enum StatusError {
     /// Enablement is scoped to a Rust workspace.
     #[error("not in a Rust workspace")]
     WorkspaceRequired,
+    /// Workspace discovery or metadata resolution failed.
+    #[error("failed to load Rust workspace")]
+    Workspace {
+        /// The shared discovery/metadata failure, including its concrete source.
+        #[from]
+        source: std::sync::Arc<crate::pm::WorkspaceError>,
+    },
     /// The complete registry set could not be resolved.
     #[error("could not resolve configured registries for status")]
     Registry(#[from] crate::config::RegistryError),
@@ -97,7 +104,10 @@ pub async fn try_workspace_status(
     sym: &Symposium,
     deps: &Arc<WorkspaceDeps>,
 ) -> std::result::Result<Vec<StatusEntry>, StatusError> {
-    let ws = deps.load().cloned().ok_or(StatusError::WorkspaceRequired)?;
+    let ws = deps
+        .try_load()?
+        .cloned()
+        .ok_or(StatusError::WorkspaceRequired)?;
 
     let mut entries = Vec::new();
 

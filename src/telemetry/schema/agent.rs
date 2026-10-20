@@ -342,11 +342,15 @@ impl SessionStartV1 {
     ///
     /// Both scoped identifiers and the cohort day come from the same bound
     /// state transition as its captured completion timestamp.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse error if the build version is not valid SemVer.
     pub(in crate::telemetry) fn new(
         fields: SessionStartFields<'_>,
         observation: &BoundSessionObservation<'_>,
-    ) -> Self {
+    ) -> Result<Self, semver::Error> {
+        let symposium = SymposiumVersion::current()?;
         let at = observation.completed_at();
         let session = AgentSessionIdentity::new(
             observation.identifier_window_scope(),
@@ -357,13 +361,13 @@ impl SessionStartV1 {
             .return_cohort_scope()
             .derive(&RetentionDimension);
 
-        Self {
+        Ok(Self {
             version: SchemaVersion::V1,
             kind: Self::KIND,
             event_id: EventId::new(),
             day: at.day(),
             at,
-            symposium: SymposiumVersion::current(),
+            symposium,
             agent: session.agent(),
             os: fields.os,
             arch: fields.arch,
@@ -371,7 +375,7 @@ impl SessionStartV1 {
             session_id: session.session_id(),
             retention_subject,
             cohort_day: observation.cohort_day(),
-        }
+        })
     }
 }
 
@@ -433,27 +437,31 @@ strict_versioned_row! {
 
 impl AgentConfigurationV1 {
     /// Create one agent entry in a daily configuration snapshot.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse error if the build version is not valid SemVer.
     pub(in crate::telemetry) fn new(
         observation: &BoundRecordingObservation<'_>,
         os: OperatingSystem,
         arch: Architecture,
         fields: AgentConfigurationFields,
-    ) -> Self {
+    ) -> Result<Self, semver::Error> {
+        let symposium = SymposiumVersion::current()?;
         let agent_subject = observation.identifier_window_scope().derive(&fields.agent);
 
-        Self {
+        Ok(Self {
             version: SchemaVersion::V1,
             kind: Self::KIND,
             event_id: EventId::new(),
             day: observation.day(),
-            symposium: SymposiumVersion::current(),
+            symposium,
             agent: fields.agent,
             configured: fields.configured,
             os,
             arch,
             agent_subject,
-        }
+        })
     }
 }
 
@@ -501,7 +509,7 @@ mod tests {
         let observation = state.observe_session(completed_at).unwrap();
         let observation = state.bind_session_observation(observation).unwrap();
 
-        SessionStartV1::new(session_start_fields(agent, vendor_session_id), &observation)
+        SessionStartV1::new(session_start_fields(agent, vendor_session_id), &observation).unwrap()
     }
 
     fn agent_configuration(agent: SupportedAgent) -> AgentConfigurationV1 {
@@ -517,6 +525,7 @@ mod tests {
                 configured: true,
             },
         )
+        .unwrap()
     }
 
     #[test]
@@ -762,7 +771,7 @@ mod tests {
         assert_eq!(row.event_id.0.get_version(), Some(uuid::Version::Random));
         assert_eq!(row.day, at.day());
         assert_eq!(row.at, at);
-        assert_eq!(row.symposium, SymposiumVersion::current());
+        assert_eq!(row.symposium, SymposiumVersion::current().unwrap());
         assert_eq!(row.agent, HookAgent::Claude);
         assert_eq!(row.os, OperatingSystem::Linux);
         assert_eq!(row.arch, Architecture::X86_64);
@@ -780,7 +789,8 @@ mod tests {
         let observation = state.observe_session(completed_at).unwrap();
         let observation = state.bind_session_observation(observation).unwrap();
 
-        let row = SessionStartV1::new(session_start_fields(HookAgent::Claude, None), &observation);
+        let row = SessionStartV1::new(session_start_fields(HookAgent::Claude, None), &observation)
+            .unwrap();
         let stored_state = toml::to_string(&state).unwrap();
         let stored_state = toml::from_str::<toml::Value>(&stored_state).unwrap();
         let cohort_anchor = stored_state["identity"]["return-cohort-anchor"]
@@ -806,7 +816,7 @@ mod tests {
         assert_eq!(row.kind, RowKind::AgentConfiguration);
         assert_eq!(row.event_id.0.get_version(), Some(uuid::Version::Random));
         assert_eq!(row.day.to_string(), "2026-08-03");
-        assert_eq!(row.symposium, SymposiumVersion::current());
+        assert_eq!(row.symposium, SymposiumVersion::current().unwrap());
         assert_eq!(row.agent, SupportedAgent::Claude);
         assert!(row.configured);
         assert_eq!(row.os, OperatingSystem::Linux);

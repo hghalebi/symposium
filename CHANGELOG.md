@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failures, instead of falsely advancing the saved snapshot.
 - Report single-manifest validation success without copying manifest values to
   stdout. Use `plugin show` to inspect an explicitly selected resolved plugin.
+- Distinguish failed workspace/state reads from absence, preserve the last
+  successful freshness snapshot, and report best-effort persistence failures.
+- Stage complete managed skills before replacing an installed copy; restore the
+  previous copy after ordinary publication failure and protect user entries.
+- Release telemetry locks explicitly when guards drop, even when a duplicated
+  handle survives. Keep identity derivation and persisted telemetry formats stable.
+- Evaluate owned hook matchers through typed errors while retaining the SDK's
+  legacy invalid-matcher behavior and native permission-denial responses.
 
 ## [0.5.1](https://github.com/symposium-dev/symposium/compare/symposium-v0.5.0...symposium-v0.5.1) - 2026-10-01
 

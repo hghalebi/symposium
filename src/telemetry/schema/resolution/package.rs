@@ -78,7 +78,7 @@ impl FromStr for ExactPackageVersion {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Version::parse(value)
             .map(Self)
-            .map_err(|_| InvalidExactPackageVersion)
+            .map_err(InvalidExactPackageVersion)
     }
 }
 
@@ -117,16 +117,15 @@ impl<'de> Deserialize<'de> for ExactPackageVersion {
 }
 
 /// Error returned when a package version is not an exact semantic version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::telemetry) struct InvalidExactPackageVersion;
+#[derive(thiserror::Error)]
+#[error("package version must be an exact semantic version")]
+pub(in crate::telemetry) struct InvalidExactPackageVersion(#[source] semver::Error);
 
-impl fmt::Display for InvalidExactPackageVersion {
+impl fmt::Debug for InvalidExactPackageVersion {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("package version must be an exact semantic version")
+        fmt::Display::fmt(self, formatter)
     }
 }
-
-impl std::error::Error for InvalidExactPackageVersion {}
 
 /// Public package coordinate safe to place in telemetry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -207,39 +206,17 @@ impl IdentityDimension for PublicPackageCoordinate {
 }
 
 /// Error returned when a public package coordinate has an invalid component.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error)]
 pub(in crate::telemetry) enum InvalidPublicPackageCoordinate {
-    Name(PublicPackageNameError),
-    Version(InvalidExactPackageVersion),
+    #[error("invalid public package name: {0}")]
+    Name(#[from] PublicPackageNameError),
+    #[error("invalid public package version: {0}")]
+    Version(#[from] InvalidExactPackageVersion),
 }
 
-impl From<PublicPackageNameError> for InvalidPublicPackageCoordinate {
-    fn from(error: PublicPackageNameError) -> Self {
-        Self::Name(error)
-    }
-}
-
-impl From<InvalidExactPackageVersion> for InvalidPublicPackageCoordinate {
-    fn from(error: InvalidExactPackageVersion) -> Self {
-        Self::Version(error)
-    }
-}
-
-impl fmt::Display for InvalidPublicPackageCoordinate {
+impl fmt::Debug for InvalidPublicPackageCoordinate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Name(error) => write!(formatter, "invalid public package name: {error}"),
-            Self::Version(error) => write!(formatter, "invalid public package version: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for InvalidPublicPackageCoordinate {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Name(error) => Some(error),
-            Self::Version(error) => Some(error),
-        }
+        fmt::Display::fmt(self, formatter)
     }
 }
 
@@ -258,24 +235,28 @@ strict_versioned_row! {
 
 impl PackageResolutionV1 {
     /// Create a record for one eligible public resolution-input package.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns the parser error when the build's version is not valid semantic
+    /// versioning.
     pub(in crate::telemetry) fn new(
         observation: &BoundRecordingObservation<'_>,
         package: PublicPackageCoordinate,
         extension_match: ExtensionMatch,
-    ) -> Self {
+    ) -> Result<Self, semver::Error> {
         let package_subject = observation.identifier_window_scope().derive(&package);
 
-        Self {
+        Ok(Self {
             version: SchemaVersion::V1,
             kind: Self::KIND,
             event_id: EventId::new(),
             day: observation.day(),
-            symposium: SymposiumVersion::current(),
+            symposium: SymposiumVersion::current()?,
             package,
             extension_match,
             package_subject,
-        }
+        })
     }
 }
 
@@ -312,6 +293,7 @@ mod tests {
                 .unwrap(),
             ExtensionMatch::Public,
         )
+        .unwrap()
     }
 
     #[test]
@@ -422,11 +404,45 @@ mod tests {
         let cases = ["", "*", "^1.2.3", "1.2", "01.2.3", "1.2.3.4"];
 
         for value in cases {
-            assert_eq!(
-                value.parse::<ExactPackageVersion>(),
-                Err(InvalidExactPackageVersion)
-            );
+            assert!(value.parse::<ExactPackageVersion>().is_err());
         }
+    }
+
+    #[test]
+    fn invalid_package_version_preserves_its_parser_source_without_exposing_input() {
+        let canary = "private-package-version-canary";
+        let error = canary.parse::<ExactPackageVersion>().unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "package version must be an exact semantic version"
+        );
+        assert!(!error.to_string().contains(canary));
+        assert!(!format!("{error:?}").contains(canary));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<semver::Error>()
+        );
+
+        let coordinate_error =
+            PublicPackageCoordinate::try_new(PackageEcosystem::Cargo, "example-runtime", canary)
+                .unwrap_err();
+        let version_error = std::error::Error::source(&coordinate_error)
+            .unwrap()
+            .downcast_ref::<InvalidExactPackageVersion>()
+            .unwrap();
+
+        assert_eq!(
+            coordinate_error.to_string(),
+            "invalid public package version: package version must be an exact semantic version"
+        );
+        assert!(!format!("{coordinate_error:?}").contains(canary));
+        assert!(
+            std::error::Error::source(version_error)
+                .unwrap()
+                .is::<semver::Error>()
+        );
     }
 
     #[test]
@@ -441,18 +457,16 @@ mod tests {
 
         assert_eq!(coordinate.name().as_str(), "example-runtime");
         assert_eq!(coordinate.version().to_string(), "1.2.3");
-        assert_eq!(
+        assert!(matches!(
             invalid_name,
             Err(InvalidPublicPackageCoordinate::Name(
                 PublicPackageNameError::UnsupportedCharacter
             ))
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             invalid_version,
-            Err(InvalidPublicPackageCoordinate::Version(
-                InvalidExactPackageVersion
-            ))
-        );
+            Err(InvalidPublicPackageCoordinate::Version(_))
+        ));
     }
 
     #[test]
@@ -540,7 +554,7 @@ mod tests {
         assert_eq!(row.kind, RowKind::PackageResolution);
         assert_eq!(row.event_id.0.get_version(), Some(uuid::Version::Random));
         assert_eq!(row.day, expected_day);
-        assert_eq!(row.symposium, SymposiumVersion::current());
+        assert_eq!(row.symposium, SymposiumVersion::current().unwrap());
         assert_eq!(row.package.ecosystem(), PackageEcosystem::Cargo);
         assert_eq!(row.package.name().as_str(), "example-runtime");
         assert_eq!(row.package.version().to_string(), "1.2.3");

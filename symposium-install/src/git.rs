@@ -283,15 +283,6 @@ struct GitHubClient {
 }
 
 impl GitHubClient {
-    // Compatibility constructor removed with the infallible public APIs in installer 0.2.
-    fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent("cargo-agents")
-            .build()
-            .expect("failed to build HTTP client");
-        Self { client }
-    }
-
     fn try_new() -> Result<Self, GitError> {
         reqwest::Client::builder()
             .user_agent("cargo-agents")
@@ -407,6 +398,9 @@ impl GitCacheManager {
     ///
     /// Retained through installer 0.2; maintained callers should use
     /// [`Self::try_new`] to report HTTP-client construction failures.
+    ///
+    /// # Panics
+    /// Panics if the HTTP client cannot be constructed.
     pub fn new(ctx: &InstallContext, subdir: &str) -> Self {
         Self::from_cache_dir(&ctx.cache_dir().join(subdir))
     }
@@ -428,10 +422,24 @@ impl GitCacheManager {
     ///
     /// This legacy constructor retains its historical client-construction panic
     /// through installer 0.2. Prefer [`Self::try_from_cache_dir`].
+    ///
+    /// # Panics
+    /// Panics if the HTTP client cannot be constructed.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::expect_used,
+            reason = "Legacy infallible public constructor retained until installer 0.2; use try_from_cache_dir"
+        )
+    )]
     pub fn from_cache_dir(cache_dir: &Path) -> Self {
+        let client = reqwest::Client::builder()
+            .user_agent("cargo-agents")
+            .build()
+            .expect("failed to build HTTP client");
         Self {
             cache_dir: cache_dir.to_path_buf(),
-            client: GitHubClient::new(),
+            client: GitHubClient { client },
         }
     }
 

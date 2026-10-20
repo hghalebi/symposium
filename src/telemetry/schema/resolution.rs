@@ -161,7 +161,9 @@ impl ResolutionSummaryV1 {
     /// # Errors
     ///
     /// Returns [`ResolutionSummaryError::UnnamedPackageCountOverflow`] when
-    /// the unnamed-package reason counters cannot be represented by `u64`.
+    /// the unnamed-package reason counters cannot be represented by `u64`, or
+    /// [`ResolutionSummaryError::SymposiumVersion`] when the build's version
+    /// is not valid semantic versioning.
     pub(in crate::telemetry) fn new(
         observation: &BoundRecordingObservation<'_>,
         fields: ResolutionSummaryFields<'_>,
@@ -176,7 +178,8 @@ impl ResolutionSummaryV1 {
             kind: Self::KIND,
             event_id: EventId::new(),
             day: observation.day(),
-            symposium: SymposiumVersion::current(),
+            symposium: SymposiumVersion::current()
+                .map_err(ResolutionSummaryError::SymposiumVersion)?,
             trigger: fields.trigger,
             outcome: fields.outcome,
             duration_ms: fields.duration_ms,
@@ -195,28 +198,22 @@ impl ResolutionSummaryV1 {
     }
 }
 
-/// Invalid relationship between fields in a resolution summary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Error constructing or validating a resolution summary.
+#[derive(thiserror::Error)]
 pub(in crate::telemetry) enum ResolutionSummaryError {
+    #[error("unnamed package reason counters overflow u64")]
     UnnamedPackageCountOverflow,
+    #[error("stored unnamed package count {stored} does not match derived reason count {derived}")]
     UnnamedPackageCountMismatch { stored: u64, derived: u64 },
+    #[error("invalid Symposium version for resolution summary")]
+    SymposiumVersion(#[source] semver::Error),
 }
 
-impl fmt::Display for ResolutionSummaryError {
+impl fmt::Debug for ResolutionSummaryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnnamedPackageCountOverflow => {
-                formatter.write_str("unnamed package reason counters overflow u64")
-            }
-            Self::UnnamedPackageCountMismatch { stored, derived } => write!(
-                formatter,
-                "stored unnamed package count {stored} does not match derived reason count {derived}"
-            ),
-        }
+        fmt::Display::fmt(self, formatter)
     }
 }
-
-impl std::error::Error for ResolutionSummaryError {}
 
 fn validate_resolution_summary(raw: &RawResolutionSummaryV1) -> Result<(), ResolutionSummaryError> {
     let derived = raw
@@ -300,7 +297,7 @@ mod tests {
             kind: RowKind::ResolutionSummary,
             event_id: EventId::new(),
             day: summary_day(),
-            symposium: SymposiumVersion::current(),
+            symposium: SymposiumVersion::current().unwrap(),
             trigger: ResolutionTrigger::SessionStart,
             outcome: ResolutionOutcome::Ok,
             duration_ms: 142,
@@ -330,7 +327,7 @@ mod tests {
         assert_eq!(row.kind, RowKind::ResolutionSummary);
         assert_eq!(row.event_id.0.get_version(), Some(uuid::Version::Random));
         assert_eq!(row.day, summary_day());
-        assert_eq!(row.symposium, SymposiumVersion::current());
+        assert_eq!(row.symposium, SymposiumVersion::current().unwrap());
         assert_eq!(row.trigger, fields.trigger);
         assert_eq!(row.outcome, fields.outcome);
         assert_eq!(row.duration_ms, fields.duration_ms);
@@ -359,9 +356,28 @@ mod tests {
 
         let result = resolution_summary(fields);
 
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(ResolutionSummaryError::UnnamedPackageCountOverflow)
+        ));
+    }
+
+    #[test]
+    fn resolution_summary_version_error_preserves_its_source_without_exposing_input() {
+        let canary = "private-resolution-version-canary";
+        let source = semver::Version::parse(canary).unwrap_err();
+        let error = ResolutionSummaryError::SymposiumVersion(source);
+
+        assert_eq!(
+            error.to_string(),
+            "invalid Symposium version for resolution summary"
+        );
+        assert!(!error.to_string().contains(canary));
+        assert!(!format!("{error:?}").contains(canary));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<semver::Error>()
         );
     }
 
@@ -419,13 +435,13 @@ mod tests {
 
         let result = validate_resolution_summary(&raw);
 
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(ResolutionSummaryError::UnnamedPackageCountMismatch {
                 stored: 20,
                 derived: 21,
             })
-        );
+        ));
     }
 
     #[test]
@@ -439,10 +455,10 @@ mod tests {
 
         let result = validate_resolution_summary(&raw);
 
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(ResolutionSummaryError::UnnamedPackageCountOverflow)
-        );
+        ));
     }
 
     #[test]
@@ -591,7 +607,7 @@ mod tests {
 
             let recorded = reasons.checked_record(reason);
 
-            assert_eq!(recorded, Ok(()));
+            assert!(recorded.is_ok());
             assert_eq!(reasons, expected);
         }
     }
@@ -606,10 +622,10 @@ mod tests {
 
         let recorded = reasons.checked_record(UnnamedPackageReason::PrivateRegistry);
 
-        assert_eq!(
+        assert!(matches!(
             recorded,
             Err(ResolutionSummaryError::UnnamedPackageCountOverflow)
-        );
+        ));
         assert_eq!(reasons, before);
     }
 

@@ -27,9 +27,11 @@ pub(in crate::telemetry) use plugin_hook::{
     PluginHookAttribution, PluginHookOutcome, PluginScope, PublicPluginCoordinate,
 };
 
-use std::{fmt, num::NonZeroU64, str::FromStr, sync::LazyLock};
+use std::{fmt, num::NonZeroU64, str::FromStr};
 
-use chrono::{DateTime, NaiveDate, SecondsFormat, Timelike, Utc};
+#[cfg(test)]
+use chrono::Timelike;
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use semver::Version;
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
@@ -183,28 +185,31 @@ impl fmt::Display for UtcDay {
 }
 
 /// A string that is not a canonical UTC calendar day.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct InvalidUtcDay;
-
-impl fmt::Display for InvalidUtcDay {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("expected a UTC day in YYYY-MM-DD form")
-    }
+#[derive(thiserror::Error)]
+pub(super) enum InvalidUtcDay {
+    #[error("expected a UTC day in YYYY-MM-DD form")]
+    Shape,
+    #[error("expected a UTC day in YYYY-MM-DD form")]
+    Parse(#[source] chrono::ParseError),
 }
 
-impl std::error::Error for InvalidUtcDay {}
+impl fmt::Debug for InvalidUtcDay {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
 
 impl FromStr for UtcDay {
     type Err = InvalidUtcDay;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if !has_utc_day_shape(value) {
-            return Err(InvalidUtcDay);
+            return Err(InvalidUtcDay::Shape);
         }
 
         NaiveDate::parse_from_str(value, "%Y-%m-%d")
             .map(Self)
-            .map_err(|_| InvalidUtcDay)
+            .map_err(InvalidUtcDay::Parse)
     }
 }
 
@@ -283,7 +288,7 @@ impl TryFrom<i64> for CohortDay {
             return Err(CohortDayOutOfRange(value));
         }
 
-        let value = u8::try_from(value).expect("BUG: a validated return-cohort day must fit in u8");
+        let value = u8::try_from(value).map_err(|_| CohortDayOutOfRange(value))?;
         Ok(Self(value))
     }
 }
@@ -313,6 +318,7 @@ pub(super) struct UtcSecond(DateTime<Utc>);
 
 impl UtcSecond {
     /// Convert a UTC timestamp, discarding any subsecond precision.
+    #[cfg(test)]
     pub(super) fn from_datetime(timestamp: DateTime<Utc>) -> Self {
         Self(
             timestamp
@@ -365,15 +371,14 @@ impl<'de> Deserialize<'de> for UtcSecond {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct SymposiumVersion(Version);
 
-static CURRENT_SYMPOSIUM_VERSION: LazyLock<Version> = LazyLock::new(|| {
-    Version::parse(env!("CARGO_PKG_VERSION"))
-        .expect("BUG: Cargo package version must be valid semantic versioning")
-});
-
 impl SymposiumVersion {
     /// Return the version of the running Symposium binary.
-    pub(super) fn current() -> Self {
-        Self(CURRENT_SYMPOSIUM_VERSION.clone())
+    ///
+    /// # Errors
+    ///
+    /// Returns the semantic-version parse error if the package version is invalid.
+    pub(super) fn current() -> Result<Self, semver::Error> {
+        Version::parse(env!("CARGO_PKG_VERSION")).map(Self)
     }
 }
 
@@ -409,16 +414,22 @@ strict_versioned_row! {
 
 impl StorageLimitV1 {
     /// Create a marker for an operation rejected by the daily storage limit.
-    #[must_use]
-    pub(super) fn new(day: UtcDay, dropped_operation: DroppedOperation) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns the semantic-version parse error if the package version is invalid.
+    pub(super) fn new(
+        day: UtcDay,
+        dropped_operation: DroppedOperation,
+    ) -> Result<Self, semver::Error> {
+        Ok(Self {
             version: SchemaVersion::V1,
             kind: Self::KIND,
             event_id: EventId::new(),
             day,
-            symposium: SymposiumVersion::current(),
+            symposium: SymposiumVersion::current()?,
             dropped_operation,
-        }
+        })
     }
 }
 
@@ -688,6 +699,36 @@ mod tests {
     }
 
     #[test]
+    fn utc_day_calendar_error_preserves_its_parser_source() {
+        use std::error::Error as _;
+
+        let error = "2099-99-99".parse::<UtcDay>().unwrap_err();
+
+        assert!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<chrono::ParseError>()
+                .is_some()
+        );
+        assert_eq!(error.to_string(), "expected a UTC day in YYYY-MM-DD form");
+        assert_eq!(format!("{error:?}"), error.to_string());
+        assert!(!error.to_string().contains("2099-99-99"));
+    }
+
+    #[test]
+    fn utc_day_shape_error_does_not_retain_private_input() {
+        use std::error::Error as _;
+
+        let error = "private-day-canary".parse::<UtcDay>().unwrap_err();
+
+        assert!(matches!(error, InvalidUtcDay::Shape));
+        assert!(error.source().is_none());
+        assert_eq!(error.to_string(), "expected a UTC day in YYYY-MM-DD form");
+        assert!(!format!("{error:?}").contains("private-day-canary"));
+    }
+
+    #[test]
     fn utc_day_rejects_noncanonical_shapes() {
         for value in ["2026-8-03", "2026-08-3", "+2026-08-03", "2026/08/03"] {
             let json = format!(r#""{value}""#);
@@ -722,7 +763,7 @@ mod tests {
 
     #[test]
     fn cohort_day_rejects_values_outside_d0_through_d30() {
-        for value in [-1_i64, 31] {
+        for value in [-1_i64, 31, i64::MIN, i64::MAX] {
             let error = CohortDay::try_from(value).unwrap_err();
 
             assert_eq!(
@@ -821,7 +862,7 @@ mod tests {
 
     #[test]
     fn current_symposium_version_uses_package_version() {
-        let version = SymposiumVersion::current();
+        let version = SymposiumVersion::current().unwrap();
 
         assert_eq!(version.0.to_string(), env!("CARGO_PKG_VERSION"));
     }
@@ -1096,13 +1137,13 @@ mod tests {
     fn new_storage_limit_uses_fixed_common_fields() {
         let day = UtcDay(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap());
 
-        let row = StorageLimitV1::new(day, DroppedOperation::ManualSync);
+        let row = StorageLimitV1::new(day, DroppedOperation::ManualSync).unwrap();
 
         assert_eq!(row.version, SchemaVersion::V1);
         assert_eq!(row.kind, RowKind::StorageLimit);
         assert_eq!(row.event_id.0.get_version(), Some(uuid::Version::Random));
         assert_eq!(row.day, day);
-        assert_eq!(row.symposium, SymposiumVersion::current());
+        assert_eq!(row.symposium, SymposiumVersion::current().unwrap());
         assert_eq!(row.dropped_operation, DroppedOperation::ManualSync);
     }
 

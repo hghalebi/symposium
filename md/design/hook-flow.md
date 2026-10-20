@@ -151,3 +151,12 @@ writers, child input/block precedence, and bounded bidirectional pipe pressure.
 Startup regressions cover configuration/logging failures for all five registered
 hook agents, including a closed diagnostic stream. These tests use synthetic
 input and local child processes; they do not qualify live-agent behavior.
+
+
+Applicable tool matchers use the SDK's checked regex operation. An invalid
+pattern is a typed hook failure and follows the existing native permission-denial
+policy; its pattern is absent from diagnostics. A foreign agent format is
+filtered before evaluating its tool matcher. Optional prewarming, hints and
+cache maintenance diagnose failures without claiming successful persistence.
+Workspace freshness uses checked input probes: failed reads cannot equal
+missing timestamps and suppress a required sync.

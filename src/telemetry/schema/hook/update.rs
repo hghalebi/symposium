@@ -46,6 +46,7 @@ impl HookMetricsV1 {
     ///
     /// # Errors
     ///
+    /// Construction fails if the build version is not valid SemVer.
     /// Returns [`HookMetricsUpdateError`] when any counter cannot represent
     /// the observation or the supplied context does not select this row.
     #[must_use = "a failed hook metric update must be dropped"]
@@ -54,13 +55,14 @@ impl HookMetricsV1 {
         observation: HookMetricObservation<'_>,
         session_counts: &mut HookSessionCountTracker<HookMetricsKey>,
     ) -> Result<Self, HookMetricsUpdateError> {
+        let symposium = SymposiumVersion::current().map_err(HookMetricsUpdateError::Version)?;
         let key = HookMetricsKey::new(recording, observation.agent, observation.hook);
         let mut row = Self {
             version: SchemaVersion::V1,
             kind: Self::KIND,
             event_id: EventId::new(),
             day: recording.day(),
-            symposium: SymposiumVersion::current(),
+            symposium,
             agent: observation.agent,
             hook: observation.hook,
             invocations: 0,
@@ -194,27 +196,41 @@ impl HookMetricsV1 {
 }
 
 /// A hook aggregate update that cannot be represented safely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error)]
 pub(in crate::telemetry) enum HookMetricsUpdateError {
+    #[error("invalid Symposium build version")]
+    Version(#[source] semver::Error),
+    #[error("hook metrics row belongs to {row_day}, not observed day {observation_day}")]
     DayChanged {
         row_day: UtcDay,
         observation_day: UtcDay,
     },
+    #[error("hook observation targets another agent or hook surface")]
     TargetChanged,
+    #[error("hook observation belongs to another identifier epoch")]
     IdentifierEpochChanged,
+    #[error("hook session tracker belongs to another aggregate")]
     SessionTrackerChanged,
+    #[error("hook invocation count overflows u64")]
     InvocationCountOverflow,
-    OutcomeCountOverflow {
-        outcome: HookOutcome,
-    },
+    #[error("{} hook outcome counter overflows u64", .outcome.counter_name())]
+    OutcomeCountOverflow { outcome: HookOutcome },
+    #[error("attempted plugin hook count overflows u64")]
     PluginAttemptCountOverflow,
+    #[error("completed plugin hook count overflows u64")]
     PluginCompletionCountOverflow,
-    CompletedPluginsExceedAttempts {
-        attempted: u64,
-        completed: u64,
-    },
-    Duration(LatencyHistogramError),
-    SessionCounts(HookSessionCountUpdateError),
+    #[error("completed plugin hooks {completed} exceed {attempted} attempted plugin hooks")]
+    CompletedPluginsExceedAttempts { attempted: u64, completed: u64 },
+    #[error("{0}")]
+    Duration(#[source] LatencyHistogramError),
+    #[error("{0}")]
+    SessionCounts(#[source] HookSessionCountUpdateError),
+}
+
+impl fmt::Debug for HookMetricsUpdateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
 }
 
 impl From<HookOutcomeCounterOverflow> for HookMetricsUpdateError {
@@ -236,54 +252,6 @@ impl From<HookSessionCountUpdateError> for HookMetricsUpdateError {
         Self::SessionCounts(error)
     }
 }
-
-impl fmt::Display for HookMetricsUpdateError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DayChanged {
-                row_day,
-                observation_day,
-            } => write!(
-                formatter,
-                "hook metrics row belongs to {row_day}, not observed day {observation_day}"
-            ),
-            Self::TargetChanged => {
-                formatter.write_str("hook observation targets another agent or hook surface")
-            }
-            Self::IdentifierEpochChanged => {
-                formatter.write_str("hook observation belongs to another identifier epoch")
-            }
-            Self::SessionTrackerChanged => {
-                formatter.write_str("hook session tracker belongs to another aggregate")
-            }
-            Self::InvocationCountOverflow => {
-                formatter.write_str("hook invocation count overflows u64")
-            }
-            Self::OutcomeCountOverflow { outcome } => write!(
-                formatter,
-                "{} hook outcome counter overflows u64",
-                outcome.counter_name()
-            ),
-            Self::PluginAttemptCountOverflow => {
-                formatter.write_str("attempted plugin hook count overflows u64")
-            }
-            Self::PluginCompletionCountOverflow => {
-                formatter.write_str("completed plugin hook count overflows u64")
-            }
-            Self::CompletedPluginsExceedAttempts {
-                attempted,
-                completed,
-            } => write!(
-                formatter,
-                "completed plugin hooks {completed} exceed {attempted} attempted plugin hooks"
-            ),
-            Self::Duration(error) => fmt::Display::fmt(error, formatter),
-            Self::SessionCounts(error) => fmt::Display::fmt(error, formatter),
-        }
-    }
-}
-
-impl std::error::Error for HookMetricsUpdateError {}
 
 #[cfg(test)]
 mod tests {
@@ -337,7 +305,7 @@ mod tests {
         assert_eq!(row.kind, RowKind::HookMetrics);
         assert_eq!(row.event_id.0.get_version(), Some(uuid::Version::Random));
         assert_eq!(row.day, recording.day());
-        assert_eq!(row.symposium, SymposiumVersion::current());
+        assert_eq!(row.symposium, SymposiumVersion::current().unwrap());
         assert_eq!(row.agent, HookAgent::Claude);
         assert_eq!(row.hook, HookSurface::PreToolUse);
         assert_eq!(row.invocations, 1);
@@ -415,13 +383,10 @@ mod tests {
         );
 
         assert_eq!(row.invocations, 2);
-        assert_eq!(
-            result,
-            Err(HookMetricsUpdateError::DayChanged {
-                row_day,
-                observation_day: later.day(),
-            })
-        );
+        assert!(matches!(result, Err(HookMetricsUpdateError::DayChanged {
+                row_day: actual_row_day,
+                observation_day,
+            }) if actual_row_day == row_day && observation_day == later.day()));
         assert_eq!(&*tracker, &tracker_before);
     }
 
@@ -560,12 +525,12 @@ mod tests {
             &mut session_counts,
         );
 
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(HookMetricsUpdateError::Duration(
                 LatencyHistogramError::BucketCountOverflow { bucket: 0 }
             ))
-        );
+        ));
         assert_eq!(row, row_before);
         assert_eq!(session_counts, session_counts_before);
     }
@@ -592,7 +557,7 @@ mod tests {
 
         let result = row.checked_record(&recording, wrong_target, &mut session_counts);
 
-        assert_eq!(result, Err(HookMetricsUpdateError::TargetChanged));
+        assert!(matches!(result, Err(HookMetricsUpdateError::TargetChanged)));
         assert_eq!(row, row_before);
         assert_eq!(session_counts, session_counts_before);
     }
@@ -626,13 +591,10 @@ mod tests {
             &mut session_counts,
         );
 
-        assert_eq!(
-            result,
-            Err(HookMetricsUpdateError::DayChanged {
-                row_day: row_before.day,
-                observation_day: later.day(),
-            })
-        );
+        assert!(matches!(result, Err(HookMetricsUpdateError::DayChanged {
+                row_day,
+                observation_day,
+            }) if row_day == row_before.day && observation_day == later.day()));
         assert_eq!(row, row_before);
         assert_eq!(session_counts, session_counts_before);
     }
@@ -665,7 +627,10 @@ mod tests {
             &mut session_counts,
         );
 
-        assert_eq!(result, Err(HookMetricsUpdateError::IdentifierEpochChanged));
+        assert!(matches!(
+            result,
+            Err(HookMetricsUpdateError::IdentifierEpochChanged)
+        ));
         assert_eq!(row, row_before);
         assert_eq!(session_counts, session_counts_before);
     }
@@ -700,7 +665,10 @@ mod tests {
             &mut post_tool_tracker,
         );
 
-        assert_eq!(result, Err(HookMetricsUpdateError::SessionTrackerChanged));
+        assert!(matches!(
+            result,
+            Err(HookMetricsUpdateError::SessionTrackerChanged)
+        ));
         assert_eq!(pre_tool_row, row_before);
         assert_eq!(post_tool_tracker, tracker_before);
     }
@@ -720,13 +688,13 @@ mod tests {
 
         let result = HookMetricsV1::new(&recording, input, &mut session_counts);
 
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(HookMetricsUpdateError::CompletedPluginsExceedAttempts {
                 attempted: 0,
                 completed: 1,
             })
-        );
+        ));
         assert_eq!(session_counts, session_counts_before);
     }
 
@@ -752,14 +720,32 @@ mod tests {
 
         let result = row.checked_record(&recording, impossible, &mut session_counts);
 
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(HookMetricsUpdateError::CompletedPluginsExceedAttempts {
                 attempted: 0,
                 completed: 2,
             })
-        );
+        ));
         assert_eq!(row, row_before);
         assert_eq!(session_counts, session_counts_before);
+    }
+
+    #[test]
+    fn version_error_preserves_source_without_exposing_it_in_the_diagnostic() {
+        const CANARY: &str = "☃";
+        let source = semver::Version::parse(CANARY).unwrap_err();
+        assert!(source.to_string().contains(CANARY));
+        assert!(format!("{source:?}").contains(CANARY));
+        let error = HookMetricsUpdateError::Version(source);
+
+        assert_eq!(error.to_string(), "invalid Symposium build version");
+        assert_eq!(format!("{error:?}"), error.to_string());
+        assert!(!format!("{error:?}").contains(CANARY));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<semver::Error>()
+        );
     }
 }

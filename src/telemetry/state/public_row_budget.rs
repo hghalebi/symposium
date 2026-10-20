@@ -56,10 +56,7 @@ impl DailyPublicRowBudget {
             return PublicRowAdmission::Overflow;
         }
 
-        self.admitted = self
-            .admitted
-            .checked_add(1)
-            .expect("BUG: the public-row allowance is bounded before incrementing");
+        self.admitted += 1;
         PublicRowAdmission::Public
     }
 

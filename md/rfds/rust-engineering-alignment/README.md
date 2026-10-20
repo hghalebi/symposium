@@ -413,6 +413,13 @@ fault-injected; entered-runtime rejection and I/O failures are exercised.
 
 ### Step 7: Finish enum, visibility, and production-path alignment
 
+Status: completed locally; exact-checkpoint hosted qualification follows the push.
+Step 6 checkpoint: `2fe02e9fbdd3691b68747d0f7b0933c9c8b069bc`.
+Production lint guards are introduced with this repair step so each scoped
+legacy expectation is checked immediately. Step 8 will enforce those guards in
+hosted CI. Closed predicate introspection and several adjacent assertions were
+already repaired while their Step 6 validation boundaries were owned.
+
 Enumerate closed `Predicate` variants in dependency-introspection helpers and
 add table coverage for existing/nested variants. Preserve required fallbacks for
 external non-exhaustive enums. Map library and integration-test callers before
@@ -426,8 +433,58 @@ identity model. Keep test-only conveniences separate from production lint scopes
 Tests: predicate behavior, affected external/test consumers, remaining boundary
 failure cases, and the supported workspace feature matrix. Update module docs.
 
-- [ ] No remaining production panic/error-discard site is left unclassified or unresolved.
-- [ ] Visibility and trait bounds reflect real callers; no speculative abstractions added.
+- [x] Remaining production panic/error-discard sites have explicit failure policies or supported, versioned compatibility contracts.
+- [x] Visibility and trait bounds reflect real callers; no speculative abstractions added.
+
+Observed: formatting, locked workspace/all-target compilation, warnings-denied
+Clippy, 1,312 local tests, orphan checks, rendered mdbook and diff checks pass.
+All 12 standalone SDK/installer minimal and `clap` check, Clippy and library-test
+gates also pass. Required workspace resolution distinguishes absence from failed discovery;
+optional caches diagnose failures without falsely recording a successful write.
+Malformed operational state is preserved. The legacy state updater still returns
+a successfully read previous version when its best-effort save fails.
+
+Skill replacement prepares complete content and managed metadata before moving
+the installed copy. Ordinary publication failures restore that copy; failed
+rollback retains a named recovery backup. This is not a crash-safe transaction
+or a lock against concurrent sync processes. Native matchers preserve concrete
+regex causes and fail closed for permission events; foreign hook formats are
+filtered before matching. Telemetry golden identities and formats remain stable,
+with exact HMAC-equivalence and rejected-transition state-preservation tests.
+
+Prediction versus observation: source-aware guards exposed eight unfulfilled
+expectations inside macro-generated serializers. A single ordinary legacy
+helper makes the actual operation visible to Clippy without broad allowances.
+The full suite also exposed existing advisory-lock contention after unwinding.
+A real filesystem probe reproduced a lock surviving through a duplicate handle;
+explicit unlock on guard drop fixes that mechanism. Normal-drop and unwinding
+regressions reacquire immediately while retaining the duplicate. Attribution to
+a particular concurrent fork remains an inference. Compatibility review found
+and repaired the previous-version return-value issue before this checkpoint.
+
+#### Versioned compatibility exceptions
+
+The production roots deny explicit unwrap/expect/panic/todo/unimplemented/
+unreachable lints outside test builds. They supplement review of assertions,
+indexing, external implementations and macro-generated operations; they are not
+a proof of universal panic freedom. There are 43 function-scoped expectations:
+40 root and three installer, none SDK. No module-wide panic allowance is added.
+
+| Existing public contract | Retained scope | Checked replacement / removal boundary |
+| --- | --- | --- |
+| Startup, directories, logging and output capture | Four root expectations for old infallible methods; logging also retains its subscriber initialization panic. | Corresponding `try_*` methods; root 0.6. |
+| Agent skill paths | Two documented unsafe-name assertions; these are separately audited because the selected lints do not catch assertions. | `try_project_skill_dir`, `try_global_skill_dir`; root 0.6. |
+| Built-in native hook translations | 22 wrong-event panic expectations. | Event-checked `try_translate_input`; root 0.6. |
+| Native hook serialization | 14 exact serializer expectations, including the shared legacy helper and trait adapter. | `try_to_hook_output` / `try_respond`; root 0.6. |
+| Installer client and acquired-location methods | Three expectations; old delegating constructors/resolvers document inherited panics. | `try_new`, `try_from_cache_dir`, `try_location`, `try_executable_named`, `try_script_named`; installer 0.2. |
+
+SDK 0.2 adapters preserve published handler generic arity, old predicate errors,
+watcher signatures and invalid-matcher false results without panic exemptions.
+Open legacy trait implementors keep their methods and bounds; a typed default
+cannot make an arbitrary external implementation panic-free. Existing external
+consumer fixtures protect those contracts. Best-effort discovery, help, status,
+telemetry and old cache adapters retain documented diagnostic/partial policies;
+not every `try_*` API makes every optional failure fatal.
 
 ### Step 8: Enforce the verified contract in CI
 

@@ -545,6 +545,20 @@ pub enum LoggingError {
     },
 }
 
+// Legacy infallible APIs keep their return contracts while diagnosing failed effects.
+fn create_legacy_directory(path: &Path) {
+    if let Err(error) = fs::create_dir_all(path) {
+        let diagnostic_delivery = write_config_warning(format_args!(
+            "warning: legacy directory creation failed ({:?})",
+            error.kind()
+        ));
+        // A failed final stderr channel cannot carry its own delivery diagnostic.
+        if let Err(source) = diagnostic_delivery {
+            tracing::warn!(error_kind = ?source.kind(), "failed to deliver legacy directory warning");
+        }
+    }
+}
+
 /// Full application context: parsed config + resolved directory paths.
 ///
 /// Thread `&Symposium` through all call sites instead of using global state.
@@ -565,11 +579,21 @@ impl Symposium {
     ///
     /// Legacy infallible entry point retained until the root crate's 0.6 release.
     /// New callers should use [`Self::try_from_environment`].
+    ///
+    /// # Panics
+    /// Panics if the home directory is unavailable; use the canonical fallible constructor.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::expect_used,
+            reason = "legacy infallible constructor; removed in root 0.6"
+        )
+    )]
     pub fn from_environment() -> Self {
         let home_dir = dirs::home_dir().expect("could not determine home directory");
         let dirs = crate::dirs::SymposiumDirs::from_environment();
-        let _ = fs::create_dir_all(&dirs.config_dir);
-        let _ = fs::create_dir_all(&dirs.cache_dir);
+        create_legacy_directory(&dirs.config_dir);
+        create_legacy_directory(&dirs.cache_dir);
 
         let config = load_config_from(&dirs.config_dir);
 
@@ -591,12 +615,12 @@ impl Symposium {
     /// New callers should use [`Self::try_from_dir`].
     pub fn from_dir(root: &Path) -> Self {
         let config_dir = root.to_path_buf();
-        let _ = fs::create_dir_all(&config_dir);
+        create_legacy_directory(&config_dir);
 
         let config = load_config_from(&config_dir);
 
         let cache_dir = config_dir.join("cache");
-        let _ = fs::create_dir_all(&cache_dir);
+        create_legacy_directory(&cache_dir);
 
         // In test mode, use the root as the home directory so that
         // global hook registration writes into the tempdir.
@@ -781,6 +805,17 @@ impl Symposium {
     ///
     /// Legacy infallible entry point retained until the root crate's 0.6 release.
     /// New callers should use [`Self::try_init_logging`].
+    ///
+    /// # Panics
+    /// Panics if the log file cannot be opened or a subscriber is already installed.
+    /// Use [`Self::try_init_logging`] for typed failures.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::expect_used,
+            reason = "legacy infallible logging; removed in root 0.6"
+        )
+    )]
     pub fn init_logging(&self, report_layer: Option<crate::report::ReportLayer>) {
         use std::fs::OpenOptions;
         use tracing_subscriber::EnvFilter;
@@ -1053,13 +1088,13 @@ impl Symposium {
     #[cfg(test)]
     pub fn plugins_dir(&self) -> PathBuf {
         let dir = self.dirs.config_dir.join("plugins");
-        let _ = fs::create_dir_all(&dir);
+        create_legacy_directory(&dir);
         dir
     }
 
     fn logs_dir(&self) -> PathBuf {
         let dir = resolve_logs_dir(&self.dirs.config_dir);
-        let _ = fs::create_dir_all(&dir);
+        create_legacy_directory(&dir);
         dir
     }
 

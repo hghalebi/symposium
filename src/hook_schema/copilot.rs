@@ -173,8 +173,14 @@ macro_rules! copilot_output_impl {
                     self.modified_args.as_ref().map(parse_copilot_tool_args),
                 ))
             }
+            /// Legacy infallible serialization retained until root 0.6.
+            ///
+            /// Use [`crate::hook_schema::AgentHookOutput::try_to_hook_output`] for typed failure.
+            ///
+            /// # Panics
+            /// Panics if the output cannot be serialized as JSON.
             fn to_hook_output(&self) -> serde_json::Value {
-                serde_json::to_value(self).unwrap()
+                super::legacy_to_hook_output(self)
             }
             fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
                 self
@@ -208,8 +214,14 @@ macro_rules! copilot_output_impl {
                     self.additional_context.clone(),
                 ))
             }
+            /// Legacy infallible serialization retained until root 0.6.
+            ///
+            /// Use [`crate::hook_schema::AgentHookOutput::try_to_hook_output`] for typed failure.
+            ///
+            /// # Panics
+            /// Panics if the output cannot be serialized as JSON.
             fn to_hook_output(&self) -> serde_json::Value {
-                serde_json::to_value(self).unwrap()
+                super::legacy_to_hook_output(self)
             }
             fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
                 self
@@ -271,6 +283,19 @@ impl AgentHookInput for CopilotPreToolUseInput {
             self.cwd.clone(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::PreToolUse(p) = event else {
             panic!("wrong event type")
@@ -344,6 +369,19 @@ impl AgentHookInput for CopilotPostToolUseInput {
             self.cwd.clone(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::PostToolUse(p) = event else {
             panic!("wrong event type")
@@ -406,6 +444,19 @@ impl AgentHookInput for CopilotUserPromptSubmitInput {
             self.cwd.clone(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::UserPromptSubmit(p) = event else {
             panic!("wrong event type")
@@ -467,6 +518,19 @@ impl AgentHookInput for CopilotSessionStartInput {
             self.cwd.clone(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::SessionStart(p) = event else {
             panic!("wrong event type")

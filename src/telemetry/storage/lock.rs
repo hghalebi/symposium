@@ -11,10 +11,19 @@ use std::fs;
 
 use super::paths::StoragePaths;
 
-/// Owns the telemetry lock for the lifetime of the underlying file handle.
+/// Owns the telemetry lock until this guard is dropped.
 #[derive(Debug)]
 pub(super) struct TelemetryLock {
-    _file: File,
+    file: File,
+}
+
+impl Drop for TelemetryLock {
+    fn drop(&mut self) {
+        // Closing only this descriptor leaves the lock held by inherited duplicates.
+        if let Err(error) = self.file.unlock() {
+            tracing::warn!(operation = "unlock", category = ?error.kind(), "telemetry: failed to release lock");
+        }
+    }
 }
 
 /// Failure to prepare or acquire the telemetry lock.
@@ -72,7 +81,7 @@ impl TelemetryLock {
         let file = open_private_lock_file(paths.lock_file())?;
         file.try_lock()?;
 
-        Ok(Self { _file: file })
+        Ok(Self { file })
     }
 }
 
@@ -159,6 +168,46 @@ mod tests {
 
         assert!(panic.is_err());
         let _reacquired = TelemetryLock::try_acquire(&paths).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_holder_releases_the_lock_while_a_duplicate_survives() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = StoragePaths::new(temporary.path());
+        let held = TelemetryLock::try_acquire(&paths).unwrap();
+        let duplicate = held.file.try_clone().unwrap();
+
+        drop(held);
+
+        let _reacquired = TelemetryLock::try_acquire(&paths).unwrap();
+        drop(duplicate);
+        assert!(matches!(
+            TelemetryLock::try_acquire(&paths),
+            Err(LockError::Contended)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unwinding_releases_the_lock_while_a_duplicate_survives() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = StoragePaths::new(temporary.path());
+        let held = TelemetryLock::try_acquire(&paths).unwrap();
+        let duplicate = held.file.try_clone().unwrap();
+
+        let panic = std::panic::catch_unwind(move || {
+            let _held = held;
+            panic!("test panic while a duplicate lock handle survives");
+        });
+
+        assert!(panic.is_err());
+        let _reacquired = TelemetryLock::try_acquire(&paths).unwrap();
+        drop(duplicate);
+        assert!(matches!(
+            TelemetryLock::try_acquire(&paths),
+            Err(LockError::Contended)
+        ));
     }
 
     #[test]

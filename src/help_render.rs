@@ -6,7 +6,7 @@
 //! If clap's format ever drifts and a slice marker isn't found, we fall back to clap's unmodified help rather than panic.
 //!
 
-use std::{fmt::Write as _, path::Path};
+use std::path::Path;
 
 use clap::{Command, CommandFactory};
 
@@ -181,19 +181,19 @@ fn render(plugins: &[Plugin], deps: &[PackageId], used: &[&str]) -> String {
 
     let mut out = String::new();
     out.push_str(header);
-    writeln!(out).unwrap();
+    out.push('\n');
 
     // Commands for Humans
-    writeln!(out, "{HUMANS_HEADING}:").unwrap();
+    out.push_str(&format!("{HUMANS_HEADING}:\n"));
     for (name, desc) in &humans {
-        writeln!(out, "{name:<col_width$}{desc}").unwrap();
+        out.push_str(&format!("{name:<col_width$}{desc}\n"));
     }
-    writeln!(out).unwrap();
+    out.push('\n');
 
     // Commands for Agents
-    writeln!(out, "{AGENTS_HEADING}:").unwrap();
+    out.push_str(&format!("{AGENTS_HEADING}:\n"));
     for (name, desc) in &agents {
-        writeln!(out, "{name:<col_width$}{desc}").unwrap();
+        out.push_str(&format!("{name:<col_width$}{desc}\n"));
     }
     out.push_str(options);
 

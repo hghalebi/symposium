@@ -40,6 +40,7 @@ impl PluginHookMetricsV1 {
     ///
     /// # Errors
     ///
+    /// Construction fails if the build version is not valid SemVer.
     /// Returns [`PluginHookMetricsUpdateError`] when any counter cannot
     /// represent the attempt or the supplied context selects another row.
     #[must_use = "a failed plugin-hook metric update must be dropped"]
@@ -48,13 +49,15 @@ impl PluginHookMetricsV1 {
         observation: PluginHookMetricObservation<'_>,
         selected: SelectedPluginHookAggregate<'_>,
     ) -> Result<Self, PluginHookMetricsUpdateError> {
+        let symposium =
+            SymposiumVersion::current().map_err(PluginHookMetricsUpdateError::Version)?;
         let bucket = selected.bucket();
         let mut row = Self {
             version: SchemaVersion::V1,
             kind: Self::KIND,
             event_id: selected.event_id(),
             day: selected.day(),
-            symposium: SymposiumVersion::current(),
+            symposium,
             agent: selected.agent(),
             hook: selected.surface(),
             plugin_scope: bucket.scope(),
@@ -183,24 +186,41 @@ impl PluginHookMetricsV1 {
 }
 
 /// A plugin-hook aggregate update that cannot be represented safely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error)]
 pub(in crate::telemetry) enum PluginHookMetricsUpdateError {
+    #[error("invalid Symposium build version")]
+    Version(#[source] semver::Error),
+    #[error("plugin-hook recording context changed before update")]
     RecordingContextChanged,
+    #[error("plugin-hook metrics row belongs to {row_day}, not observed day {observation_day}")]
     DayChanged {
         row_day: UtcDay,
         observation_day: UtcDay,
     },
+    #[error("plugin-hook aggregate target changed during update")]
     TargetChanged,
+    #[error("plugin-hook aggregate identity changed during update")]
     PluginIdentityChanged,
+    #[error("plugin-hook private state belongs to another aggregate row")]
     RowIdentifierChanged,
+    #[error("plugin-hook attempt count overflows u64")]
     AttemptCountOverflow,
+    #[error("plugin-hook execution count overflows u64")]
     ExecutionCountOverflow,
-    OutcomeCountOverflow {
-        outcome: PluginHookOutcome,
-    },
-    PrepareDuration(LatencyHistogramError),
-    ExecuteDuration(LatencyHistogramError),
-    SessionCounts(HookSessionCountUpdateError),
+    #[error("{} plugin-hook outcome counter overflows u64", .outcome.counter_name())]
+    OutcomeCountOverflow { outcome: PluginHookOutcome },
+    #[error("{0}")]
+    PrepareDuration(#[source] LatencyHistogramError),
+    #[error("{0}")]
+    ExecuteDuration(#[source] LatencyHistogramError),
+    #[error("{0}")]
+    SessionCounts(#[source] HookSessionCountUpdateError),
+}
+
+impl fmt::Debug for PluginHookMetricsUpdateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
 }
 
 impl From<PluginHookOutcomeCounterOverflow> for PluginHookMetricsUpdateError {
@@ -216,48 +236,6 @@ impl From<HookSessionCountUpdateError> for PluginHookMetricsUpdateError {
         Self::SessionCounts(error)
     }
 }
-
-impl fmt::Display for PluginHookMetricsUpdateError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RecordingContextChanged => {
-                formatter.write_str("plugin-hook recording context changed before update")
-            }
-            Self::DayChanged {
-                row_day,
-                observation_day,
-            } => write!(
-                formatter,
-                "plugin-hook metrics row belongs to {row_day}, not observed day {observation_day}"
-            ),
-            Self::TargetChanged => {
-                formatter.write_str("plugin-hook aggregate target changed during update")
-            }
-            Self::PluginIdentityChanged => {
-                formatter.write_str("plugin-hook aggregate identity changed during update")
-            }
-            Self::RowIdentifierChanged => {
-                formatter.write_str("plugin-hook private state belongs to another aggregate row")
-            }
-            Self::AttemptCountOverflow => {
-                formatter.write_str("plugin-hook attempt count overflows u64")
-            }
-            Self::ExecutionCountOverflow => {
-                formatter.write_str("plugin-hook execution count overflows u64")
-            }
-            Self::OutcomeCountOverflow { outcome } => write!(
-                formatter,
-                "{} plugin-hook outcome counter overflows u64",
-                outcome.counter_name()
-            ),
-            Self::PrepareDuration(error) => error.fmt(formatter),
-            Self::ExecuteDuration(error) => error.fmt(formatter),
-            Self::SessionCounts(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for PluginHookMetricsUpdateError {}
 
 #[cfg(test)]
 mod tests {
@@ -336,7 +314,7 @@ mod tests {
         store: &mut PluginHookAggregateStore,
         attribution: PluginHookAttribution,
         hook: HookSurface,
-        expected: PluginHookMetricsUpdateError,
+        expected: impl FnOnce(&PluginHookMetricsUpdateError) -> bool,
     ) {
         let row_before = row.clone();
         let _ = select_private(store, recording, attribution.clone(), hook);
@@ -345,7 +323,7 @@ mod tests {
 
         let result = row.checked_record(recording, observation, selected);
 
-        assert_eq!(result, Err(expected));
+        assert!(expected(&result.unwrap_err()));
         assert_eq!(*row, row_before);
         assert_eq!(*store, store_before);
     }
@@ -535,7 +513,7 @@ mod tests {
             &mut store,
             second_plugin,
             HookSurface::PreToolUse,
-            PluginHookMetricsUpdateError::PluginIdentityChanged,
+            |error| matches!(error, PluginHookMetricsUpdateError::PluginIdentityChanged),
         );
     }
 
@@ -561,9 +539,14 @@ mod tests {
             &mut store,
             PluginHookAttribution::Unnamed,
             HookSurface::PreToolUse,
-            PluginHookMetricsUpdateError::DayChanged {
-                row_day,
-                observation_day: recording.day(),
+            |error| {
+                matches!(
+                    error,
+                    PluginHookMetricsUpdateError::DayChanged {
+                        row_day: actual_row_day,
+                        observation_day,
+                    } if *actual_row_day == row_day && *observation_day == recording.day()
+                )
             },
         );
     }
@@ -583,7 +566,7 @@ mod tests {
             &mut store,
             PluginHookAttribution::Unnamed,
             HookSurface::PostToolUse,
-            PluginHookMetricsUpdateError::TargetChanged,
+            |error| matches!(error, PluginHookMetricsUpdateError::TargetChanged),
         );
     }
 
@@ -647,10 +630,10 @@ mod tests {
 
         let result = row.checked_record(&recording, observation, selected);
 
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(PluginHookMetricsUpdateError::RowIdentifierChanged)
-        );
+        ));
         assert_eq!(row, row_before);
         assert_eq!(store, store_before);
     }
@@ -678,10 +661,10 @@ mod tests {
 
         let result = row.checked_record(&reset_recording, observation, selected);
 
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(PluginHookMetricsUpdateError::RecordingContextChanged)
-        );
+        ));
         assert_eq!(row, row_before);
         assert_eq!(store, store_before);
     }
@@ -732,13 +715,31 @@ mod tests {
 
         let result = row.checked_record(&recording, second, selected);
 
-        assert_eq!(
+        assert!(matches!(
             result,
             Err(PluginHookMetricsUpdateError::PrepareDuration(
                 LatencyHistogramError::BucketCountOverflow { bucket: 0 }
             ))
-        );
+        ));
         assert_eq!(row, row_before);
         assert_eq!(store, store_before);
+    }
+
+    #[test]
+    fn version_error_preserves_source_without_exposing_it_in_the_diagnostic() {
+        const CANARY: &str = "☃";
+        let source = semver::Version::parse(CANARY).unwrap_err();
+        assert!(source.to_string().contains(CANARY));
+        assert!(format!("{source:?}").contains(CANARY));
+        let error = PluginHookMetricsUpdateError::Version(source);
+
+        assert_eq!(error.to_string(), "invalid Symposium build version");
+        assert_eq!(format!("{error:?}"), error.to_string());
+        assert!(!format!("{error:?}").contains(CANARY));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<semver::Error>()
+        );
     }
 }

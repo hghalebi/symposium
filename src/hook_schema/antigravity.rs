@@ -251,6 +251,19 @@ impl AgentHookInput for AntigravityPreToolUseInput {
             self.common.cwd(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::PreToolUse(p) = event else {
             panic!("wrong event")
@@ -329,6 +342,19 @@ impl AgentHookOutput for AntigravityPreToolUseOutput {
             self.overwrite.clone(),
         ))
     }
+    /// Legacy infallible serialization retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookOutput::try_to_hook_output`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if the output cannot be serialized as JSON.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unwrap_used,
+            reason = "legacy infallible serialization retained until root 0.6; use try_to_hook_output"
+        )
+    )]
     fn to_hook_output(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap()
     }
@@ -379,6 +405,19 @@ impl AgentHookInput for AntigravityPostToolUseInput {
             self.common.cwd(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::PostToolUse(p) = event else {
             panic!("wrong event")
@@ -503,6 +542,19 @@ impl AgentHookInput for AntigravityInvocationInput {
             self.common.cwd(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::UserPromptSubmit(p) = event else {
             panic!("wrong event")
@@ -542,6 +594,19 @@ impl AgentHookInput for AntigravitySessionStartInput {
             self.common.cwd(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::SessionStart(p) = event else {
             panic!("wrong event")
@@ -580,6 +645,19 @@ impl AgentHookOutput for AntigravityInjectStepsOutput {
     fn to_symposium(&self) -> symposium::OutputEvent {
         symposium::OutputEvent::SessionStart(symposium::SessionStartOutput::new(self.context()))
     }
+    /// Legacy infallible serialization retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookOutput::try_to_hook_output`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if the output cannot be serialized as JSON.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unwrap_used,
+            reason = "legacy infallible serialization retained until root 0.6; use try_to_hook_output"
+        )
+    )]
     fn to_hook_output(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap()
     }
@@ -638,6 +716,19 @@ impl AgentHookInput for AntigravityStopInput {
             self.common.cwd(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::Stop(p) = event else {
             panic!("wrong event")
@@ -684,6 +775,19 @@ impl AgentHookOutput for AntigravityStopOutput {
     fn to_symposium(&self) -> symposium::OutputEvent {
         symposium::OutputEvent::Stop(symposium::StopOutput::new(self.reason.clone()))
     }
+    /// Legacy infallible serialization retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookOutput::try_to_hook_output`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if the output cannot be serialized as JSON.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unwrap_used,
+            reason = "legacy infallible serialization retained until root 0.6; use try_to_hook_output"
+        )
+    )]
     fn to_hook_output(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap()
     }

@@ -43,6 +43,23 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
+/// A tool-event matcher is not a valid regular expression.
+///
+/// Display and Debug omit the pattern. The concrete parser source remains
+/// available through [`std::error::Error::source`] and can contain private input.
+#[derive(thiserror::Error)]
+#[error("invalid hook matcher regular expression")]
+pub struct MatcherError {
+    #[source]
+    source: regex::Error,
+}
+
+impl std::fmt::Debug for MatcherError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MatcherError")
+    }
+}
+
 // ── Event types ─────────────────────────────────────────────────────────
 
 /// Agents supported by Symposium hooks.
@@ -166,21 +183,34 @@ impl Input {
 
     /// Check whether this event matches the given matcher string.
     ///
-    /// For tool events (`PreToolUse`, `PostToolUse`), the matcher is a regex
-    /// tested against the tool name. For other events, all matchers match.
-    /// The wildcard `"*"` matches everything.
+    /// For tool events, the matcher is a regex tested against the tool name.
+    /// Other events and the wildcard `"*"` always match. This legacy Boolean
+    /// API returns `false` for an invalid tool-event regex until SDK 0.2; use
+    /// [`Self::try_matches_matcher`] to distinguish that error from a non-match.
     pub fn matches_matcher(&self, matcher: &str) -> bool {
-        if matcher == "*" {
-            return true;
-        }
+        self.try_matches_matcher(matcher).unwrap_or(false)
+    }
 
+    /// Check a tool-name regex without treating invalid syntax as a non-match.
+    ///
+    /// The wildcard `"*"` matches every event. Non-tool events do not inspect
+    /// the pattern and always match, preserving their event-selection contract.
+    ///
+    /// # Errors
+    /// Returns [`MatcherError`] if a tool-event regex cannot be compiled.
+    pub fn try_matches_matcher(&self, matcher: &str) -> Result<bool, MatcherError> {
+        if matcher == "*" {
+            return Ok(true);
+        }
         let tool_name = match self {
             Input::PreToolUse(p) => &p.tool_name,
             Input::PostToolUse(p) => &p.tool_name,
-            Input::UserPromptSubmit(_) | Input::SessionStart(_) | Input::Stop(_) => return true,
+            Input::UserPromptSubmit(_) | Input::SessionStart(_) | Input::Stop(_) => {
+                return Ok(true);
+            }
         };
-
-        regex::Regex::new(matcher).is_ok_and(|re| re.is_match(tool_name))
+        let regex = regex::Regex::new(matcher).map_err(|source| MatcherError { source })?;
+        Ok(regex.is_match(tool_name))
     }
 }
 
@@ -996,6 +1026,31 @@ mod tests {
             .unwrap();
         assert!(Rc::ptr_eq(&source.0, &marker));
         assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn typed_matcher_preserves_valid_matching_and_non_tool_contracts() {
+        let event: Input = serde_json::from_slice(input()).unwrap();
+        assert!(event.try_matches_matcher("^(Bash|Write)$").unwrap());
+        assert!(!event.try_matches_matcher("^Read$").unwrap());
+        assert!(event.try_matches_matcher("*").unwrap());
+        let non_tool = Input::SessionStart(SessionStartInput::new(None, None));
+        assert!(non_tool.try_matches_matcher("(").unwrap());
+    }
+
+    #[test]
+    fn invalid_matcher_has_a_safe_typed_source_and_legacy_false_result() {
+        let event: Input = serde_json::from_slice(input()).unwrap();
+        let pattern = "(PRIVATE_MATCHER_CANARY";
+        let error = event.try_matches_matcher(pattern).unwrap_err();
+        let source = error
+            .source()
+            .unwrap()
+            .downcast_ref::<regex::Error>()
+            .unwrap();
+        assert!(source.to_string().contains("PRIVATE_MATCHER_CANARY"));
+        assert!(!format!("{error} {error:?}").contains("PRIVATE_MATCHER_CANARY"));
+        assert!(!event.matches_matcher(pattern));
     }
 
     #[test]

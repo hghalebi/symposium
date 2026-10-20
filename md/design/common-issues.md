@@ -140,3 +140,41 @@ skills. Registry, dependency, plugin and skill collection failures must reach
 the cleanup decision. Recovery is to repair the reported source, rerun sync,
 and check both the installed content and removal report. Do not delete caches
 or consent records to make an incomplete scan appear empty.
+
+
+## Production lint scope and macro-generated code
+
+Production crate roots deny explicit panic and unwrap lints under `not(test)`.
+The exact legacy infallible methods retain scoped expectations with removal
+versions. An unfulfilled expectation fails strict Clippy, which makes obsolete
+exceptions visible instead of hiding them indefinitely.
+
+Clippy may skip operations inside macro-generated bodies. If an audited legacy
+macro needs a common infallible serializer, put that exact operation in a small
+ordinary helper called only by the legacy methods, and scope the expectation
+there. Keep canonical serialization fallible. A broad macro/module allowance
+would conceal new errors. Existing native-schema compatibility tests protect
+wire values and external trait implementations while strict Clippy verifies the
+actual ordinary helper.
+
+## A lock guard must release the lock, not just close its handle
+
+If telemetry reports contention immediately after a guard is dropped, check for
+duplicated or inherited file handles before adding retries. On Unix, a duplicate
+can keep the same open-file description alive, so closing the guard's handle
+alone may leave the advisory lock held. The guard explicitly unlocks on drop;
+unlock failures report the operation and I/O category without private contents.
+
+The regression tests retain a duplicate through ordinary drop and unwinding,
+then acquire from a fresh open immediately. They also check that closing the old
+duplicate cannot release the new holder's lock. Run them locally with both agent
+variables removed:
+
+```sh
+env -u SYMPOSIUM_ENABLE_AGENT_TESTING -u SYMPOSIUM_TEST_AGENT \
+  cargo test --lib telemetry::storage::lock::tests --locked
+```
+
+This reproduces the handle-lifetime mechanism deterministically. A particular
+concurrent fork causing a full-suite failure remains an inference; a passing
+isolated test does not establish that handle lifetime matches guard lifetime.

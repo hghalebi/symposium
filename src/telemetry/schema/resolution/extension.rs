@@ -76,17 +76,13 @@ impl ResolutionPathNode {
 
         match self {
             Self::All(node) => {
-                let child_depth = depth
-                    .checked_add(1)
-                    .expect("BUG: resolution path depth is bounded before descending");
+                let child_depth = depth.saturating_add(1);
                 for child in &node.children {
                     child.validate_depth(child_depth)?;
                 }
             }
             Self::Any(node) => {
-                let child_depth = depth
-                    .checked_add(1)
-                    .expect("BUG: resolution path depth is bounded before descending");
+                let child_depth = depth.saturating_add(1);
                 node.child.validate_depth(child_depth)?;
             }
             Self::Package(_) | Self::Extension(_) | Self::Not(_) | Self::Opaque(_) => {}
@@ -104,9 +100,7 @@ impl ResolutionPathNode {
             }
             Self::Any(node) => node.child.count_leaves(leaf_count)?,
             Self::Package(_) | Self::Extension(_) | Self::Not(_) | Self::Opaque(_) => {
-                let observed = leaf_count
-                    .checked_add(1)
-                    .expect("BUG: resolution path leaf count is bounded before incrementing");
+                let observed = leaf_count.saturating_add(1);
 
                 if observed > MAX_RESOLUTION_PATH_LEAVES {
                     return Err(ResolutionPathError::LeafCountExceeded {
@@ -264,24 +258,28 @@ strict_versioned_row! {
 
 impl ExtensionResolutionV1 {
     /// Create a record for one public extension and its safe resolution path.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns the parser error when the build's version is not valid semantic
+    /// versioning.
     pub(in crate::telemetry) fn new(
         observation: &BoundRecordingObservation<'_>,
         target: PublicExtensionCoordinate,
         path: ResolutionPath,
-    ) -> Self {
+    ) -> Result<Self, semver::Error> {
         let extension_subject = path.derive_subject(observation.identifier_window_scope(), &target);
 
-        Self {
+        Ok(Self {
             version: SchemaVersion::V1,
             kind: Self::KIND,
             event_id: EventId::new(),
             day: observation.day(),
-            symposium: SymposiumVersion::current(),
+            symposium: SymposiumVersion::current()?,
             target,
             path,
             extension_subject,
-        }
+        })
     }
 }
 
@@ -320,7 +318,7 @@ impl TryFrom<Vec<ResolutionPathNode>> for ResolutionPath {
         }
 
         let encoded_size = serde_json::to_vec(&nodes)
-            .expect("BUG: resolution path nodes must have an infallible JSON representation")
+            .map_err(ResolutionPathError::Encode)?
             .len();
         if encoded_size > MAX_RESOLUTION_PATH_ENCODED_BYTES {
             return Err(ResolutionPathError::EncodedSizeExceeded {
@@ -333,35 +331,25 @@ impl TryFrom<Vec<ResolutionPathNode>> for ResolutionPath {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error)]
 enum ResolutionPathError {
+    #[error("resolution path must contain at least one node")]
     Empty,
+    #[error("resolution path depth {observed} exceeds maximum {maximum}")]
     DepthExceeded { observed: usize, maximum: usize },
+    #[error("resolution path leaf count {observed} exceeds maximum {maximum}")]
     LeafCountExceeded { observed: usize, maximum: usize },
+    #[error("resolution path encoded size {observed} bytes exceeds maximum {maximum} bytes")]
     EncodedSizeExceeded { observed: usize, maximum: usize },
+    #[error("failed to encode resolution path")]
+    Encode(#[source] serde_json::Error),
 }
 
-impl fmt::Display for ResolutionPathError {
+impl fmt::Debug for ResolutionPathError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => formatter.write_str("resolution path must contain at least one node"),
-            Self::DepthExceeded { observed, maximum } => write!(
-                formatter,
-                "resolution path depth {observed} exceeds maximum {maximum}"
-            ),
-            Self::LeafCountExceeded { observed, maximum } => write!(
-                formatter,
-                "resolution path leaf count {observed} exceeds maximum {maximum}"
-            ),
-            Self::EncodedSizeExceeded { observed, maximum } => write!(
-                formatter,
-                "resolution path encoded size {observed} bytes exceeds maximum {maximum} bytes"
-            ),
-        }
+        fmt::Display::fmt(self, formatter)
     }
 }
-
-impl std::error::Error for ResolutionPathError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -769,13 +757,13 @@ mod tests {
         let path = resolution_path_with_every_node_variant();
         let expected_subject = "ext_63872efd4737ec84179b4e8b0662c121".parse().unwrap();
 
-        let row = ExtensionResolutionV1::new(&observation, target, path);
+        let row = ExtensionResolutionV1::new(&observation, target, path).unwrap();
 
         assert_eq!(row.version, SchemaVersion::V1);
         assert_eq!(row.kind, RowKind::ExtensionResolution);
         assert_eq!(row.event_id.0.get_version(), Some(uuid::Version::Random));
         assert_eq!(row.day, day);
-        assert_eq!(row.symposium, SymposiumVersion::current());
+        assert_eq!(row.symposium, SymposiumVersion::current().unwrap());
         assert_eq!(row.target, public_target());
         assert_eq!(row.path, resolution_path_with_every_node_variant());
         assert_eq!(row.extension_subject, expected_subject);
@@ -789,7 +777,8 @@ mod tests {
             &observation,
             public_target(),
             resolution_path_with_every_node_variant(),
-        );
+        )
+        .unwrap();
         let json = serde_json::to_string(&row).unwrap();
 
         let RowClassification::Supported(TelemetryRow::ExtensionResolution(decoded)) =
@@ -806,7 +795,7 @@ mod tests {
         let constructed = ResolutionPath::try_from(Vec::new());
         let deserialized = serde_json::from_str::<ResolutionPath>("[]");
 
-        assert_eq!(constructed.unwrap_err(), ResolutionPathError::Empty);
+        assert!(matches!(constructed, Err(ResolutionPathError::Empty)));
         assert!(
             deserialized
                 .unwrap_err()
@@ -824,13 +813,13 @@ mod tests {
         let rejected = validate_resolution_path(&beyond_limit);
 
         assert!(accepted.is_ok());
-        assert_eq!(
-            rejected.unwrap_err(),
-            ResolutionPathError::DepthExceeded {
+        assert!(matches!(
+            rejected,
+            Err(ResolutionPathError::DepthExceeded {
                 observed: 9,
                 maximum: 8,
-            }
-        );
+            })
+        ));
     }
 
     #[test]
@@ -842,13 +831,37 @@ mod tests {
         let rejected = validate_resolution_path(&beyond_limit);
 
         assert!(accepted.is_ok());
-        assert_eq!(
-            rejected.unwrap_err(),
-            ResolutionPathError::DepthExceeded {
+        assert!(matches!(
+            rejected,
+            Err(ResolutionPathError::DepthExceeded {
                 observed: 9,
                 maximum: 8,
-            }
-        );
+            })
+        ));
+    }
+
+    #[test]
+    fn resolution_path_rejects_an_overflowing_depth_before_descending() {
+        let nodes = [
+            ResolutionPathNode::All(AllNode {
+                children: vec![ResolutionPathNode::Not(NotNode {})],
+            }),
+            ResolutionPathNode::Any(AnyNode {
+                child: Box::new(ResolutionPathNode::Not(NotNode {})),
+            }),
+        ];
+
+        for node in nodes {
+            let result = node.validate_depth(usize::MAX);
+
+            assert!(matches!(
+                result,
+                Err(ResolutionPathError::DepthExceeded {
+                    observed: usize::MAX,
+                    maximum: 8,
+                })
+            ));
+        }
     }
 
     #[test]
@@ -860,13 +873,13 @@ mod tests {
         let rejected = validate_resolution_path(&beyond_limit);
 
         assert!(accepted.is_ok());
-        assert_eq!(
-            rejected.unwrap_err(),
-            ResolutionPathError::LeafCountExceeded {
+        assert!(matches!(
+            rejected,
+            Err(ResolutionPathError::LeafCountExceeded {
                 observed: 17,
                 maximum: 16,
-            }
-        );
+            })
+        ));
     }
 
     #[test]
@@ -878,13 +891,30 @@ mod tests {
         let rejected = validate_resolution_path(&beyond_limit);
 
         assert!(accepted.is_ok());
-        assert_eq!(
-            rejected.unwrap_err(),
-            ResolutionPathError::LeafCountExceeded {
+        assert!(matches!(
+            rejected,
+            Err(ResolutionPathError::LeafCountExceeded {
                 observed: 17,
                 maximum: 16,
-            }
-        );
+            })
+        ));
+    }
+
+    #[test]
+    fn resolution_path_rejects_an_overflowing_leaf_count_without_mutation() {
+        let node = ResolutionPathNode::Not(NotNode {});
+        let mut leaf_count = usize::MAX;
+
+        let result = node.count_leaves(&mut leaf_count);
+
+        assert!(matches!(
+            result,
+            Err(ResolutionPathError::LeafCountExceeded {
+                observed: usize::MAX,
+                maximum: 16,
+            })
+        ));
+        assert_eq!(leaf_count, usize::MAX);
     }
 
     #[test]
@@ -896,13 +926,29 @@ mod tests {
         let rejected = validate_resolution_path(&beyond_limit);
 
         assert!(accepted.is_ok());
-        assert_eq!(
-            rejected.unwrap_err(),
-            ResolutionPathError::EncodedSizeExceeded {
+        assert!(matches!(
+            rejected,
+            Err(ResolutionPathError::EncodedSizeExceeded {
                 observed: 4_097,
                 maximum: 4_096,
-            }
-        );
+            })
+        ));
+    }
+
+    #[test]
+    fn resolution_path_encoding_error_preserves_its_source_without_exposing_input() {
+        let canary = "private-resolution-path-canary";
+        let source = <serde_json::Error as serde::ser::Error>::custom(canary);
+        let error = ResolutionPathError::Encode(source);
+
+        assert_eq!(error.to_string(), "failed to encode resolution path");
+        assert!(!error.to_string().contains(canary));
+        assert!(!format!("{error:?}").contains(canary));
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<serde_json::Error>()
+            .unwrap();
+        assert_eq!(source.to_string(), canary);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! [`WorkspaceDeps`] types — since that is cargo's ecosystem, not a generic
 //! concern. A [`CargoPm`] *holds* its [`WorkspaceDeps`] resolver (as an
 //! [`Arc`], so several instances share one lazily-run, cached `cargo metadata`)
-//! and drives it (`self.workspace.crates()`).
+//! and drives it through the checked workspace resolver.
 
 use std::sync::Arc;
 
@@ -18,7 +18,8 @@ use crate::crate_sources::RustCrateFetch;
 
 pub mod workspace;
 pub use workspace::{
-    LoadedWorkspace, WorkspaceCrate, WorkspaceDeps, file_mtime, workspace_dir_name,
+    LoadedWorkspace, WorkspaceCrate, WorkspaceDeps, WorkspaceError, file_mtime, try_file_mtime,
+    try_find_workspace_root, workspace_dir_name,
 };
 
 use super::{
@@ -330,9 +331,7 @@ impl PackageManager for CargoPm {
                 actual: id.pm.clone(),
             });
         }
-        // `crates()` drives the lazy `cargo metadata` resolution — the cargo PM
-        // owns the call, resolving against its own workspace.
-        let mut fetch = RustCrateFetch::new(&id.name, self.workspace.crates());
+        let mut fetch = RustCrateFetch::new(&id.name, self.workspace.as_ref());
         if id.version != ANY_VERSION {
             fetch = fetch.version(&id.version);
         }
@@ -356,7 +355,8 @@ impl PackageManager for CargoPm {
     async fn try_list_deps(&self) -> std::result::Result<Vec<PackageId>, PackageManagerError> {
         Ok(self
             .workspace
-            .crates()
+            .try_crates()
+            .map_err(|source| PackageManagerError::Workspace { source })?
             .iter()
             .map(|c| PackageId::new(CARGO_PM, c.name.clone(), c.version.to_string()))
             .collect())

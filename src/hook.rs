@@ -229,9 +229,18 @@ pub enum HookError {
     /// Registry configuration could not provide a complete source set.
     #[error("failed to resolve hook registries")]
     Registry(#[from] crate::config::RegistryError),
+    /// Required workspace resolution failed before plugin dispatch.
+    #[error("failed to resolve hook workspace")]
+    WorkspaceLookup {
+        #[source]
+        source: Arc<crate::pm::WorkspaceError>,
+    },
     /// A hook refers to an installation absent from its validated manifest.
     #[error("hook refers to a missing installation")]
     MissingInstallation,
+    /// An applicable tool matcher is not a valid regular expression.
+    #[error("failed to evaluate hook matcher")]
+    Matcher(#[from] symposium_sdk::hook::MatcherError),
     /// An agent does not support the selected event.
     #[error("agent {agent:?} does not support hook event {event:?}")]
     UnsupportedEvent { agent: HookAgent, event: HookEvent },
@@ -591,15 +600,23 @@ async fn run_auto_sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, session_start
     // Find workspace root via `cargo locate-project` (fast, no dep resolution).
     // If we can't find one, fall through to full sync which will
     // use cargo metadata.
-    let workspace_root = crate::workspace_state::find_workspace_root(sym, &cwd);
+    let workspace_root = workspace_root_for_hook(sym, &cwd);
 
     // SessionStart always syncs (and refreshes sources); other events skip
     // when the workspace hasn't changed since the last sync.
-    if !session_start && let Some(ref root) = workspace_root {
-        let state = crate::workspace_state::WorkspaceState::load(sym, root);
-        if state.sync_is_fresh(root) {
-            tracing::debug!("auto-sync skipped: Cargo.lock unchanged since last sync");
-            return false;
+    if !session_start
+        && let Some(ref root) = workspace_root
+        && let Some(state) = workspace_state_for_hook(sym, root)
+    {
+        match state.try_sync_is_fresh(root) {
+            Ok(true) => {
+                tracing::debug!("auto-sync skipped: Cargo.lock unchanged since last sync");
+                return false;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "workspace freshness unavailable; running sync")
+            }
         }
     }
     let dependencies_changed = !session_start && workspace_root.is_some();
@@ -618,14 +635,43 @@ async fn run_auto_sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, session_start
 
     // Record successful sync. If we didn't find the root earlier,
     // try again now (sync may have created Cargo.lock).
-    let root = workspace_root.or_else(|| crate::workspace_state::find_workspace_root(sym, &cwd));
+    let root = workspace_root.or_else(|| workspace_root_for_hook(sym, &cwd));
     if let Some(ref root) = root {
-        let mut state = crate::workspace_state::WorkspaceState::load(sym, root);
-        state.record_sync(root);
+        // A completed sync can rebuild this optional cache from current inputs.
+        let mut state = workspace_state_for_hook(sym, root).unwrap_or_default();
+        if let Err(error) = state.try_record_sync(root) {
+            tracing::warn!(error = %error, "successful sync timestamps were not recorded");
+            return dependencies_changed;
+        }
         state.workspace_root = Some(root.clone());
-        state.save(sym, root);
+        if let Err(error) = state.try_save(sym, root) {
+            tracing::warn!(error = %error, "successful sync state was not saved");
+        }
     }
     dependencies_changed
+}
+
+fn workspace_root_for_hook(sym: &Symposium, cwd: &std::path::Path) -> Option<PathBuf> {
+    match crate::workspace_state::try_find_workspace_root(sym, cwd) {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::warn!(error = %error, "fast workspace discovery failed; trying full sync");
+            None
+        }
+    }
+}
+
+fn workspace_state_for_hook(
+    sym: &Symposium,
+    root: &std::path::Path,
+) -> Option<crate::workspace_state::WorkspaceState> {
+    match crate::workspace_state::WorkspaceState::try_load(sym, root) {
+        Ok(state) => Some(state),
+        Err(error) => {
+            tracing::warn!(error = %error, "workspace cache unavailable; recomputing after sync");
+            None
+        }
+    }
 }
 
 /// Whether the hook pipeline must resolve the workspace crate graph before
@@ -653,7 +699,13 @@ fn hook_dispatch_needs_deps(sym: &Symposium, registry_plugins: &[Plugin]) -> boo
 /// lazily when the hook first fires) — `SessionStart` updates installed tools
 /// but never installs eagerly. Best-effort: failures are logged and skipped.
 async fn prewarm_hook_sources(sym: &Symposium, deps: &Arc<WorkspaceDeps>) {
-    let workspace = deps.load().cloned();
+    let workspace = match deps.try_load() {
+        Ok(workspace) => workspace.cloned(),
+        Err(error) => {
+            tracing::warn!(error = %error, "prewarm workspace unavailable (skipping)");
+            return;
+        }
+    };
     let registry =
         match crate::plugins::try_load_registry_with_workspace(sym, workspace.as_deref()).await {
             Ok(registry) => registry,
@@ -784,7 +836,13 @@ async fn handle_session_start(
 /// Suggest `cargo agents --help` when the active workspace exposes crate-aware plugin subcommands.
 /// Reuses the help renderer's `applicable_subcommands`, so the hint fires only when there is actually something to discover; `None` otherwise.
 async fn discovery_hint(sym: &Symposium, deps: &Arc<WorkspaceDeps>) -> Option<String> {
-    let workspace = deps.load().cloned();
+    let workspace = match deps.try_load() {
+        Ok(workspace) => workspace.cloned(),
+        Err(error) => {
+            tracing::warn!(error = %error, "discovery hint workspace unavailable (skipping)");
+            return None;
+        }
+    };
     let registry =
         match crate::plugins::try_load_registry_with_workspace(sym, workspace.as_deref()).await {
             Ok(registry) => registry,
@@ -866,10 +924,16 @@ fn update_nudge(sym: &Symposium) -> Option<String> {
     if sym.config.auto_update != AutoUpdate::Warn {
         return None;
     }
-    if !crate::state::should_check_for_update(sym.config_dir()) {
-        return None;
+    match crate::state::try_should_check_for_update(sym.config_dir()) {
+        Ok(false) => return None,
+        Ok(true) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, "hook update throttle state unavailable (continuing)")
+        }
     }
-    crate::state::record_update_check(sym.config_dir());
+    if let Err(error) = crate::state::try_record_update_check(sym.config_dir()) {
+        tracing::warn!(error = %error, "hook update timestamp was not saved (continuing)");
+    }
 
     let latest = match crate::self_update::try_check_upgrade(sym) {
         Ok(latest) => latest?,
@@ -1094,7 +1158,10 @@ async fn try_dispatch_plugin_hooks(
     prior_context: Option<String>,
     deps: &Arc<WorkspaceDeps>,
 ) -> Result<serde_json::Value, HookDispatchError> {
-    let workspace = deps.load().cloned();
+    let workspace = deps
+        .try_load()
+        .map_err(|source| HookError::WorkspaceLookup { source })?
+        .cloned();
     let registry = crate::plugins::try_load_registry_with_workspace(sym, workspace.as_deref())
         .await
         .map_err(HookError::Registry)?;
@@ -1299,8 +1366,15 @@ fn dispatched_hooks_for_payload(
             if hook.event != input.event() {
                 continue;
             }
+            if hook
+                .format
+                .as_agent()
+                .is_some_and(|agent| agent != host_agent)
+            {
+                continue;
+            }
             if let Some(matcher) = &hook.matcher
-                && !input.matches_matcher(matcher)
+                && !input.try_matches_matcher(matcher)?
             {
                 continue;
             }
@@ -1874,6 +1948,46 @@ mod tests {
             None,
             None,
         ))
+    }
+
+    #[test]
+    fn invalid_foreign_matcher_cannot_block_this_hosts_dispatch() {
+        let mut plugin = plugin_with_hook(vec![], vec![]);
+        plugin.manifest.hooks[0].format = HookFormat::Copilot;
+        plugin.manifest.hooks[0].matcher = Some("(".into());
+        let hooks = dispatched_hooks_for_payload(
+            &[plugin],
+            &pre_tool_use_input(),
+            HookAgent::Claude,
+            &mut crate::predicate::PredicateContext::new(&[]),
+        )
+        .unwrap();
+        assert!(hooks.is_empty());
+    }
+
+    #[test]
+    fn invalid_applicable_matcher_is_typed_without_echoing_pattern() {
+        let mut plugin = plugin_with_hook(vec![], vec![]);
+        plugin.manifest.hooks[0].matcher = Some(format!("{STREAM_CANARY}("));
+        let error = dispatched_hooks_for_payload(
+            &[plugin],
+            &pre_tool_use_input(),
+            HookAgent::Claude,
+            &mut crate::predicate::PredicateContext::new(&[]),
+        )
+        .err()
+        .expect("invalid matcher must reject dispatch");
+        assert!(matches!(error, HookError::Matcher(_)));
+        assert!(!error.to_string().contains(STREAM_CANARY));
+        use std::error::Error;
+        assert!(
+            error
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .is::<regex::Error>()
+        );
     }
 
     #[test]

@@ -1,3 +1,15 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable
+    )
+)]
+
 use clap::Parser;
 use std::env;
 use std::io::Write;
@@ -146,7 +158,9 @@ async fn main() -> ExitCode {
     }
 
     // A rejected registry configuration must not stamp operational state.
-    state::ensure_current(sym.config_dir());
+    if let Err(error) = state::try_ensure_current(sym.config_dir()) {
+        tracing::warn!(error = %error, "operational state was not stamped (continuing)");
+    }
 
     // Auto-update = "on": check for updates and re-exec if a new binary was
     // installed.  Skipped for self-update (which always checks explicitly)
