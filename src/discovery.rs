@@ -36,14 +36,52 @@
 use std::path::Path;
 
 use crate::pm::WorkspaceDeps;
-use anyhow::{Context, Result};
 use std::sync::Arc;
 
-use crate::config::Symposium;
+use crate::config::{ConfigError, RegistryError, Symposium};
 use crate::crate_sources::normalize_crate_name;
 use crate::output::Output;
 use crate::pm::{CARGO_PM, PackageId};
 use crate::report::ReportEvent;
+
+/// A failure to discover consent candidates, ask for a decision, or persist it.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConsentError {
+    /// Registry validation failed before any consent decision was recorded.
+    #[error("invalid registry configuration for consent")]
+    Registry {
+        /// The invalid source configuration.
+        #[source]
+        source: RegistryError,
+    },
+    /// Decisions could not be saved; the in-memory decisions were restored.
+    #[error("failed to write user config")]
+    SaveConfig {
+        /// The configuration serialization or filesystem failure.
+        #[source]
+        source: ConfigError,
+    },
+    /// Reading the user's consent decision failed.
+    #[error("consent prompt failed")]
+    Prompt {
+        /// The terminal interaction failure.
+        #[source]
+        source: dialoguer::Error,
+    },
+}
+
+impl ConsentError {
+    fn into_legacy(self) -> anyhow::Error {
+        match self {
+            Self::Registry { source } => anyhow::Error::new(source),
+            Self::SaveConfig { source } => {
+                anyhow::Error::new(source).context("failed to write user config")
+            }
+            Self::Prompt { source } => anyhow::Error::new(source).context("consent prompt failed"),
+        }
+    }
+}
 
 /// Why a discovered offer is (or is not) enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,12 +154,40 @@ impl Discovery {
 /// cache-only — for a workspace dependency, into the source `cargo metadata`
 /// already extracted (no probe, no network) — so every dependency-embedded
 /// plugin is discoverable, registry crates included.
+/// This legacy best-effort adapter remains through root 0.6. New callers should
+/// use [`try_discover`] so invalid registries cannot appear to be empty.
 pub async fn discover(sym: &Symposium, deps: &Arc<WorkspaceDeps>) -> Discovery {
+    match try_discover(sym, deps).await {
+        Ok(discovery) => discovery,
+        Err(_) => {
+            tracing::warn!("discovery skipped: invalid registry configuration");
+            Discovery::default()
+        }
+    }
+}
+
+/// Discover dependency-embedded plugins after validating all registry sources.
+///
+/// Dependency listing remains best-effort for compatibility: a manager failure
+/// emits a content-free warning and discovers no offers for this pass.
+///
+/// # Errors
+/// Returns [`RegistryError`] before discovery when a configured source is invalid.
+pub async fn try_discover(
+    sym: &Symposium,
+    deps: &Arc<WorkspaceDeps>,
+) -> Result<Discovery, RegistryError> {
+    let pms = sym.try_package_managers(deps)?;
     let Some(workspace_root) = deps.workspace_root().map(Path::to_path_buf) else {
-        return Discovery::default();
+        return Ok(Discovery::default());
     };
-    let pms = sym.package_managers(deps);
-    let dep_ids = pms.list_deps().await.unwrap_or_default();
+    let dep_ids = match pms.try_list_deps().await {
+        Ok(ids) => ids,
+        Err(_) => {
+            tracing::warn!("dependency discovery skipped: failed to list workspace dependencies");
+            Vec::new()
+        }
+    };
 
     let mut discovery = Discovery::default();
     // Untrusted instances = the cargo transport: its `active_plugins` are the
@@ -147,7 +213,7 @@ pub async fn discover(sym: &Symposium, deps: &Arc<WorkspaceDeps>) -> Discovery {
             }
         }
     }
-    discovery
+    Ok(discovery)
 }
 
 /// The crate names whose embedded plugins the user has enabled, to load at
@@ -197,23 +263,54 @@ pub fn enabled_dependencies(
 
 /// Run [`discover`] for the workspace `deps` points at, or an empty
 /// [`Discovery`] when there is no workspace.
+/// Legacy best-effort alias for [`discover`], retained through root 0.6.
 pub async fn discover_for(sym: &Symposium, deps: &Arc<WorkspaceDeps>) -> Discovery {
     discover(sym, deps).await
+}
+
+/// Checked discovery for the workspace `deps` points at.
+///
+/// # Errors
+/// Returns [`RegistryError`] when a configured source is invalid.
+pub async fn try_discover_for(
+    sym: &Symposium,
+    deps: &Arc<WorkspaceDeps>,
+) -> Result<Discovery, RegistryError> {
+    try_discover(sym, deps).await
 }
 
 /// The names of the discovered offers still awaiting consent, deduplicated
 /// and sorted — what a consent prompt would ask about, and what the
 /// non-interactive hint names.
+/// Legacy best-effort adapter retained through root 0.6. New callers should use
+/// [`try_pending_candidates`] to distinguish invalid sources from no candidates.
 pub async fn pending_candidates(sym: &Symposium, deps: &Arc<WorkspaceDeps>) -> Vec<String> {
-    let mut names: Vec<String> = discover_for(sym, deps)
-        .await
+    match try_pending_candidates(sym, deps).await {
+        Ok(names) => names,
+        Err(_) => {
+            tracing::warn!("candidate hints skipped: invalid registry configuration");
+            Vec::new()
+        }
+    }
+}
+
+/// Names of undecided dependency plugins, after validating registry sources.
+///
+/// # Errors
+/// Returns [`RegistryError`] when a configured source is invalid.
+pub async fn try_pending_candidates(
+    sym: &Symposium,
+    deps: &Arc<WorkspaceDeps>,
+) -> Result<Vec<String>, RegistryError> {
+    let mut names: Vec<String> = try_discover_for(sym, deps)
+        .await?
         .candidates
         .into_iter()
         .map(|c| c.id.name)
         .collect();
     names.sort();
     names.dedup();
-    names
+    Ok(names)
 }
 
 /// Record consent decisions: approvals into `[plugins] auto-enable`,
@@ -221,10 +318,33 @@ pub async fn pending_candidates(sym: &Symposium, deps: &Arc<WorkspaceDeps>) -> V
 ///
 /// Split out from the prompt so the decision recording is testable without a
 /// terminal, and so other entry points can record the same way.
-pub fn apply_consent(sym: &mut Symposium, approved: &[String], declined: &[String]) -> Result<()> {
+/// Legacy adapter retained through root 0.6; prefer [`try_apply_consent`].
+pub fn apply_consent(
+    sym: &mut Symposium,
+    approved: &[String],
+    declined: &[String],
+) -> anyhow::Result<()> {
+    try_apply_consent(sym, approved, declined).map_err(ConsentError::into_legacy)
+}
+
+/// Record explicit consent decisions after validating all registry sources.
+///
+/// # Errors
+/// Returns [`ConsentError::Registry`] before mutation for an invalid source, or
+/// [`ConsentError::SaveConfig`] when persistence fails. In-memory plugin
+/// decisions are restored on a failed save, and success is reported only after
+/// persistence completes.
+pub fn try_apply_consent(
+    sym: &mut Symposium,
+    approved: &[String],
+    declined: &[String],
+) -> Result<(), ConsentError> {
     if approved.is_empty() && declined.is_empty() {
         return Ok(());
     }
+    sym.try_registry_instances()
+        .map_err(|source| ConsentError::Registry { source })?;
+    let previous_plugins = sym.config.plugins.clone();
     let plugins = &mut sym.config.plugins;
     for name in approved {
         if !plugins.is_auto_enabled(name) {
@@ -236,7 +356,10 @@ pub fn apply_consent(sym: &mut Symposium, approved: &[String], declined: &[Strin
             plugins.disable.push(name.clone());
         }
     }
-    sym.save_config().context("failed to write user config")?;
+    if let Err(source) = sym.try_save_config() {
+        sym.config.plugins = previous_plugins;
+        return Err(ConsentError::SaveConfig { source });
+    }
 
     if !approved.is_empty() {
         tracing::info!(
@@ -273,11 +396,32 @@ pub async fn prompt_for_consent(
     sym: &mut Symposium,
     deps: &Arc<WorkspaceDeps>,
     out: &Output,
-) -> Result<()> {
+) -> anyhow::Result<()> {
+    try_prompt_for_consent(sym, deps, out)
+        .await
+        .map_err(ConsentError::into_legacy)
+}
+
+/// Ask interactively about undecided offers and persist only explicit answers.
+///
+/// The gating, default "ask me later", and Escape behavior match
+/// [`prompt_for_consent`]. Non-interactive outputs never touch stdin.
+///
+/// # Errors
+/// Returns [`ConsentError`] for invalid registry sources, terminal interaction
+/// failures, or a failed save. A failed save restores in-memory decisions.
+pub async fn try_prompt_for_consent(
+    sym: &mut Symposium,
+    deps: &Arc<WorkspaceDeps>,
+    out: &Output,
+) -> Result<(), ConsentError> {
     if !out.is_interactive() {
         return Ok(());
     }
-    let candidates = discover_for(sym, deps).await.candidates;
+    let candidates = try_discover_for(sym, deps)
+        .await
+        .map_err(|source| ConsentError::Registry { source })?
+        .candidates;
     if candidates.is_empty() {
         return Ok(());
     }
@@ -299,7 +443,7 @@ pub async fn prompt_for_consent(
             .items(["Ask me later", "Enable", "No — don't ask again"])
             .default(0)
             .interact_opt()
-            .context("consent prompt failed")?;
+            .map_err(|source| ConsentError::Prompt { source })?;
         match answer {
             Some(1) => approved.push(name),
             Some(2) => declined.push(name),
@@ -307,7 +451,7 @@ pub async fn prompt_for_consent(
             None => break, // Esc — leave the rest undecided
         }
     }
-    apply_consent(sym, &approved, &declined)
+    try_apply_consent(sym, &approved, &declined)
 }
 
 /// A short human summary of what a discovered plugin contributes, for the
@@ -401,6 +545,104 @@ mod tests {
         )
         .unwrap();
         Symposium::from_dir(&config_dir)
+    }
+
+    #[test]
+    fn failed_consent_save_restores_decisions_and_preserves_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sym = sym_with(
+            tmp.path(),
+            "[plugins]\nauto-enable = [\"already-approved\"]\ndisable = [\"already-declined\"]",
+        );
+        let previous = sym.config.plugins.clone();
+        let config_path = sym.config_dir().join("config.toml");
+        let original = std::fs::read(&config_path).unwrap();
+        let saved_path = sym.config_dir().join("original-config.toml");
+        std::fs::rename(&config_path, &saved_path).unwrap();
+        std::fs::create_dir(&config_path).unwrap();
+        let sentinel = config_path.join("keep");
+        std::fs::write(&sentinel, b"existing destination contents").unwrap();
+
+        let error = try_apply_consent(&mut sym, &["new-approval".into()], &["new-decline".into()])
+            .unwrap_err();
+
+        assert_eq!(sym.config.plugins, previous);
+        assert_eq!(std::fs::read(saved_path).unwrap(), original);
+        assert_eq!(
+            std::fs::read(sentinel).unwrap(),
+            b"existing destination contents"
+        );
+        let ConsentError::SaveConfig { source } = error else {
+            panic!("expected a typed save failure");
+        };
+        assert!(matches!(source, ConfigError::Write { source, .. }
+            if source.kind() != std::io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn rejected_consent_keeps_registry_source_and_legacy_downcast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sym = sym_with(tmp.path(), "");
+        sym.config.registries.push(crate::config::RegistryConfig {
+            name: "invalid".into(),
+            git: Some("https://synthetic-consent-canary.invalid/token".into()),
+            path: Some("local".into()),
+            auto_update: false,
+        });
+        let original = std::fs::read(sym.config_dir().join("config.toml")).unwrap();
+
+        let error = try_apply_consent(&mut sym, &["candidate".into()], &[]).unwrap_err();
+        assert!(!error.to_string().contains("synthetic-consent-canary"));
+        assert!(matches!(
+            error,
+            ConsentError::Registry {
+                source: RegistryError::BothSources { .. }
+            }
+        ));
+        let legacy = apply_consent(&mut sym, &["candidate".into()], &[]).unwrap_err();
+        assert!(legacy.downcast_ref::<RegistryError>().is_some());
+        assert!(sym.config.plugins.auto_enable.is_empty());
+        assert_eq!(
+            std::fs::read(sym.config_dir().join("config.toml")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_consent_never_prompts_or_mutates_noninteractive_outputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sym = sym_with(tmp.path(), "");
+        let deps = workspace(tmp.path());
+        let original = std::fs::read(sym.config_dir().join("config.toml")).unwrap();
+
+        for output in [Output::quiet(), Output::capturing()] {
+            try_prompt_for_consent(&mut sym, &deps, &output)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(sym.config.plugins, crate::config::PluginsConfig::default());
+        assert_eq!(
+            std::fs::read(sym.config_dir().join("config.toml")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn consent_prompt_error_retains_the_concrete_terminal_source() {
+        use std::error::Error;
+
+        let error = ConsentError::Prompt {
+            source: dialoguer::Error::IO(std::io::Error::other("synthetic-prompt-canary")),
+        };
+        assert!(!error.to_string().contains("synthetic-prompt-canary"));
+        assert!(error.source().unwrap().is::<dialoguer::Error>());
+        assert!(
+            error
+                .into_legacy()
+                .downcast_ref::<dialoguer::Error>()
+                .is_some()
+        );
     }
 
     #[tokio::test]

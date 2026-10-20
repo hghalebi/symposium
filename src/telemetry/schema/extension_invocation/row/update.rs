@@ -41,6 +41,7 @@ impl ExtensionInvocationMetricsV1 {
     ///
     /// # Errors
     ///
+    /// Construction fails if the build version is not valid SemVer.
     /// Returns [`ExtensionInvocationMetricsUpdateError`] when the supplied
     /// context selects another aggregate or a counter cannot represent the
     /// observation. Private state remains unchanged on failure.
@@ -50,13 +51,15 @@ impl ExtensionInvocationMetricsV1 {
         observation: ExtensionInvocationMetricObservation<'_>,
         selected: SelectedExtensionInvocationAggregate<'_>,
     ) -> Result<Self, ExtensionInvocationMetricsUpdateError> {
+        let symposium =
+            SymposiumVersion::current().map_err(ExtensionInvocationMetricsUpdateError::Version)?;
         let bucket = selected.bucket();
         let mut row = Self {
             version: SchemaVersion::V1,
             kind: Self::KIND,
             event_id: selected.event_id(),
             day: selected.day(),
-            symposium: SymposiumVersion::current(),
+            symposium,
             agent: selected.agent(),
             target_scope: bucket.scope(),
             target: bucket.target().cloned(),
@@ -186,22 +189,35 @@ impl ExtensionInvocationMetricsV1 {
 }
 
 /// An extension-invocation aggregate update that cannot be represented safely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error)]
 pub(in crate::telemetry) enum ExtensionInvocationMetricsUpdateError {
+    #[error("invalid Symposium build version")]
+    Version(#[source] semver::Error),
+    #[error("extension-invocation private state belongs to another recording context")]
     RecordingContextChanged,
+    #[error("extension-invocation row belongs to {row_day}, not selected day {selected_day}")]
     DayChanged {
         row_day: UtcDay,
         selected_day: UtcDay,
     },
+    #[error("extension-invocation row belongs to another agent")]
     AgentChanged,
+    #[error("extension-invocation row belongs to another target bucket")]
     TargetIdentityChanged,
+    #[error("extension-invocation private state belongs to another aggregate row")]
     RowIdentifierChanged,
-    PhaseCountOverflow {
-        phase: ExtensionInvocationPhase,
-    },
+    #[error("extension {} count overflows u64", .phase.counter_name())]
+    PhaseCountOverflow { phase: ExtensionInvocationPhase },
     // Defensive propagation: the matching row counter is incremented first,
     // so the tracker's corresponding contribution cannot currently overflow.
-    SessionCounts(ExtensionSessionCountUpdateError),
+    #[error("{0}")]
+    SessionCounts(#[source] ExtensionSessionCountUpdateError),
+}
+
+impl fmt::Debug for ExtensionInvocationMetricsUpdateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
 }
 
 impl From<ExtensionSessionCountUpdateError> for ExtensionInvocationMetricsUpdateError {
@@ -209,39 +225,6 @@ impl From<ExtensionSessionCountUpdateError> for ExtensionInvocationMetricsUpdate
         Self::SessionCounts(error)
     }
 }
-
-impl fmt::Display for ExtensionInvocationMetricsUpdateError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RecordingContextChanged => formatter.write_str(
-                "extension-invocation private state belongs to another recording context",
-            ),
-            Self::DayChanged {
-                row_day,
-                selected_day,
-            } => write!(
-                formatter,
-                "extension-invocation row belongs to {row_day}, not selected day {selected_day}"
-            ),
-            Self::AgentChanged => {
-                formatter.write_str("extension-invocation row belongs to another agent")
-            }
-            Self::TargetIdentityChanged => {
-                formatter.write_str("extension-invocation row belongs to another target bucket")
-            }
-            Self::RowIdentifierChanged => formatter
-                .write_str("extension-invocation private state belongs to another aggregate row"),
-            Self::PhaseCountOverflow { phase } => write!(
-                formatter,
-                "extension {} count overflows u64",
-                phase.counter_name()
-            ),
-            Self::SessionCounts(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for ExtensionInvocationMetricsUpdateError {}
 
 #[cfg(test)]
 mod tests;

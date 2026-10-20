@@ -26,7 +26,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -40,6 +39,46 @@ const CACHE_SCHEMA_VERSION: u32 = 1;
 /// Subdirectory of `SymposiumDirs::cache_dir` that holds one predicate cache
 /// file per workspace.
 const PREDICATES_SUBDIR: &str = "predicates";
+
+/// A failed atomic predicate-cache write. Displays omit serialized cache values.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PredicateCacheError {
+    #[error("failed to create predicate cache directory {path}")]
+    CreateDirectory {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to serialize predicate cache")]
+    Serialize {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to create temporary predicate cache in {path}")]
+    CreateTemp {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write temporary predicate cache for {path}")]
+    WriteTemp {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to synchronize temporary predicate cache for {path}")]
+    SynchronizeTemp {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to replace predicate cache at {path}")]
+    Persist {
+        path: PathBuf,
+        #[source]
+        source: tempfile::PersistError,
+    },
+}
 
 /// The union of watched inputs and cache lifetime derived from one predicate
 /// execution.
@@ -245,7 +284,7 @@ impl PredicateCache {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Self::default(),
             Err(err) => {
-                tracing::warn!(?path, error = %err, "failed to read predicate cache");
+                tracing::warn!(?path, error_kind = ?err.kind(), "failed to read predicate cache");
                 return Self::default();
             }
         };
@@ -261,7 +300,12 @@ impl PredicateCache {
                 Self::default()
             }
             Err(err) => {
-                tracing::warn!(?path, error = %err, "failed to parse predicate cache");
+                tracing::warn!(
+                    ?path,
+                    line = err.line(),
+                    column = err.column(),
+                    "failed to parse predicate cache"
+                );
                 Self::default()
             }
         }
@@ -280,22 +324,39 @@ impl PredicateCache {
     /// Persist the cache atomically at `path`. Parents are created as needed.
     /// Errors bubble up because a failed write indicates a real problem, but
     /// the caller may downgrade to a warning to avoid failing the outer sync.
-    pub fn save(&self, path: &Path) -> Result<()> {
+    pub fn save(&self, path: &Path) -> Result<(), PredicateCacheError> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating cache directory {}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|source| PredicateCacheError::CreateDirectory {
+                path: parent.to_path_buf(),
+                source,
+            })?;
         }
-        let serialized = serde_json::to_vec_pretty(self).context("serializing predicate cache")?;
+        let serialized = serde_json::to_vec_pretty(self)
+            .map_err(|source| PredicateCacheError::Serialize { source })?;
         // Atomic replace: write to a sibling temp file, fsync, rename.
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)
-            .with_context(|| format!("creating temp file in {}", dir.display()))?;
+        let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|source| {
+            PredicateCacheError::CreateTemp {
+                path: dir.to_path_buf(),
+                source,
+            }
+        })?;
         tmp.write_all(&serialized)
-            .context("writing predicate cache")?;
-        tmp.as_file_mut().sync_all().ok();
+            .map_err(|source| PredicateCacheError::WriteTemp {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        tmp.as_file_mut()
+            .sync_all()
+            .map_err(|source| PredicateCacheError::SynchronizeTemp {
+                path: path.to_path_buf(),
+                source,
+            })?;
         tmp.persist(path)
-            .map_err(|e| e.error)
-            .with_context(|| format!("persisting predicate cache to {}", path.display()))?;
+            .map_err(|source| PredicateCacheError::Persist {
+                path: path.to_path_buf(),
+                source,
+            })?;
         Ok(())
     }
 }
@@ -391,6 +452,27 @@ mod tests {
 
         let loaded = PredicateCache::load(&path);
         assert_eq!(loaded.get("depends-on(lambda)"), Some(&entry));
+    }
+
+    #[test]
+    fn cache_directory_failure_preserves_existing_file_and_source() {
+        use std::error::Error;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blocked_parent = dir.path().join("not-a-directory");
+        fs::write(&blocked_parent, b"preserve this file").unwrap();
+        let cache_path = blocked_parent.join("cache.json");
+
+        let error = PredicateCache::default().save(&cache_path).unwrap_err();
+        match &error {
+            PredicateCacheError::CreateDirectory { path, source } => {
+                assert_eq!(path, &blocked_parent);
+                assert_ne!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected directory error, got {other:?}"),
+        }
+        assert!(error.source().is_some());
+        assert_eq!(fs::read(&blocked_parent).unwrap(), b"preserve this file");
     }
 
     #[test]

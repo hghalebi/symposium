@@ -45,11 +45,46 @@ impl Agent for Antigravity {
 }
 
 macro_rules! antigravity_event {
-    ($event:ident, $input:ident, $output:ident) => {
+    ($event:ident, $input:ident, $output:ident, $variant:ident) => {
         pub struct $event;
         impl AgentHookEvent for $event {
             type Input = $input;
             type Output = $output;
+
+            fn try_parse_input(
+                &self,
+                payload: &str,
+            ) -> Result<Self::Input, super::HookSchemaError> {
+                Self::Input::try_parse_input(payload)
+            }
+            fn try_parse_output(
+                &self,
+                output: &[u8],
+            ) -> Result<Self::Output, super::HookSchemaError> {
+                Self::Output::try_parse_output(output)
+            }
+            fn try_translate_input(
+                &self,
+                input: &symposium::InputEvent,
+            ) -> Result<Self::Input, super::HookSchemaError> {
+                super::validate_input_event(input, super::HookEvent::$variant)?;
+                Ok(Self::Input::from_symposium(input))
+            }
+            fn try_translate_output(
+                &self,
+                output: &symposium::OutputEvent,
+            ) -> Result<Self::Output, super::HookSchemaError> {
+                super::validate_output_event(output, super::HookEvent::$variant)?;
+                Ok(Self::Output::from_symposium(output))
+            }
+            fn try_respond(
+                &self,
+                output: &serde_json::Value,
+            ) -> Result<super::HookResponse, super::HookSchemaError> {
+                serde_json::to_vec(output)
+                    .map(super::HookResponse::success)
+                    .map_err(super::HookSchemaError::OutputSerialization)
+            }
         }
     };
 }
@@ -57,27 +92,32 @@ macro_rules! antigravity_event {
 antigravity_event!(
     AntigravityPreToolUseEvent,
     AntigravityPreToolUseInput,
-    AntigravityPreToolUseOutput
+    AntigravityPreToolUseOutput,
+    PreToolUse
 );
 antigravity_event!(
     AntigravityPostToolUseEvent,
     AntigravityPostToolUseInput,
-    AntigravityPostToolUseOutput
+    AntigravityPostToolUseOutput,
+    PostToolUse
 );
 antigravity_event!(
     AntigravityUserPromptSubmitEvent,
     AntigravityInvocationInput,
-    AntigravityInjectStepsOutput
+    AntigravityInjectStepsOutput,
+    UserPromptSubmit
 );
 antigravity_event!(
     AntigravitySessionStartEvent,
     AntigravitySessionStartInput,
-    AntigravityInjectStepsOutput
+    AntigravityInjectStepsOutput,
+    SessionStart
 );
 antigravity_event!(
     AntigravityStopEvent,
     AntigravityStopInput,
-    AntigravityStopOutput
+    AntigravityStopOutput,
+    Stop
 );
 
 // ── Common ────────────────────────────────────────────────────────────
@@ -194,6 +234,12 @@ impl Default for AntigravityPreToolUseOutput {
 }
 
 impl AgentHookInput for AntigravityPreToolUseInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -205,6 +251,19 @@ impl AgentHookInput for AntigravityPreToolUseInput {
             self.common.cwd(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::PreToolUse(p) = event else {
             panic!("wrong event")
@@ -227,6 +286,28 @@ impl AgentHookInput for AntigravityPreToolUseInput {
 }
 
 impl AgentHookOutput for AntigravityPreToolUseOutput {
+    fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+        serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+    }
+    fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+        if output.is_empty() {
+            return Ok(Self::default());
+        }
+        let parsed: Self =
+            serde_json::from_slice(output).map_err(super::HookSchemaError::OutputParse)?;
+        super::validate_decision(
+            Some(&parsed.decision),
+            &[
+                "allow",
+                "deny",
+                "ask",
+                "force_ask",
+                "deny_unless_prior_grant",
+            ],
+            "decision",
+        )?;
+        Ok(parsed)
+    }
     fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
         if output.is_empty() {
             return Ok(Self::default());
@@ -261,6 +342,19 @@ impl AgentHookOutput for AntigravityPreToolUseOutput {
             self.overwrite.clone(),
         ))
     }
+    /// Legacy infallible serialization retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookOutput::try_to_hook_output`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if the output cannot be serialized as JSON.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unwrap_used,
+            reason = "legacy infallible serialization retained until root 0.6; use try_to_hook_output"
+        )
+    )]
     fn to_hook_output(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap()
     }
@@ -289,6 +383,12 @@ pub struct AntigravityPostToolUseInput {
 pub struct AntigravityPostToolUseOutput {}
 
 impl AgentHookInput for AntigravityPostToolUseInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -305,6 +405,19 @@ impl AgentHookInput for AntigravityPostToolUseInput {
             self.common.cwd(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::PostToolUse(p) = event else {
             panic!("wrong event")
@@ -328,6 +441,15 @@ impl AgentHookInput for AntigravityPostToolUseInput {
 }
 
 impl AgentHookOutput for AntigravityPostToolUseOutput {
+    fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+        serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+    }
+    fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+        if output.is_empty() {
+            return Ok(Self::default());
+        }
+        serde_json::from_slice(output).map_err(super::HookSchemaError::OutputParse)
+    }
     fn parse_output(_output: &[u8]) -> anyhow::Result<Self> {
         Ok(Self::default())
     }
@@ -402,6 +524,12 @@ impl AntigravityInjectStepsOutput {
 }
 
 impl AgentHookInput for AntigravityInvocationInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -414,6 +542,19 @@ impl AgentHookInput for AntigravityInvocationInput {
             self.common.cwd(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::UserPromptSubmit(p) = event else {
             panic!("wrong event")
@@ -438,6 +579,12 @@ impl AgentHookInput for AntigravityInvocationInput {
 }
 
 impl AgentHookInput for AntigravitySessionStartInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -447,6 +594,19 @@ impl AgentHookInput for AntigravitySessionStartInput {
             self.common.cwd(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::SessionStart(p) = event else {
             panic!("wrong event")
@@ -464,6 +624,15 @@ impl AgentHookInput for AntigravitySessionStartInput {
 }
 
 impl AgentHookOutput for AntigravityInjectStepsOutput {
+    fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+        serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+    }
+    fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+        if output.is_empty() {
+            return Ok(Self::default());
+        }
+        serde_json::from_slice(output).map_err(super::HookSchemaError::OutputParse)
+    }
     fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
         if output.is_empty() {
             return Ok(Self::default());
@@ -476,6 +645,19 @@ impl AgentHookOutput for AntigravityInjectStepsOutput {
     fn to_symposium(&self) -> symposium::OutputEvent {
         symposium::OutputEvent::SessionStart(symposium::SessionStartOutput::new(self.context()))
     }
+    /// Legacy infallible serialization retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookOutput::try_to_hook_output`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if the output cannot be serialized as JSON.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unwrap_used,
+            reason = "legacy infallible serialization retained until root 0.6; use try_to_hook_output"
+        )
+    )]
     fn to_hook_output(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap()
     }
@@ -519,6 +701,12 @@ pub struct AntigravityStopOutput {
 }
 
 impl AgentHookInput for AntigravityStopInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -528,6 +716,19 @@ impl AgentHookInput for AntigravityStopInput {
             self.common.cwd(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::Stop(p) = event else {
             panic!("wrong event")
@@ -546,6 +747,15 @@ impl AgentHookInput for AntigravityStopInput {
 }
 
 impl AgentHookOutput for AntigravityStopOutput {
+    fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+        serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+    }
+    fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+        if output.is_empty() {
+            return Ok(Self::default());
+        }
+        serde_json::from_slice(output).map_err(super::HookSchemaError::OutputParse)
+    }
     fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
         if output.is_empty() {
             return Ok(Self::default());
@@ -565,6 +775,19 @@ impl AgentHookOutput for AntigravityStopOutput {
     fn to_symposium(&self) -> symposium::OutputEvent {
         symposium::OutputEvent::Stop(symposium::StopOutput::new(self.reason.clone()))
     }
+    /// Legacy infallible serialization retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookOutput::try_to_hook_output`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if the output cannot be serialized as JSON.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unwrap_used,
+            reason = "legacy infallible serialization retained until root 0.6; use try_to_hook_output"
+        )
+    )]
     fn to_hook_output(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap()
     }

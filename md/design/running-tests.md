@@ -1,29 +1,132 @@
 # Running tests
 
-## Quick start
+## Local-only checks
 
-```bash
-cargo test              # simulation + configured agents
+From the repository root, explicitly remove both agent-testing variables from
+child processes. The commands below use a POSIX shell (`sh`, Bash, or Zsh):
+
+```sh
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+env -u SYMPOSIUM_ENABLE_AGENT_TESTING -u SYMPOSIUM_TEST_AGENT \
+  cargo test --workspace --locked --no-fail-fast
 ```
 
-By default, `cargo test` runs simulation tests and then re-runs agent-mode tests against each agent listed in `test-agents.toml`. On a fresh clone (no file), the defaults are `claude-sdk` and `kiro-cli-acp`.
+The suite uses temporary fixture directories and project-scoped hooks. Agent-only
+test bodies do not run without the enable gate, so passing this suite proves local
+behavior only. `--no-fail-fast` lets Cargo report failures in later test binaries.
 
-## Configuring test agents
+Workspace feature unification can hide minimal-library failures. When changing
+SDK or installer APIs or features, also run compilation, Clippy, and library
+tests for each standalone configuration:
 
-Create `test-agents.toml` in the repo root (gitignored):
+```sh
+cargo check -p symposium-sdk --lib --locked --no-default-features
+cargo check -p symposium-sdk --lib --locked --no-default-features --features clap
+cargo check -p symposium-install --lib --locked --no-default-features
+cargo check -p symposium-install --lib --locked --no-default-features --features clap
+cargo clippy -p symposium-sdk --lib --locked --no-default-features -- -D warnings
+cargo clippy -p symposium-sdk --lib --locked --no-default-features --features clap -- -D warnings
+cargo clippy -p symposium-install --lib --locked --no-default-features -- -D warnings
+cargo clippy -p symposium-install --lib --locked --no-default-features --features clap -- -D warnings
+env -u SYMPOSIUM_ENABLE_AGENT_TESTING -u SYMPOSIUM_TEST_AGENT \
+  cargo test -p symposium-sdk --lib --locked --no-default-features
+env -u SYMPOSIUM_ENABLE_AGENT_TESTING -u SYMPOSIUM_TEST_AGENT \
+  cargo test -p symposium-sdk --lib --locked --no-default-features --features clap
+env -u SYMPOSIUM_ENABLE_AGENT_TESTING -u SYMPOSIUM_TEST_AGENT \
+  cargo test -p symposium-install --lib --locked --no-default-features
+env -u SYMPOSIUM_ENABLE_AGENT_TESTING -u SYMPOSIUM_TEST_AGENT \
+  cargo test -p symposium-install --lib --locked --no-default-features --features clap
+```
+
+Use supported feature combinations rather than assuming `--all-features` is valid.
+Run focused checks first, then the required workspace suite. For documentation:
+
+```sh
+cargo run --locked -p xtask -- md-orphan-check
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+mdbook build
+git diff --check
+```
+
+Book rendering requires the `mdbook` and `mdbook-mermaid` tools configured by
+`book.toml`; report missing tools separately from source-check results. Do not
+remove a preprocessor to make a local check pass.
+
+## CI coverage
+
+The `.github/workflows/ci.yml` workflow defines these checks for pull requests
+targeting `main` and pushes to `main`:
+
+| Check | Runner or configuration | Commands |
+|-------|-------------------------|----------|
+| Compilation | `ubuntu-latest` and `macos-15-intel` | `cargo check --workspace --all-targets --locked` |
+| Formatting | Independent job on `ubuntu-latest` | `cargo fmt --all -- --check` |
+| Clippy | Independent job on `ubuntu-latest` | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
+| Workspace tests | `ubuntu-latest`, `macos-15-intel`, `windows-latest`, and Ubuntu targeting `x86_64-unknown-linux-musl` | `cargo test --workspace --locked --no-fail-fast`, adding `--target x86_64-unknown-linux-musl` for musl |
+| Standalone libraries | `ubuntu-latest`; SDK and installer, each with minimal features and with `clap` | The four `--lib --no-default-features` configurations above, each compiled, linted with warnings denied, and tested |
+| Documentation | `ubuntu-latest` | Locked orphan and warnings-denied Rustdoc checks, `mdbook build`, and `git diff --check` |
+
+The workspace test step removes both `SYMPOSIUM_ENABLE_AGENT_TESTING` and
+`SYMPOSIUM_TEST_AGENT`, then writes `test-agents = []` to the local test
+configuration. The standalone-library step also removes both variables before
+its check, Clippy, and test commands. Real-agent tests remain opt-in. The musl
+job installs `musl-tools`; Windows keeps the `sh` setup described below.
+
+The documentation job installs `mdbook` **0.5.2** and `mdbook-mermaid` **0.17.1**
+with `cargo install --locked` into a job-local tools directory. It checks for
+orphaned Markdown and builds public Rustdoc with warnings denied before rendering
+the configured book. This is a pull-request
+documentation gate; the workflow has only `contents: read` permission and does
+not deploy the book.
+
+This matrix describes configured coverage. A hosted pass requires the workflow
+results for the exact commit; local checks do not establish that the runner or
+target matrix passed.
+
+## Isolate CLI smoke tests
+
+Do not run `init` or `sync` against your actual home or working projects during
+validation. Prefer existing fixture tests. For a local help smoke check, this
+POSIX-shell example uses both an isolated project and a temporary Symposium home:
+
+```sh
+(
+  symposium_manifest="$PWD/Cargo.toml"
+  symposium_check_dir=$(mktemp -d) || exit 1
+  trap 'rm -rf "$symposium_check_dir"' EXIT
+  mkdir -p "$symposium_check_dir/home" "$symposium_check_dir/project" || exit 1
+  cd "$symposium_check_dir/project" || exit 1
+  SYMPOSIUM_HOME="$symposium_check_dir/home" \
+    cargo run --locked --manifest-path "$symposium_manifest" --bin cargo-agents -- --help
+)
+```
+
+Tests of configuration mutations must keep `hook-scope = "project"` and assert
+that invalid input leaves the original file intact. See [Writing tests](./testing-guidelines.md).
+
+## Real agents are opt-in
+
+The harness returns no configured agents unless
+`SYMPOSIUM_ENABLE_AGENT_TESTING` is set. Its value is not parsed as a Boolean:
+`0` also enables agent testing. Without that gate, `SYMPOSIUM_TEST_AGENT` alone
+cannot enable the fixture runner's agent passes.
+
+Once enabled, `SYMPOSIUM_TEST_AGENT` selects one agent and overrides
+`test-agents.toml`. Without an override, the harness reads that gitignored file
+from the repository root; if it cannot read the file, it falls back to
+`claude-sdk`. To choose agents explicitly:
 
 ```toml
-# Run against these agents. Use `acpr --list` to see ACP registry agents.
+# test-agents.toml; used only after explicit enablement
+# Use `acpr --list` to inspect ACP registry agents.
 test-agents = ["claude-sdk"]
 ```
 
-Set to `[]` to skip agent tests entirely (used in CI):
-
-```toml
-test-agents = []
-```
-
-Available agent names:
+`test-agents = []` disables configured agents when no explicit override is set;
+it is useful defense in depth in CI. Keep the enable variable absent in local
+checks and CI, since an explicit agent override takes precedence over the list.
 
 | Name | Backend | Notes |
 |------|---------|-------|
@@ -31,33 +134,32 @@ Available agent names:
 | `kiro-cli-acp` | Kiro CLI via ACP | Requires `kiro-cli` in PATH |
 | Any name from `acpr --list` | ACP registry via `acpr` | Auto-downloaded |
 
-## Filtering to a single agent
+Only when you intend to run a real agent, use both variables:
 
-Override with the `SYMPOSIUM_TEST_AGENT` env var:
-
-```bash
-SYMPOSIUM_TEST_AGENT=kiro-cli-acp cargo test --test hook_agent
+```sh
+SYMPOSIUM_ENABLE_AGENT_TESTING=1 SYMPOSIUM_TEST_AGENT=kiro-cli-acp \
+  cargo test --locked --test hook_agent
 ```
 
-This ignores `test-agents.toml` and runs only the specified agent.
+These tests can invoke external services, use configured credentials, and
+consume provider quota. Report their results separately from local-only checks.
+Never print credentials when diagnosing agent setup.
 
-## Running specific test files
+## Focused tests and debugging
 
-```bash
-cargo test --test hook_agent       # just the agent integration tests
-cargo test --test init_sync        # just the init/sync tests
-cargo test --test dispatch         # just the CLI dispatch tests
+For example, run a single integration binary locally:
+
+```sh
+env -u SYMPOSIUM_ENABLE_AGENT_TESTING -u SYMPOSIUM_TEST_AGENT \
+  cargo test --locked --test init_sync
+env -u SYMPOSIUM_ENABLE_AGENT_TESTING -u SYMPOSIUM_TEST_AGENT \
+  cargo test --locked --test dispatch
 ```
 
-## Debugging test failures
-
-Add `--nocapture` to see test output (agent messages, hook traces):
-
-```bash
-cargo test --test hook_agent -- --nocapture
-```
-
-On failure, the test's temporary directory is preserved and its path is printed to stderr so you can inspect the fixture state.
+Add `-- --nocapture` when you need test output. On failure, the fixture harness
+preserves its temporary directory and prints the path to stderr. Inspect the
+fixture before updating snapshots; see [common issues](./common-issues.md) for
+path normalization and reporting flakes.
 
 ## Windows
 

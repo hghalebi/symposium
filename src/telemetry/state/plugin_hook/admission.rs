@@ -69,9 +69,12 @@ impl PluginHookAggregateStore {
             Entry::Occupied(entry) => Self::select_occupied(entry),
             Entry::Vacant(entry) => {
                 if bucket.is_public() {
-                    let PublicRowAdmission::Public = self.public_rows.admit_new() else {
-                        unreachable!("BUG: a non-exhausted public-row budget must admit a row");
-                    };
+                    match self.public_rows.admit_new() {
+                        PublicRowAdmission::Public => {}
+                        PublicRowAdmission::Overflow => {
+                            return Err(PluginHookAdmissionError::PublicBudgetInvariant);
+                        }
+                    }
                 }
                 Self::insert_vacant(entry, bucket)
             }
@@ -170,6 +173,7 @@ impl PluginHookAggregateStore {
 pub(in crate::telemetry) enum PluginHookAdmissionError {
     DayBeforeCurrent(DayBeforeCurrent),
     PrivateState(PluginHookAggregateSelectionError),
+    PublicBudgetInvariant,
 }
 
 impl From<DayBeforeCurrent> for PluginHookAdmissionError {
@@ -183,11 +187,22 @@ impl fmt::Display for PluginHookAdmissionError {
         match self {
             Self::DayBeforeCurrent(error) => write!(formatter, "plugin-hook admission {error}"),
             Self::PrivateState(error) => error.fmt(formatter),
+            Self::PublicBudgetInvariant => {
+                formatter.write_str("plugin-hook public-row budget changed during admission")
+            }
         }
     }
 }
 
-impl std::error::Error for PluginHookAdmissionError {}
+impl std::error::Error for PluginHookAdmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DayBeforeCurrent(error) => Some(error),
+            Self::PrivateState(error) => Some(error),
+            Self::PublicBudgetInvariant => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests;

@@ -464,9 +464,8 @@ fn every_phase_counter_overflow_rejects_without_mutating_row_or_private_state() 
         let result =
             overflowing.checked_record(&recording, metric_observation(phase, None), selected);
 
-        assert_eq!(
-            result,
-            Err(ExtensionInvocationMetricsUpdateError::PhaseCountOverflow { phase })
+        assert!(
+            matches!(result, Err(ExtensionInvocationMetricsUpdateError::PhaseCountOverflow { phase: actual_phase }) if actual_phase == phase)
         );
         assert_eq!(overflowing, row_before);
         assert_eq!(store, store_before);
@@ -499,10 +498,10 @@ fn update_rejects_another_target_without_mutation() {
         selected,
     );
 
-    assert_eq!(
+    assert!(matches!(
         result,
         Err(ExtensionInvocationMetricsUpdateError::TargetIdentityChanged)
-    );
+    ));
     assert_eq!(row, row_before);
 }
 
@@ -540,10 +539,10 @@ fn update_rejects_private_state_from_another_row_without_mutation() {
         selected,
     );
 
-    assert_eq!(
+    assert!(matches!(
         result,
         Err(ExtensionInvocationMetricsUpdateError::RowIdentifierChanged)
-    );
+    ));
     assert_eq!(row, row_before);
     assert_eq!(second_store, second_store_before);
 }
@@ -583,10 +582,10 @@ fn update_rejects_a_selection_from_another_identifier_epoch() {
         selected,
     );
 
-    assert_eq!(
+    assert!(matches!(
         result,
         Err(ExtensionInvocationMetricsUpdateError::RecordingContextChanged)
-    );
+    ));
     assert_eq!(row, row_before);
 }
 
@@ -621,12 +620,29 @@ fn day_rollover_rejects_the_previous_days_row_from_the_same_store() {
         selected,
     );
 
-    assert_eq!(
-        result,
-        Err(ExtensionInvocationMetricsUpdateError::DayChanged {
-            row_day: row_before.day,
-            selected_day: recording.day(),
-        })
+    assert!(
+        matches!(result, Err(ExtensionInvocationMetricsUpdateError::DayChanged {
+            row_day,
+            selected_day,
+        }) if row_day == row_before.day && selected_day == recording.day())
     );
     assert_eq!(row, row_before);
+}
+
+#[test]
+fn version_error_preserves_source_without_exposing_it_in_the_diagnostic() {
+    const CANARY: &str = "☃";
+    let source = semver::Version::parse(CANARY).unwrap_err();
+    assert!(source.to_string().contains(CANARY));
+    assert!(format!("{source:?}").contains(CANARY));
+    let error = ExtensionInvocationMetricsUpdateError::Version(source);
+
+    assert_eq!(error.to_string(), "invalid Symposium build version");
+    assert_eq!(format!("{error:?}"), error.to_string());
+    assert!(!format!("{error:?}").contains(CANARY));
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .is::<semver::Error>()
+    );
 }

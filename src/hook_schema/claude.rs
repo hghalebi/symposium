@@ -21,11 +21,46 @@ impl Agent for ClaudeCode {
 }
 
 macro_rules! claude_event {
-    ($event:ident, $input:ident, $output:ident) => {
+    ($event:ident, $input:ident, $output:ident, $variant:ident) => {
         pub struct $event;
         impl AgentHookEvent for $event {
             type Input = $input;
             type Output = $output;
+
+            fn try_parse_input(
+                &self,
+                payload: &str,
+            ) -> Result<Self::Input, super::HookSchemaError> {
+                Self::Input::try_parse_input(payload)
+            }
+            fn try_parse_output(
+                &self,
+                output: &[u8],
+            ) -> Result<Self::Output, super::HookSchemaError> {
+                Self::Output::try_parse_output(output)
+            }
+            fn try_translate_input(
+                &self,
+                input: &symposium::InputEvent,
+            ) -> Result<Self::Input, super::HookSchemaError> {
+                super::validate_input_event(input, super::HookEvent::$variant)?;
+                Ok(Self::Input::from_symposium(input))
+            }
+            fn try_translate_output(
+                &self,
+                output: &symposium::OutputEvent,
+            ) -> Result<Self::Output, super::HookSchemaError> {
+                super::validate_output_event(output, super::HookEvent::$variant)?;
+                Ok(Self::Output::from_symposium(output))
+            }
+            fn try_respond(
+                &self,
+                output: &serde_json::Value,
+            ) -> Result<super::HookResponse, super::HookSchemaError> {
+                serde_json::to_vec(output)
+                    .map(super::HookResponse::success)
+                    .map_err(super::HookSchemaError::OutputSerialization)
+            }
         }
     };
 }
@@ -33,39 +68,28 @@ macro_rules! claude_event {
 claude_event!(
     ClaudePreToolUseEvent,
     ClaudePreToolUseInput,
-    ClaudePreToolUseOutput
+    ClaudePreToolUseOutput,
+    PreToolUse
 );
 claude_event!(
     ClaudePostToolUseEvent,
     ClaudePostToolUseInput,
-    ClaudePostToolUseOutput
+    ClaudePostToolUseOutput,
+    PostToolUse
 );
 claude_event!(
     ClaudeUserPromptSubmitEvent,
     ClaudeUserPromptSubmitInput,
-    ClaudeUserPromptSubmitOutput
+    ClaudeUserPromptSubmitOutput,
+    UserPromptSubmit
 );
 claude_event!(
     ClaudeSessionStartEvent,
     ClaudeSessionStartInput,
-    ClaudeSessionStartOutput
+    ClaudeSessionStartOutput,
+    SessionStart
 );
-claude_event!(ClaudeStopEvent, ClaudeStopInput, ClaudeStopOutput);
-
-// ── Helper: extract context from symposium output ─────────────────────
-
-fn claude_hook_output_from_symposium(
-    event_name: &str,
-    event: &symposium::OutputEvent,
-) -> Option<serde_json::Value> {
-    let ctx = event.additional_context()?;
-    Some(serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": event_name,
-            "additionalContext": ctx,
-        }
-    }))
-}
+claude_event!(ClaudeStopEvent, ClaudeStopInput, ClaudeStopOutput, Stop);
 
 // ── PreToolUse ────────────────────────────────────────────────────────
 
@@ -113,6 +137,19 @@ pub struct ClaudePreToolUseHookOutput {
 }
 
 impl AgentHookInput for ClaudePreToolUseInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        let input: Self =
+            serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)?;
+        super::validate_native_event(
+            &input.hook_event_name,
+            super::HookEvent::PreToolUse,
+            "PreToolUse",
+        )?;
+        Ok(input)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -130,6 +167,19 @@ impl AgentHookInput for ClaudePreToolUseInput {
                 .map(String::from),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::PreToolUse(p) = event else {
             panic!("wrong event type")
@@ -157,6 +207,31 @@ impl AgentHookInput for ClaudePreToolUseInput {
 }
 
 impl AgentHookOutput for ClaudePreToolUseOutput {
+    fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+        serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+    }
+    fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+        if output.is_empty() {
+            return Ok(Self::default());
+        }
+        let parsed: Self =
+            serde_json::from_slice(output).map_err(super::HookSchemaError::OutputParse)?;
+        if let Some(hook) = &parsed.hook_specific_output {
+            if !hook.hook_event_name.is_empty() {
+                super::validate_native_event(
+                    &hook.hook_event_name,
+                    super::HookEvent::PreToolUse,
+                    "PreToolUse",
+                )?;
+            }
+            super::validate_decision(
+                hook.permission_decision.as_deref(),
+                &["allow", "deny", "ask", "defer"],
+                "hookSpecificOutput.permissionDecision",
+            )?;
+        }
+        Ok(parsed)
+    }
     fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
         if output.is_empty() {
             return Ok(Self::default());
@@ -215,6 +290,19 @@ impl AgentHookOutput for ClaudePreToolUseOutput {
             h.and_then(|h| h.updated_input.clone()),
         ))
     }
+    /// Legacy infallible serialization retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookOutput::try_to_hook_output`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if the output cannot be serialized as JSON.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unwrap_used,
+            reason = "legacy infallible serialization retained until root 0.6; use try_to_hook_output"
+        )
+    )]
     fn to_hook_output(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap()
     }
@@ -294,6 +382,19 @@ pub struct ClaudePostToolUseHookOutput {
 }
 
 impl AgentHookInput for ClaudePostToolUseInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        let input: Self =
+            serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)?;
+        super::validate_native_event(
+            &input.hook_event_name,
+            super::HookEvent::PostToolUse,
+            "PostToolUse",
+        )?;
+        Ok(input)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -312,6 +413,19 @@ impl AgentHookInput for ClaudePostToolUseInput {
                 .map(String::from),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::PostToolUse(p) = event else {
             panic!("wrong event type")
@@ -340,6 +454,26 @@ impl AgentHookInput for ClaudePostToolUseInput {
 }
 
 impl AgentHookOutput for ClaudePostToolUseOutput {
+    fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+        serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+    }
+    fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+        if output.is_empty() {
+            return Ok(Self::default());
+        }
+        let parsed: Self =
+            serde_json::from_slice(output).map_err(super::HookSchemaError::OutputParse)?;
+        if let Some(hook) = &parsed.hook_specific_output
+            && !hook.hook_event_name.is_empty()
+        {
+            super::validate_native_event(
+                &hook.hook_event_name,
+                super::HookEvent::PostToolUse,
+                "PostToolUse",
+            )?;
+        }
+        Ok(parsed)
+    }
     fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
         if output.is_empty() {
             return Ok(Self::default());
@@ -347,9 +481,15 @@ impl AgentHookOutput for ClaudePostToolUseOutput {
         Ok(serde_json::from_slice(output)?)
     }
     fn from_symposium(event: &symposium::OutputEvent) -> Self {
-        match claude_hook_output_from_symposium("PostToolUse", event) {
-            Some(v) => serde_json::from_value(v).unwrap_or_default(),
-            None => Self::default(),
+        Self {
+            hook_specific_output: event.additional_context().map(|context| {
+                ClaudePostToolUseHookOutput {
+                    hook_event_name: "PostToolUse".into(),
+                    additional_context: Some(context.into()),
+                    rest: serde_json::Map::new(),
+                }
+            }),
+            ..Self::default()
         }
     }
     fn to_symposium(&self) -> symposium::OutputEvent {
@@ -359,6 +499,19 @@ impl AgentHookOutput for ClaudePostToolUseOutput {
                 .and_then(|h| h.additional_context.clone()),
         ))
     }
+    /// Legacy infallible serialization retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookOutput::try_to_hook_output`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if the output cannot be serialized as JSON.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unwrap_used,
+            reason = "legacy infallible serialization retained until root 0.6; use try_to_hook_output"
+        )
+    )]
     fn to_hook_output(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap()
     }
@@ -405,6 +558,19 @@ pub struct ClaudeUserPromptSubmitHookOutput {
 }
 
 impl AgentHookInput for ClaudeUserPromptSubmitInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        let input: Self =
+            serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)?;
+        super::validate_native_event(
+            &input.hook_event_name,
+            super::HookEvent::UserPromptSubmit,
+            "UserPromptSubmit",
+        )?;
+        Ok(input)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -421,6 +587,19 @@ impl AgentHookInput for ClaudeUserPromptSubmitInput {
                 .map(String::from),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::UserPromptSubmit(p) = event else {
             panic!("wrong event type")
@@ -447,6 +626,26 @@ impl AgentHookInput for ClaudeUserPromptSubmitInput {
 }
 
 impl AgentHookOutput for ClaudeUserPromptSubmitOutput {
+    fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+        serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+    }
+    fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+        if output.is_empty() {
+            return Ok(Self::default());
+        }
+        let parsed: Self =
+            serde_json::from_slice(output).map_err(super::HookSchemaError::OutputParse)?;
+        if let Some(hook) = &parsed.hook_specific_output
+            && !hook.hook_event_name.is_empty()
+        {
+            super::validate_native_event(
+                &hook.hook_event_name,
+                super::HookEvent::UserPromptSubmit,
+                "UserPromptSubmit",
+            )?;
+        }
+        Ok(parsed)
+    }
     fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
         if output.is_empty() {
             return Ok(Self::default());
@@ -454,9 +653,15 @@ impl AgentHookOutput for ClaudeUserPromptSubmitOutput {
         Ok(serde_json::from_slice(output)?)
     }
     fn from_symposium(event: &symposium::OutputEvent) -> Self {
-        match claude_hook_output_from_symposium("UserPromptSubmit", event) {
-            Some(v) => serde_json::from_value(v).unwrap_or_default(),
-            None => Self::default(),
+        Self {
+            hook_specific_output: event.additional_context().map(|context| {
+                ClaudeUserPromptSubmitHookOutput {
+                    hook_event_name: "UserPromptSubmit".into(),
+                    additional_context: Some(context.into()),
+                    rest: serde_json::Map::new(),
+                }
+            }),
+            ..Self::default()
         }
     }
     fn to_symposium(&self) -> symposium::OutputEvent {
@@ -466,6 +671,19 @@ impl AgentHookOutput for ClaudeUserPromptSubmitOutput {
                 .and_then(|h| h.additional_context.clone()),
         ))
     }
+    /// Legacy infallible serialization retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookOutput::try_to_hook_output`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if the output cannot be serialized as JSON.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unwrap_used,
+            reason = "legacy infallible serialization retained until root 0.6; use try_to_hook_output"
+        )
+    )]
     fn to_hook_output(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap()
     }
@@ -510,6 +728,19 @@ pub struct ClaudeSessionStartHookOutput {
 }
 
 impl AgentHookInput for ClaudeSessionStartInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        let input: Self =
+            serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)?;
+        super::validate_native_event(
+            &input.hook_event_name,
+            super::HookEvent::SessionStart,
+            "SessionStart",
+        )?;
+        Ok(input)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -525,6 +756,19 @@ impl AgentHookInput for ClaudeSessionStartInput {
                 .map(String::from),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::SessionStart(p) = event else {
             panic!("wrong event type")
@@ -550,6 +794,26 @@ impl AgentHookInput for ClaudeSessionStartInput {
 }
 
 impl AgentHookOutput for ClaudeSessionStartOutput {
+    fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+        serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+    }
+    fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+        if output.is_empty() {
+            return Ok(Self::default());
+        }
+        let parsed: Self =
+            serde_json::from_slice(output).map_err(super::HookSchemaError::OutputParse)?;
+        if let Some(hook) = &parsed.hook_specific_output
+            && !hook.hook_event_name.is_empty()
+        {
+            super::validate_native_event(
+                &hook.hook_event_name,
+                super::HookEvent::SessionStart,
+                "SessionStart",
+            )?;
+        }
+        Ok(parsed)
+    }
     fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
         if output.is_empty() {
             return Ok(Self::default());
@@ -557,9 +821,15 @@ impl AgentHookOutput for ClaudeSessionStartOutput {
         Ok(serde_json::from_slice(output)?)
     }
     fn from_symposium(event: &symposium::OutputEvent) -> Self {
-        match claude_hook_output_from_symposium("SessionStart", event) {
-            Some(v) => serde_json::from_value(v).unwrap_or_default(),
-            None => Self::default(),
+        Self {
+            hook_specific_output: event.additional_context().map(|context| {
+                ClaudeSessionStartHookOutput {
+                    hook_event_name: "SessionStart".into(),
+                    additional_context: Some(context.into()),
+                    rest: serde_json::Map::new(),
+                }
+            }),
+            ..Self::default()
         }
     }
     fn to_symposium(&self) -> symposium::OutputEvent {
@@ -569,6 +839,19 @@ impl AgentHookOutput for ClaudeSessionStartOutput {
                 .and_then(|h| h.additional_context.clone()),
         ))
     }
+    /// Legacy infallible serialization retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookOutput::try_to_hook_output`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if the output cannot be serialized as JSON.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unwrap_used,
+            reason = "legacy infallible serialization retained until root 0.6; use try_to_hook_output"
+        )
+    )]
     fn to_hook_output(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap()
     }
@@ -601,6 +884,15 @@ pub struct ClaudeStopOutput {
 }
 
 impl AgentHookInput for ClaudeStopInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        let input: Self =
+            serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)?;
+        super::validate_native_event(&input.hook_event_name, super::HookEvent::Stop, "Stop")?;
+        Ok(input)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -616,6 +908,19 @@ impl AgentHookInput for ClaudeStopInput {
                 .map(String::from),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::Stop(p) = event else {
             panic!("wrong event type")
@@ -641,6 +946,15 @@ impl AgentHookInput for ClaudeStopInput {
 }
 
 impl AgentHookOutput for ClaudeStopOutput {
+    fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+        serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+    }
+    fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+        if output.is_empty() {
+            return Ok(Self::default());
+        }
+        serde_json::from_slice(output).map_err(super::HookSchemaError::OutputParse)
+    }
     fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
         if output.is_empty() {
             return Ok(Self::default());
@@ -654,6 +968,19 @@ impl AgentHookOutput for ClaudeStopOutput {
     fn to_symposium(&self) -> symposium::OutputEvent {
         symposium::OutputEvent::Stop(symposium::StopOutput::default())
     }
+    /// Legacy infallible serialization retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookOutput::try_to_hook_output`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if the output cannot be serialized as JSON.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unwrap_used,
+            reason = "legacy infallible serialization retained until root 0.6; use try_to_hook_output"
+        )
+    )]
     fn to_hook_output(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap()
     }

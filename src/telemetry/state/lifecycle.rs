@@ -5,7 +5,7 @@ use std::fmt;
 use super::{IdentityState, TelemetryStateV1};
 use crate::telemetry::{
     identity::{IdentifierWindowScope, IdentityKey, ReturnCohortScope},
-    schema::{CohortDay, UtcDay, UtcSecond},
+    schema::{CohortDay, CohortDayOutOfRange, UtcDay, UtcSecond},
 };
 
 /// Exclusive length of an identifier window in UTC-day positions.
@@ -208,9 +208,8 @@ impl TelemetryStateV1 {
             });
         }
 
-        let return_cohort_scope = self
-            .return_cohort_scope()
-            .expect("BUG: the checked return-cohort anchor must be present");
+        let return_cohort_scope =
+            ReturnCohortScope::new(&self.identity.key, selected_return_cohort.to_string());
 
         Ok(BoundSessionObservation {
             recording,
@@ -289,8 +288,8 @@ impl TelemetryStateV1 {
             });
         }
 
-        let day = CohortDay::try_from(elapsed_days)
-            .expect("BUG: a session between D0 and D30 must have a valid cohort day");
+        let day =
+            CohortDay::try_from(elapsed_days).map_err(SessionObservationError::InvalidCohortDay)?;
         Ok(ReturnCohortUpdate::Current { anchor, day })
     }
 }
@@ -547,10 +546,11 @@ impl ReturnCohortUpdate {
     }
 }
 
-/// An observed session earlier than one of its stored identity anchors.
+/// A session transition rejected by its time or cohort invariants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::telemetry) enum SessionObservationError {
     Recording(RecordingObservationError),
+    InvalidCohortDay(CohortDayOutOfRange),
     BeforeReturnCohort {
         observed_day: UtcDay,
         cohort_anchor: UtcDay,
@@ -567,6 +567,7 @@ impl fmt::Display for SessionObservationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Recording(error) => fmt::Display::fmt(error, formatter),
+            Self::InvalidCohortDay(error) => fmt::Display::fmt(error, formatter),
             Self::BeforeReturnCohort {
                 observed_day,
                 cohort_anchor,
@@ -582,6 +583,7 @@ impl std::error::Error for SessionObservationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Recording(error) => Some(error),
+            Self::InvalidCohortDay(error) => Some(error),
             Self::BeforeReturnCohort { .. } => None,
         }
     }
@@ -1235,5 +1237,20 @@ mod tests {
             "observed session day 2026-09-09 precedes the return-cohort anchor 2026-09-10"
         );
         assert_eq!(serialized, source);
+    }
+
+    #[test]
+    fn rejected_session_transitions_preserve_the_complete_state_on_retry() {
+        for source in [
+            state_with_anchors_at_high_water(KEY, "2026-08-01", "2026-08-01", "2026-09-10"),
+            state_with_anchors_at_high_water(KEY, "2026-09-10", "2026-08-01", "2026-08-01"),
+            state_with_anchors_at_high_water(KEY, "2026-08-01", "2026-09-10", "2026-08-01"),
+        ] {
+            let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+            for _ in 0..2 {
+                assert!(state.observe_session(completion_time(2026, 9, 9)).is_err());
+                assert_eq!(toml::to_string_pretty(&state).unwrap(), source);
+            }
+        }
     }
 }

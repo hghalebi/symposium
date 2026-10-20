@@ -10,27 +10,29 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::Result;
 use indoc::formatdoc;
 use sacp::schema::McpServer;
 use serde_json::json;
 
 use crate::output::{Output, display_path};
 
-use super::{load_json_or_empty, save_json};
+use super::{
+    AgentConfigError, config_shape, json_object_entry_mut, json_object_mut, load_json_or_empty,
+    save_json,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /// Extract the name from any McpServer variant.
-fn server_name(server: &McpServer) -> &str {
-    match server {
+fn server_name(server: &McpServer) -> Result<&str, AgentConfigError> {
+    Ok(match server {
         McpServer::Stdio(s) => &s.name,
         McpServer::Http(s) => &s.name,
         McpServer::Sse(s) => &s.name,
-        _ => panic!("unsupported McpServer variant"),
-    }
+        _ => return Err(AgentConfigError::UnsupportedMcpServer),
+    })
 }
 
 /// Convert an McpServer to the JSON value agents expect in their config.
@@ -40,8 +42,8 @@ fn server_name(server: &McpServer) -> &str {
 ///
 /// `env`/`headers` are objects, not ACP's `[{name, value}]` list: a list is
 /// skipped or rejected, silently for an entry that only differs by carrying env.
-fn server_to_json(server: &McpServer) -> serde_json::Value {
-    match server {
+fn server_to_json(server: &McpServer) -> Result<serde_json::Value, AgentConfigError> {
+    Ok(match server {
         McpServer::Stdio(s) => {
             let mut v = json!({
                 "command": s.command.to_string_lossy(),
@@ -66,20 +68,21 @@ fn server_to_json(server: &McpServer) -> serde_json::Value {
             }
             v
         }
-        _ => panic!("unsupported McpServer variant"),
-    }
+        _ => return Err(AgentConfigError::UnsupportedMcpServer),
+    })
 }
 
 /// [`server_to_json`] plus the explicit `type` its own `mcp add` writes.
 /// Without it a remote entry is not picked up at all.
-fn copilot_server_to_json(server: &McpServer) -> serde_json::Value {
-    let mut v = server_to_json(server);
+fn copilot_server_to_json(server: &McpServer) -> Result<serde_json::Value, AgentConfigError> {
+    let mut v = server_to_json(server)?;
     v["type"] = json!(match server {
         McpServer::Stdio(_) => "local",
         McpServer::Sse(_) => "sse",
-        _ => "http",
+        McpServer::Http(_) => "http",
+        _ => return Err(AgentConfigError::UnsupportedMcpServer),
     });
-    v
+    Ok(v)
 }
 
 fn pairs_to_object<'a>(pairs: impl Iterator<Item = (&'a String, &'a String)>) -> serde_json::Value {
@@ -93,8 +96,8 @@ fn pairs_to_object<'a>(pairs: impl Iterator<Item = (&'a String, &'a String)>) ->
 /// OpenCode rejects the whole config file given the common `{command, args}`
 /// shape: `type` is required, the command is one array of binary plus args, and
 /// env goes under `environment` (an `env` key parses but never reaches the child).
-fn opencode_server_to_json(server: &McpServer) -> serde_json::Value {
-    match server {
+fn opencode_server_to_json(server: &McpServer) -> Result<serde_json::Value, AgentConfigError> {
+    Ok(match server {
         McpServer::Stdio(s) => {
             let mut command = vec![s.command.to_string_lossy().into_owned()];
             command.extend(s.args.iter().cloned());
@@ -122,8 +125,8 @@ fn opencode_server_to_json(server: &McpServer) -> serde_json::Value {
             }
             v
         }
-        _ => panic!("unsupported McpServer variant"),
-    }
+        _ => return Err(AgentConfigError::UnsupportedMcpServer),
+    })
 }
 
 /// Render a table as it would appear in a file, sub-tables included, unlike
@@ -146,12 +149,31 @@ enum UpsertResult {
 /// An existing `"enabled": false` is preserved: it is how a user turns one
 /// server off, and sync runs per hook event.
 fn upsert_json_mcp_entry(
-    container: &mut serde_json::Value,
+    container: &mut serde_json::Map<String, serde_json::Value>,
     name: &str,
     expected: &serde_json::Value,
 ) -> UpsertResult {
     if let Some(existing) = container.get(name) {
         let mut expected = expected.clone();
+        // Preserve user extension fields while reconciling the transport we own.
+        if let Some(object) = existing.as_object() {
+            for (key, value) in object {
+                if !matches!(
+                    key.as_str(),
+                    "command"
+                        | "args"
+                        | "env"
+                        | "url"
+                        | "serverUrl"
+                        | "headers"
+                        | "type"
+                        | "environment"
+                        | "enabled"
+                ) {
+                    expected[key] = value.clone();
+                }
+            }
+        }
         if existing.get("enabled") == Some(&serde_json::Value::Bool(false))
             && expected.get("enabled").is_some()
         {
@@ -160,10 +182,10 @@ fn upsert_json_mcp_entry(
         if *existing == expected {
             return UpsertResult::AlreadyCorrect;
         }
-        container[name] = expected;
+        container.insert(name.to_string(), expected);
         UpsertResult::Updated
     } else {
-        container[name] = expected.clone();
+        container.insert(name.to_string(), expected.clone());
         UpsertResult::Inserted
     }
 }
@@ -181,7 +203,7 @@ fn register_json_mcp_servers(
     servers: &[McpServer],
     container_key: Option<&str>,
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     register_json_mcp_servers_with(config_path, servers, container_key, server_to_json, out)
 }
 
@@ -191,29 +213,33 @@ fn register_json_mcp_servers_with(
     config_path: &Path,
     servers: &[McpServer],
     container_key: Option<&str>,
-    to_json: fn(&McpServer) -> serde_json::Value,
+    to_json: fn(&McpServer) -> Result<serde_json::Value, AgentConfigError>,
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     let display = display_path(config_path);
     let mut config = load_json_or_empty(config_path)?;
 
-    if !config.is_object() {
-        config = json!({});
-    }
-
+    let root = json_object_mut(&mut config, config_path, "")?;
     let container = if let Some(key) = container_key {
-        if !config.get(key).is_some_and(|v| v.is_object()) {
-            config[key] = json!({});
-        }
-        &mut config[key]
+        json_object_entry_mut(root, key, config_path, &format!("/{key}"))?
     } else {
-        &mut config
+        root
     };
+    for server in servers {
+        let name = server_name(server)?;
+        if container.get(name).is_some_and(|entry| !entry.is_object()) {
+            return Err(config_shape(
+                config_path,
+                &mcp_entry_pointer(container_key, name),
+                "object",
+            ));
+        }
+    }
 
     let mut changed = false;
     for server in servers {
-        let name = server_name(server);
-        let expected = to_json(server);
+        let name = server_name(server)?;
+        let expected = to_json(server)?;
         match upsert_json_mcp_entry(container, name, &expected) {
             UpsertResult::AlreadyCorrect => {
                 out.already_ok(format!("{display}: {name} MCP server already configured"));
@@ -235,30 +261,42 @@ fn register_json_mcp_servers_with(
     Ok(())
 }
 
+fn mcp_entry_pointer(container_key: Option<&str>, name: &str) -> String {
+    let escaped = name.replace('~', "~0").replace('/', "~1");
+    match container_key {
+        Some(key) => format!("/{key}/{escaped}"),
+        None => format!("/{escaped}"),
+    }
+}
+
 /// Remove MCP server entries from a JSON config file.
 fn unregister_json_mcp_servers(
     config_path: &Path,
     names: &[&str],
     container_key: Option<&str>,
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     let display = display_path(config_path);
-    if !config_path.exists() {
-        return Ok(());
-    }
-
     let mut config = load_json_or_empty(config_path)?;
-
-    let container = if let Some(key) = container_key {
-        config.get_mut(key).and_then(|v| v.as_object_mut())
+    let root = json_object_mut(&mut config, config_path, "")?;
+    let obj = if let Some(key) = container_key {
+        let Some(value) = root.get_mut(key) else {
+            return Ok(());
+        };
+        json_object_mut(value, config_path, &format!("/{key}"))?
     } else {
-        config.as_object_mut()
+        root
     };
 
-    let Some(obj) = container else {
-        return Ok(());
-    };
-
+    for name in names {
+        if obj.get(*name).is_some_and(|entry| !entry.is_object()) {
+            return Err(config_shape(
+                config_path,
+                &mcp_entry_pointer(container_key, name),
+                "object",
+            ));
+        }
+    }
     let mut changed = false;
     for name in names {
         if obj.remove(*name).is_some() {
@@ -282,7 +320,7 @@ pub(super) fn register_claude_mcp_servers(
     path: &Path,
     servers: &[McpServer],
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     register_json_mcp_servers(path, servers, Some("mcpServers"), out)
 }
 
@@ -290,7 +328,7 @@ pub(super) fn unregister_claude_mcp_servers(
     path: &Path,
     names: &[&str],
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     unregister_json_mcp_servers(path, names, Some("mcpServers"), out)
 }
 
@@ -302,7 +340,7 @@ pub(super) fn register_antigravity_mcp_servers(
     path: &Path,
     servers: &[McpServer],
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     register_json_mcp_servers(path, servers, Some("mcpServers"), out)
 }
 
@@ -310,7 +348,7 @@ pub(super) fn unregister_antigravity_mcp_servers(
     path: &Path,
     names: &[&str],
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     unregister_json_mcp_servers(path, names, Some("mcpServers"), out)
 }
 
@@ -319,26 +357,18 @@ pub(super) fn register_codex_mcp_servers(
     config_path: &Path,
     servers: &[McpServer],
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     let display = display_path(config_path);
 
-    let content = if config_path.exists() {
-        fs::read_to_string(config_path)?
-    } else {
-        String::new()
-    };
-
-    let mut doc: toml_edit::DocumentMut = content
-        .parse()
-        .unwrap_or_else(|_| toml_edit::DocumentMut::new());
-
+    let mut doc = load_codex_mcp_config(config_path)?;
     if !doc.contains_key("mcp_servers") {
         doc["mcp_servers"] = toml_edit::Item::Table(toml_edit::Table::new());
     }
+    normalize_mcp_table(&mut doc, config_path)?;
 
     let mut changed = false;
     for server in servers {
-        let name = server_name(server);
+        let name = server_name(server)?;
 
         // Built before the comparison: an entry can differ by `env` or `url`,
         // not just command/args.
@@ -380,12 +410,32 @@ pub(super) fn register_codex_mcp_servers(
                 ));
                 continue;
             }
-            _ => {
-                out.info(format!("{display}: skipping unsupported MCP server {name}"));
-                continue;
-            }
+            _ => return Err(AgentConfigError::UnsupportedMcpServer),
         }
 
+        if let Some(existing) = doc["mcp_servers"].get(name) {
+            let existing = existing.as_table_like().ok_or_else(|| {
+                config_shape(
+                    config_path,
+                    &mcp_entry_pointer(Some("mcp_servers"), name),
+                    "table",
+                )
+            })?;
+            for (key, value) in existing.iter() {
+                if !matches!(
+                    key,
+                    "command"
+                        | "args"
+                        | "env"
+                        | "url"
+                        | "http_headers"
+                        | "env_http_headers"
+                        | "bearer_token_env_var"
+                ) {
+                    server_table.insert(key, value.clone());
+                }
+            }
+        }
         let rendered = render_toml_entry(&server_table);
         let already_correct = doc["mcp_servers"]
             .get(name)
@@ -405,9 +455,49 @@ pub(super) fn register_codex_mcp_servers(
 
     if changed {
         if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(|source| AgentConfigError::CreateDirectory {
+                path: parent.to_path_buf(),
+                source,
+            })?;
         }
-        fs::write(config_path, doc.to_string())?;
+        fs::write(config_path, doc.to_string()).map_err(|source| AgentConfigError::Write {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+fn load_codex_mcp_config(
+    path: &Path,
+) -> std::result::Result<toml_edit::DocumentMut, AgentConfigError> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(AgentConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    content.parse().map_err(|source| AgentConfigError::Toml {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn normalize_mcp_table(
+    doc: &mut toml_edit::DocumentMut,
+    path: &Path,
+) -> std::result::Result<(), AgentConfigError> {
+    if let Some(item) = doc.get_mut("mcp_servers") {
+        if let Some(table) = item.as_inline_table().cloned() {
+            *item = toml_edit::Item::Table(table.into_table());
+        }
+        if !item.is_table() {
+            return Err(config_shape(path, "/mcp_servers", "table"));
+        }
     }
     Ok(())
 }
@@ -416,19 +506,29 @@ pub(super) fn unregister_codex_mcp_servers(
     config_path: &Path,
     names: &[&str],
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     let display = display_path(config_path);
-    if !config_path.exists() {
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(config_path)?;
-    let mut doc: toml_edit::DocumentMut = content.parse()?;
-
-    let Some(mcp_servers) = doc.get_mut("mcp_servers").and_then(|v| v.as_table_mut()) else {
+    let mut doc = load_codex_mcp_config(config_path)?;
+    normalize_mcp_table(&mut doc, config_path)?;
+    let Some(mcp_servers) = doc
+        .get_mut("mcp_servers")
+        .and_then(|value| value.as_table_mut())
+    else {
         return Ok(());
     };
 
+    for name in names {
+        if mcp_servers
+            .get(name)
+            .is_some_and(|entry| !entry.is_table_like())
+        {
+            return Err(config_shape(
+                config_path,
+                &mcp_entry_pointer(Some("mcp_servers"), name),
+                "table",
+            ));
+        }
+    }
     let mut changed = false;
     for name in names {
         if mcp_servers.remove(name).is_some() {
@@ -438,7 +538,10 @@ pub(super) fn unregister_codex_mcp_servers(
     }
 
     if changed {
-        fs::write(config_path, doc.to_string())?;
+        fs::write(config_path, doc.to_string()).map_err(|source| AgentConfigError::Write {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
     }
     Ok(())
 }
@@ -451,7 +554,7 @@ pub(super) fn register_copilot_mcp_servers(
     path: &Path,
     servers: &[McpServer],
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     register_json_mcp_servers_with(
         path,
         servers,
@@ -465,7 +568,7 @@ pub(super) fn unregister_copilot_mcp_servers(
     path: &Path,
     names: &[&str],
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     unregister_json_mcp_servers(path, names, Some("mcpServers"), out)
 }
 
@@ -474,11 +577,15 @@ pub(super) fn register_kiro_mcp_servers(
     path: &Path,
     servers: &[McpServer],
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     register_claude_mcp_servers(path, servers, out)
 }
 
-pub(super) fn unregister_kiro_mcp_servers(path: &Path, names: &[&str], out: &Output) -> Result<()> {
+pub(super) fn unregister_kiro_mcp_servers(
+    path: &Path,
+    names: &[&str],
+    out: &Output,
+) -> Result<(), AgentConfigError> {
     unregister_claude_mcp_servers(path, names, out)
 }
 
@@ -487,7 +594,7 @@ pub(super) fn unregister_kiro_mcp_servers(path: &Path, names: &[&str], out: &Out
 /// Goose's schema, per `goose recipe validate`: a `type` discriminant (`stdio` /
 /// `streamable_http`, no `sse`), the binary under `cmd` not `command`, `envs` as
 /// a map, and the name repeated inside the entry.
-fn goose_extension_yaml(server: &McpServer) -> Option<String> {
+fn goose_extension_yaml(server: &McpServer) -> Result<Option<String>, AgentConfigError> {
     let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
     let yaml_list = |items: &[String]| {
         let quoted: Vec<_> = items.iter().map(|a| quote(a)).collect();
@@ -500,7 +607,7 @@ fn goose_extension_yaml(server: &McpServer) -> Option<String> {
             .collect::<String>()
     };
 
-    match server {
+    Ok(match server {
         McpServer::Stdio(stdio) => {
             let name = &stdio.name;
             let cmd = quote(&stdio.command.to_string_lossy());
@@ -534,8 +641,8 @@ fn goose_extension_yaml(server: &McpServer) -> Option<String> {
         // No `sse` variant exists, and writing one as streamable HTTP yields an
         // entry that cannot connect. Caller reports it as unsupported.
         McpServer::Sse(_) => None,
-        _ => None,
-    }
+        _ => return Err(AgentConfigError::UnsupportedMcpServer),
+    })
 }
 
 /// Does `content` carry this extension with `enabled: false`? Scans the entry's
@@ -590,19 +697,24 @@ pub(super) fn register_goose_mcp_servers(
     config_path: &Path,
     servers: &[McpServer],
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     let display = display_path(config_path);
 
-    let mut content = if config_path.exists() {
-        fs::read_to_string(config_path)?
-    } else {
-        String::new()
+    let mut content = match fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(AgentConfigError::Read {
+                path: config_path.to_path_buf(),
+                source,
+            });
+        }
     };
 
     let mut changed = false;
     for server in servers {
-        let name = server_name(server);
-        let snippet = match goose_extension_yaml(server) {
+        let name = server_name(server)?;
+        let snippet = match goose_extension_yaml(server)? {
             Some(snippet) => snippet,
             None => {
                 out.info(format!("{display}: skipping unsupported MCP server {name}"));
@@ -679,9 +791,15 @@ pub(super) fn register_goose_mcp_servers(
 
     if changed {
         if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(|source| AgentConfigError::CreateDirectory {
+                path: parent.to_path_buf(),
+                source,
+            })?;
         }
-        fs::write(config_path, content)?;
+        fs::write(config_path, content).map_err(|source| AgentConfigError::Write {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
     }
     Ok(())
 }
@@ -690,13 +808,18 @@ pub(super) fn unregister_goose_mcp_servers(
     config_path: &Path,
     names: &[&str],
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     let display = display_path(config_path);
-    if !config_path.exists() {
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(config_path)?;
+    let content = match fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(AgentConfigError::Read {
+                path: config_path.to_path_buf(),
+                source,
+            });
+        }
+    };
     let lines: Vec<&str> = content.lines().collect();
     let mut new_lines = Vec::new();
     let mut in_section = false;
@@ -725,7 +848,10 @@ pub(super) fn unregister_goose_mcp_servers(
     }
 
     if changed {
-        fs::write(config_path, new_lines.join("\n"))?;
+        fs::write(config_path, new_lines.join("\n")).map_err(|source| AgentConfigError::Write {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
     }
     Ok(())
 }
@@ -735,7 +861,7 @@ pub(super) fn register_opencode_mcp_servers(
     path: &Path,
     servers: &[McpServer],
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     register_json_mcp_servers_with(path, servers, Some("mcp"), opencode_server_to_json, out)
 }
 
@@ -743,7 +869,7 @@ pub(super) fn unregister_opencode_mcp_servers(
     path: &Path,
     names: &[&str],
     out: &Output,
-) -> Result<()> {
+) -> Result<(), AgentConfigError> {
     unregister_json_mcp_servers(path, names, Some("mcp"), out)
 }
 
@@ -776,6 +902,235 @@ mod tests {
                     .headers(vec![HttpHeader::new("Authorization", "Bearer t")]),
             ),
         ]
+    }
+
+    type McpRegistrar = fn(&Path, &[McpServer], &Output) -> Result<(), AgentConfigError>;
+
+    fn json_registrars() -> [(McpRegistrar, &'static str); 5] {
+        [
+            (register_claude_mcp_servers, "mcpServers"),
+            (register_antigravity_mcp_servers, "mcpServers"),
+            (register_copilot_mcp_servers, "mcpServers"),
+            (register_kiro_mcp_servers, "mcpServers"),
+            (register_opencode_mcp_servers, "mcp"),
+        ]
+    }
+
+    #[test]
+    fn json_mcp_rejects_invalid_roots_and_containers_without_writing() {
+        use std::error::Error as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent.json");
+        for (register, key) in json_registrars() {
+            let mut invalid = vec![
+                "null".to_string(),
+                "[]".to_string(),
+                "12".to_string(),
+                r#""synthetic-secret-canary""#.to_string(),
+                "{invalid-json".to_string(),
+            ];
+            for value in [json!(null), json!([]), json!("synthetic-secret-canary")] {
+                let mut root = json!({"unknown": true});
+                root[key] = value.clone();
+                invalid.push(root.to_string());
+                root[key] = json!({"symposium": value});
+                invalid.push(root.to_string());
+            }
+            for original in invalid {
+                fs::write(&path, &original).unwrap();
+                let error = register(&path, &test_servers(), &Output::quiet()).unwrap_err();
+                assert!(matches!(
+                    error,
+                    AgentConfigError::Shape { .. } | AgentConfigError::Json { .. }
+                ));
+                assert!(!error.to_string().contains("synthetic-secret-canary"));
+                if matches!(error, AgentConfigError::Json { .. }) {
+                    assert!(error.source().is_some());
+                }
+                assert_eq!(original, fs::read_to_string(&path).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_mcp_configs_retain_the_io_source_and_existing_data() {
+        use std::error::Error as _;
+        type McpUnregister = fn(&Path, &[&str], &Output) -> Result<(), AgentConfigError>;
+        let registrars: [McpRegistrar; 3] = [
+            register_claude_mcp_servers,
+            register_codex_mcp_servers,
+            register_goose_mcp_servers,
+        ];
+        let unregister: [McpUnregister; 3] = [
+            unregister_claude_mcp_servers,
+            unregister_codex_mcp_servers,
+            unregister_goose_mcp_servers,
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("agent-config");
+        fs::create_dir(&config).unwrap();
+        let sentinel = config.join("foreign-settings");
+        fs::write(&sentinel, "keep-existing-settings").unwrap();
+        for (register, remove) in registrars.into_iter().zip(unregister) {
+            for result in [
+                register(&config, &test_servers(), &Output::quiet()),
+                remove(&config, &test_server_names(), &Output::quiet()),
+            ] {
+                let error = result.unwrap_err();
+                assert!(matches!(error, AgentConfigError::Read { .. }));
+                assert!(
+                    error
+                        .source()
+                        .unwrap()
+                        .downcast_ref::<std::io::Error>()
+                        .is_some()
+                );
+                assert_eq!(
+                    fs::read_to_string(&sentinel).unwrap(),
+                    "keep-existing-settings"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn json_mcp_preserves_extensions_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent.json");
+        for (register, key) in json_registrars() {
+            let mut original = json!({"unknown": [1, 2]});
+            original[key] = json!({
+                "someone-else": {"command": "keep me", "vendor": true},
+                "symposium": {"command": "stale", "vendor": {"preserve": true}, "url": "old-url", "serverUrl": "old-antigravity-url"}
+            });
+            fs::write(&path, original.to_string()).unwrap();
+            register(&path, &test_servers(), &Output::quiet()).unwrap();
+            let first = fs::read_to_string(&path).unwrap();
+            let updated: serde_json::Value = serde_json::from_str(&first).unwrap();
+            assert_eq!(updated["unknown"], original["unknown"]);
+            assert_eq!(updated[key]["someone-else"], original[key]["someone-else"]);
+            assert_eq!(
+                updated[key]["symposium"]["vendor"],
+                original[key]["symposium"]["vendor"]
+            );
+            assert!(
+                updated[key]["symposium"].get("url").is_none(),
+                "stale transport was removed"
+            );
+            assert!(
+                updated[key]["symposium"].get("serverUrl").is_none(),
+                "stale Antigravity transport was removed"
+            );
+            register(&path, &test_servers(), &Output::quiet()).unwrap();
+            assert_eq!(first, fs::read_to_string(&path).unwrap());
+        }
+    }
+
+    #[test]
+    fn json_mcp_accepts_missing_and_whitespace_files() {
+        for contents in [None, Some(" \n\t")] {
+            for (register, key) in json_registrars() {
+                let tmp = tempfile::tempdir().unwrap();
+                let path = tmp.path().join("agent.json");
+                if let Some(contents) = contents {
+                    fs::write(&path, contents).unwrap();
+                }
+                register(&path, &test_servers(), &Output::quiet()).unwrap();
+                let value: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+                assert!(value[key]["symposium"].is_object());
+            }
+        }
+    }
+
+    #[test]
+    fn json_mcp_removal_rejects_wrong_shapes_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent.json");
+        for original in [
+            "null",
+            "[]",
+            r#"{"mcpServers":null}"#,
+            r#"{"mcpServers":[]}"#,
+            r#"{"mcpServers":{"symposium":null}}"#,
+        ] {
+            fs::write(&path, original).unwrap();
+            assert!(
+                unregister_claude_mcp_servers(&path, &["symposium"], &Output::quiet()).is_err()
+            );
+            assert_eq!(original, fs::read_to_string(&path).unwrap());
+        }
+    }
+
+    #[test]
+    fn codex_toml_rejects_parse_and_shape_errors_without_writing() {
+        use std::error::Error as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        for original in [
+            "model = 'synthetic-secret-canary'\n[broken",
+            "mcp_servers = 1",
+            "mcp_servers = []",
+            "mcp_servers = 'synthetic-secret-canary'",
+            "[mcp_servers]\nsymposium = false",
+        ] {
+            fs::write(&path, original).unwrap();
+            let error =
+                register_codex_mcp_servers(&path, &test_servers(), &Output::quiet()).unwrap_err();
+            assert!(!error.to_string().contains("synthetic-secret-canary"));
+            if matches!(error, AgentConfigError::Toml { .. }) {
+                assert!(error.source().is_some());
+            }
+            assert_eq!(original, fs::read_to_string(&path).unwrap());
+            assert!(unregister_codex_mcp_servers(&path, &["symposium"], &Output::quiet()).is_err());
+            assert_eq!(original, fs::read_to_string(&path).unwrap());
+        }
+    }
+
+    #[test]
+    fn codex_toml_preserves_unknown_settings_and_accepts_inline_tables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = "model = 'keep'\nmcp_servers = { other = { command = 'keep' }, symposium = { command = 'stale', vendor = { keep = true } } }\n";
+        fs::write(&path, original).unwrap();
+        register_codex_mcp_servers(&path, &test_servers(), &Output::quiet()).unwrap();
+        let first = fs::read_to_string(&path).unwrap();
+        let value: toml::Value = toml::from_str(&first).unwrap();
+        assert_eq!(value["model"].as_str(), Some("keep"));
+        assert_eq!(
+            value["mcp_servers"]["other"]["command"].as_str(),
+            Some("keep")
+        );
+        assert_eq!(
+            value["mcp_servers"]["symposium"]["vendor"]["keep"].as_bool(),
+            Some(true)
+        );
+        register_codex_mcp_servers(&path, &test_servers(), &Output::quiet()).unwrap();
+        assert_eq!(first, fs::read_to_string(&path).unwrap());
+        unregister_codex_mcp_servers(&path, &["symposium"], &Output::quiet()).unwrap();
+        let value: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            value["mcp_servers"]["other"]["command"].as_str(),
+            Some("keep")
+        );
+        assert!(value["mcp_servers"].get("symposium").is_none());
+    }
+
+    #[test]
+    fn codex_toml_accepts_missing_and_whitespace_files() {
+        for contents in [None, Some(" \n\t")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("config.toml");
+            if let Some(contents) = contents {
+                fs::write(&path, contents).unwrap();
+            }
+            register_codex_mcp_servers(&path, &test_servers(), &Output::quiet()).unwrap();
+            let value: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                value["mcp_servers"]["symposium"]["command"].as_str(),
+                Some("/usr/local/bin/cargo-agents")
+            );
+        }
     }
 
     /// A pair-list `env` is skipped or rejected by every client, silently when
@@ -1001,20 +1356,15 @@ mod tests {
     }
 
     #[test]
-    fn register_claude_recovers_non_object_container() {
+    fn register_claude_rejects_non_object_container_without_writing() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
-        // mcpServers is a string instead of an object
-        save_json(&path, &json!({"mcpServers": "corrupted"})).unwrap();
-
-        register_claude_mcp_servers(&path, &test_servers(), &Output::quiet()).unwrap();
-
-        let settings: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            settings["mcpServers"]["symposium"]["command"],
-            "/usr/local/bin/cargo-agents"
-        );
+        let original = r#"{ "mcpServers": "corrupted", "unknown": true }"#;
+        fs::write(&path, original).unwrap();
+        let error =
+            register_claude_mcp_servers(&path, &test_servers(), &Output::quiet()).unwrap_err();
+        assert!(matches!(error, AgentConfigError::Shape { .. }));
+        assert_eq!(original, fs::read_to_string(&path).unwrap());
     }
 
     #[test]

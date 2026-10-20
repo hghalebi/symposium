@@ -9,8 +9,9 @@ mod mcp_server_registration;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
-use serde_json::json;
+use anyhow::Result;
+use serde_json::{Map, Value, json};
+use thiserror::Error;
 
 use crate::config::Symposium;
 use crate::output::{Output, display_path};
@@ -41,8 +42,8 @@ pub enum Agent {
 }
 
 impl Agent {
-    /// Parse an agent name from a config string.
-    pub fn from_config_name(name: &str) -> Result<Self> {
+    /// Parse a supported agent name without including untrusted names in diagnostics.
+    pub fn try_from_config_name(name: &str) -> std::result::Result<Self, AgentConfigError> {
         match name {
             "antigravity" => Ok(Agent::Antigravity),
             "claude" => Ok(Agent::Claude),
@@ -51,10 +52,16 @@ impl Agent {
             "goose" => Ok(Agent::Goose),
             "kiro" => Ok(Agent::Kiro),
             "opencode" => Ok(Agent::OpenCode),
-            other => bail!(
-                "unknown agent: {other} (expected antigravity, claude, codex, copilot, goose, kiro, or opencode)"
-            ),
+            _ => Err(AgentConfigError::UnknownAgent),
         }
+    }
+
+    /// Parse an agent name from a config string.
+    ///
+    /// Legacy error-erasing adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_from_config_name`] for structured failures.
+    pub fn from_config_name(name: &str) -> Result<Self> {
+        Self::try_from_config_name(name).map_err(Into::into)
     }
 
     /// Config name as stored in TOML.
@@ -100,16 +107,38 @@ impl Agent {
     // Skill installation paths
     // -----------------------------------------------------------------------
 
+    /// Resolve a project skill directory after validating the single directory name.
+    pub fn try_project_skill_dir(
+        &self,
+        project_root: &Path,
+        skill_name: &str,
+    ) -> std::result::Result<PathBuf, AgentConfigError> {
+        if !crate::skills::is_safe_dir_name(skill_name) {
+            return Err(AgentConfigError::UnsafeSkillName);
+        }
+        Ok(self.project_skill_path(project_root, skill_name))
+    }
+
     /// Project-level skill directory for a given skill name.
     ///
-    /// Claude Code requires `.claude/skills/`, while Antigravity, Copilot and
-    /// Antigravity, Codex and Copilot support the vendor-neutral
+    /// Claude Code requires `.claude/skills/`; Antigravity, Codex and Copilot
+    /// support the vendor-neutral
     /// `.agents/skills/` path.
+    ///
+    /// Legacy infallible adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_project_skill_dir`] when the name is not already validated.
+    ///
+    /// # Panics
+    /// Panics when `skill_name` is not a safe single directory name.
     pub fn project_skill_dir(&self, project_root: &Path, skill_name: &str) -> PathBuf {
         assert!(
             crate::skills::is_safe_dir_name(skill_name),
             "unsafe skill directory name {skill_name:?}"
         );
+        self.project_skill_path(project_root, skill_name)
+    }
+
+    fn project_skill_path(&self, project_root: &Path, skill_name: &str) -> PathBuf {
         match self {
             Agent::Claude => project_root.join(".claude").join("skills").join(skill_name),
             Agent::Antigravity | Agent::Codex | Agent::Copilot => {
@@ -121,12 +150,34 @@ impl Agent {
         }
     }
 
+    /// Resolve a supported global skill directory after validating its name.
+    pub fn try_global_skill_dir(
+        &self,
+        home: &Path,
+        skill_name: &str,
+    ) -> std::result::Result<Option<PathBuf>, AgentConfigError> {
+        if !crate::skills::is_safe_dir_name(skill_name) {
+            return Err(AgentConfigError::UnsafeSkillName);
+        }
+        Ok(self.global_skill_path(home, skill_name))
+    }
+
     /// Global skill directory for a given skill name, if supported.
+    ///
+    /// Legacy infallible adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_global_skill_dir`] when the name is not already validated.
+    ///
+    /// # Panics
+    /// Panics when `skill_name` is not a safe single directory name.
     pub fn global_skill_dir(&self, home: &Path, skill_name: &str) -> Option<PathBuf> {
         assert!(
             crate::skills::is_safe_dir_name(skill_name),
             "unsafe skill directory name {skill_name:?}"
         );
+        self.global_skill_path(home, skill_name)
+    }
+
+    fn global_skill_path(&self, home: &Path, skill_name: &str) -> Option<PathBuf> {
         match self {
             // Antigravity's shared config root, the one location all three of its
             // surfaces (CLI, IDE, web) read.
@@ -150,12 +201,25 @@ impl Agent {
     // -----------------------------------------------------------------------
 
     /// Register hooks in the project-level agent config.
+    /// Legacy error-erasing adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_register_project_hooks`] for structured failures.
     pub fn register_project_hooks(
+        &self,
+        project_root: &Path,
+        sym: &Symposium,
+        out: &Output,
+    ) -> Result<()> {
+        self.try_register_project_hooks(project_root, sym, out)
+            .map_err(Into::into)
+    }
+
+    /// Register project hooks while preserving malformed files and typed failures.
+    pub fn try_register_project_hooks(
         &self,
         project_root: &Path,
         _sym: &Symposium,
         out: &Output,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), AgentConfigError> {
         match self {
             Agent::Antigravity => {
                 register_antigravity_hooks(&project_root.join(".agents").join("hooks.json"), out)
@@ -186,7 +250,19 @@ impl Agent {
     }
 
     /// Register hooks in the global agent config.
-    pub fn register_hooks(&self, home: &Path, _sym: &Symposium, out: &Output) -> Result<()> {
+    /// Legacy error-erasing adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_register_hooks`] for structured failures.
+    pub fn register_hooks(&self, home: &Path, sym: &Symposium, out: &Output) -> Result<()> {
+        self.try_register_hooks(home, sym, out).map_err(Into::into)
+    }
+
+    /// Register global hooks while preserving malformed files and typed failures.
+    pub fn try_register_hooks(
+        &self,
+        home: &Path,
+        _sym: &Symposium,
+        out: &Output,
+    ) -> std::result::Result<(), AgentConfigError> {
         tracing::debug!(agent = %self.config_name(), "registering hooks");
         // Register hooks
         match self {
@@ -288,6 +364,8 @@ impl Agent {
     }
 
     /// Register MCP servers in the agent's config for `scope`.
+    /// Legacy error-erasing adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_register_mcp_servers`] for structured failures.
     pub fn register_mcp_servers(
         &self,
         scope: McpScope,
@@ -296,6 +374,19 @@ impl Agent {
         servers: &[sacp::schema::McpServer],
         out: &Output,
     ) -> Result<()> {
+        self.try_register_mcp_servers(scope, project_root, home, servers, out)
+            .map_err(Into::into)
+    }
+
+    /// Register MCP servers for the requested scope with structured failures.
+    pub fn try_register_mcp_servers(
+        &self,
+        scope: McpScope,
+        project_root: &Path,
+        home: &Path,
+        servers: &[sacp::schema::McpServer],
+        out: &Output,
+    ) -> std::result::Result<(), AgentConfigError> {
         tracing::debug!(agent = %self.config_name(), count = servers.len(), ?scope, "registering MCP servers");
         let path = self.mcp_config_path(scope, project_root, home);
         match self {
@@ -322,6 +413,8 @@ impl Agent {
     }
 
     /// Remove MCP servers from the agent's config for `scope`.
+    /// Legacy error-erasing adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_unregister_mcp_servers`] for structured failures.
     pub fn unregister_mcp_servers(
         &self,
         scope: McpScope,
@@ -330,6 +423,19 @@ impl Agent {
         names: &[&str],
         out: &Output,
     ) -> Result<()> {
+        self.try_unregister_mcp_servers(scope, project_root, home, names, out)
+            .map_err(Into::into)
+    }
+
+    /// Remove only the named MCP servers, preserving unrelated agent settings.
+    pub fn try_unregister_mcp_servers(
+        &self,
+        scope: McpScope,
+        project_root: &Path,
+        home: &Path,
+        names: &[&str],
+        out: &Output,
+    ) -> std::result::Result<(), AgentConfigError> {
         let path = self.mcp_config_path(scope, project_root, home);
         match self {
             Agent::Claude => {
@@ -355,44 +461,86 @@ impl Agent {
     }
 
     /// Remove hooks from the project-level agent config.
-    pub fn unregister_project_hooks(&self, project_root: &Path, _sym: &Symposium, out: &Output) {
-        match self {
-            Agent::Antigravity => {
-                unregister_antigravity_hooks(&project_root.join(".agents").join("hooks.json"), out)
-            }
-            Agent::Claude => {
-                unregister_claude_hooks(&project_root.join(".claude").join("settings.json"), out)
-            }
-            Agent::Codex => {
-                unregister_codex_hooks(&project_root.join(".codex").join("hooks.json"), out)
-            }
-            Agent::Copilot => {
-                unregister_copilot_hooks(&project_root.join(".github").join("hooks"), out)
-            }
-            Agent::Kiro => unregister_kiro_hooks(&project_root.join(".kiro").join("agents"), out),
-            Agent::Goose => {}    // no hooks to unregister
-            Agent::OpenCode => {} // no hooks to unregister
+    ///
+    /// Legacy best-effort adapter retained until the root crate's 0.6 release.
+    /// Rejected configuration remains unchanged and the failure is reported.
+    pub fn unregister_project_hooks(&self, project_root: &Path, sym: &Symposium, out: &Output) {
+        if let Err(error) = self.try_unregister_project_hooks(project_root, sym, out) {
+            out.warn(error);
         }
     }
 
-    /// Remove hooks from the global agent config.
-    pub fn unregister_hooks(&self, home: &Path, _sym: &Symposium, out: &Output) {
-        match self {
-            Agent::Antigravity => unregister_antigravity_hooks(
-                &home.join(".gemini").join("config").join("hooks.json"),
-                out,
+    /// Remove project hooks while preserving structured failures.
+    pub fn try_unregister_project_hooks(
+        &self,
+        project_root: &Path,
+        _sym: &Symposium,
+        out: &Output,
+    ) -> std::result::Result<(), AgentConfigError> {
+        let (path, layout) = match self {
+            Agent::Antigravity => (
+                project_root.join(".agents/hooks.json"),
+                HookConfigLayout::Antigravity,
             ),
-            Agent::Claude => {
-                unregister_claude_hooks(&home.join(".claude").join("settings.json"), out)
-            }
-            Agent::Codex => unregister_codex_hooks(&home.join(".codex").join("hooks.json"), out),
-            Agent::Copilot => {
-                unregister_copilot_hooks_global(&home.join(".copilot").join("settings.json"), out)
-            }
-            Agent::Kiro => unregister_kiro_hooks(&home.join(".kiro").join("agents"), out),
-            Agent::Goose => {}    // no hooks to unregister
-            Agent::OpenCode => {} // no hooks to unregister
+            Agent::Claude => (
+                project_root.join(".claude/settings.json"),
+                HookConfigLayout::Grouped,
+            ),
+            Agent::Codex => (
+                project_root.join(".codex/hooks.json"),
+                HookConfigLayout::Grouped,
+            ),
+            Agent::Copilot => (
+                project_root.join(".github/hooks/symposium.json"),
+                HookConfigLayout::CopilotProject,
+            ),
+            Agent::Kiro => (
+                project_root.join(".kiro/agents/symposium.json"),
+                HookConfigLayout::Kiro,
+            ),
+            Agent::Goose | Agent::OpenCode => return Ok(()),
+        };
+        try_unregister_hook_file_with_output(&path, layout, out)
+    }
+
+    /// Remove hooks from the global agent config.
+    ///
+    /// Legacy best-effort adapter retained until the root crate's 0.6 release.
+    /// Rejected configuration remains unchanged and the failure is reported.
+    pub fn unregister_hooks(&self, home: &Path, sym: &Symposium, out: &Output) {
+        if let Err(error) = self.try_unregister_hooks(home, sym, out) {
+            out.warn(error);
         }
+    }
+
+    /// Remove global hooks while preserving structured failures.
+    pub fn try_unregister_hooks(
+        &self,
+        home: &Path,
+        _sym: &Symposium,
+        out: &Output,
+    ) -> std::result::Result<(), AgentConfigError> {
+        let (path, layout) = match self {
+            Agent::Antigravity => (
+                home.join(".gemini/config/hooks.json"),
+                HookConfigLayout::Antigravity,
+            ),
+            Agent::Claude => (
+                home.join(".claude/settings.json"),
+                HookConfigLayout::Grouped,
+            ),
+            Agent::Codex => (home.join(".codex/hooks.json"), HookConfigLayout::Grouped),
+            Agent::Copilot => (
+                home.join(".copilot/settings.json"),
+                HookConfigLayout::CopilotSettings,
+            ),
+            Agent::Kiro => (
+                home.join(".kiro/agents/symposium.json"),
+                HookConfigLayout::Kiro,
+            ),
+            Agent::Goose | Agent::OpenCode => return Ok(()),
+        };
+        try_unregister_hook_file_with_output(&path, layout, out)
     }
 }
 
@@ -400,18 +548,14 @@ impl Agent {
 // Claude Code hook registration
 // ---------------------------------------------------------------------------
 
-fn register_claude_hooks(settings_path: &Path, out: &Output) -> Result<()> {
+fn register_claude_hooks(
+    settings_path: &Path,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
     let mut settings = load_json_or_empty(settings_path)?;
     let display = display_path(settings_path);
-
-    let hooks = settings
-        .as_object_mut()
-        .unwrap()
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
-
-    let hooks_obj = hooks.as_object_mut().unwrap();
-
+    let root = json_object_mut(&mut settings, settings_path, "")?;
+    let hooks = json_object_entry_mut(root, "hooks", settings_path, "/hooks")?;
     let mut added = Vec::new();
 
     for event in [
@@ -422,7 +566,18 @@ fn register_claude_hooks(settings_path: &Path, out: &Output) -> Result<()> {
         "Stop",
     ] {
         let command = format!("cargo-agents hook claude {}", event_to_cli_arg(event));
-        if ensure_claude_hook_entry(hooks_obj, event, &command) {
+        let entry = json!({
+            "matcher": "*",
+            "hooks": [{ "type": "command", "command": command }]
+        });
+        if ensure_hook_entry(
+            hooks,
+            event,
+            entry,
+            settings_path,
+            "/hooks",
+            HookEntryShape::Grouped,
+        )? {
             added.push(event);
         }
     }
@@ -433,66 +588,21 @@ fn register_claude_hooks(settings_path: &Path, out: &Output) -> Result<()> {
         save_json(settings_path, &settings)?;
         out.done(format!("{display}: added hooks ({})", added.join(", ")));
     }
-
     Ok(())
-}
-
-/// Returns `true` if a new entry was added, `false` if already registered.
-fn ensure_claude_hook_entry(
-    hooks: &mut serde_json::Map<String, serde_json::Value>,
-    event: &str,
-    command: &str,
-) -> bool {
-    let event_hooks = hooks.entry(event).or_insert_with(|| json!([]));
-
-    let arr = match event_hooks.as_array_mut() {
-        Some(a) => a,
-        None => return false,
-    };
-
-    let already_registered = arr.iter().any(|group| {
-        group
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .is_some_and(|hooks| {
-                hooks.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.starts_with("cargo-agents hook"))
-                })
-            })
-    });
-
-    if already_registered {
-        return false;
-    }
-
-    arr.push(json!({
-        "matcher": "*",
-        "hooks": [{
-            "type": "command",
-            "command": command
-        }]
-    }));
-    true
 }
 
 // ---------------------------------------------------------------------------
 // Codex CLI hook registration
 // ---------------------------------------------------------------------------
 
-fn register_codex_hooks(hooks_path: &Path, out: &Output) -> Result<()> {
+fn register_codex_hooks(
+    hooks_path: &Path,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
     let mut settings = load_json_or_empty(hooks_path)?;
     let display = display_path(hooks_path);
-
-    let hooks = settings
-        .as_object_mut()
-        .unwrap()
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
-
-    let hooks_obj = hooks.as_object_mut().unwrap();
-
+    let root = json_object_mut(&mut settings, hooks_path, "")?;
+    let hooks = json_object_entry_mut(root, "hooks", hooks_path, "/hooks")?;
     let mut added = Vec::new();
 
     for event in [
@@ -502,7 +612,18 @@ fn register_codex_hooks(hooks_path: &Path, out: &Output) -> Result<()> {
         "SessionStart",
     ] {
         let command = format!("cargo-agents hook codex {}", event_to_cli_arg(event));
-        if ensure_codex_hook_entry(hooks_obj, event, &command) {
+        let entry = json!({
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": command, "timeout": 10 }]
+        });
+        if ensure_hook_entry(
+            hooks,
+            event,
+            entry,
+            hooks_path,
+            "/hooks",
+            HookEntryShape::Grouped,
+        )? {
             added.push(event);
         }
     }
@@ -513,53 +634,12 @@ fn register_codex_hooks(hooks_path: &Path, out: &Output) -> Result<()> {
         save_json(hooks_path, &settings)?;
         out.done(format!("{display}: added hooks ({})", added.join(", ")));
     }
-
     Ok(())
 }
 
-/// Returns `true` if a new entry was added, `false` if already registered.
-fn ensure_codex_hook_entry(
-    hooks: &mut serde_json::Map<String, serde_json::Value>,
-    event: &str,
-    command: &str,
-) -> bool {
-    let event_hooks = hooks.entry(event).or_insert_with(|| json!([]));
-
-    let arr = match event_hooks.as_array_mut() {
-        Some(a) => a,
-        None => return false,
-    };
-
-    let already_registered = arr.iter().any(|group| {
-        group
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .is_some_and(|hooks| {
-                hooks.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.starts_with("cargo-agents hook"))
-                })
-            })
-    });
-
-    if already_registered {
-        return false;
-    }
-
-    arr.push(json!({
-        "matcher": "",
-        "hooks": [{
-            "type": "command",
-            "command": command,
-            "timeout": 10
-        }]
-    }));
-    true
-}
-
+#[cfg(test)]
 fn unregister_codex_hooks(hooks_path: &Path, out: &Output) {
-    unregister_settings_hooks(hooks_path, "cargo-agents hook", out);
+    unregister_hook_file(hooks_path, HookConfigLayout::Grouped, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -567,73 +647,57 @@ fn unregister_codex_hooks(hooks_path: &Path, out: &Output) {
 // ---------------------------------------------------------------------------
 
 /// Register hooks in the global Copilot user settings file (`~/.copilot/settings.json`).
-fn register_copilot_hooks_global(config_path: &Path, out: &Output) -> Result<()> {
-    let display = display_path(config_path);
-    let mut config = load_json_or_empty(config_path)?;
-
-    let hooks = config
-        .as_object_mut()
-        .unwrap()
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
-
-    let hooks_obj = hooks.as_object_mut().unwrap();
-
-    // Check if already registered
-    let already = hooks_obj.values().any(|arr| {
-        arr.as_array().is_some_and(|a| {
-            a.iter().any(|h| {
-                h.get("bash")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|c| c.starts_with("cargo-agents hook"))
-            })
-        })
-    });
-
-    if already {
-        out.already_ok(format!("{display}: hooks already registered"));
-        return Ok(());
-    }
-
-    let copilot_hooks = copilot_hook_entries();
-    for (event, entry) in copilot_hooks {
-        let arr = hooks_obj.entry(event).or_insert_with(|| json!([]));
-        if let Some(a) = arr.as_array_mut() {
-            a.push(entry);
-        }
-    }
-
-    save_json(config_path, &config)?;
-    out.done(format!("{display}: added hooks"));
-    Ok(())
+fn register_copilot_hooks_global(
+    config_path: &Path,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
+    register_copilot_hooks_file(config_path, false, out)
 }
 
 /// Register hooks in a project-level Copilot hooks directory (`.github/hooks/`).
-fn register_copilot_hooks(hooks_dir: &Path, out: &Output) -> Result<()> {
-    fs::create_dir_all(hooks_dir)?;
-    let hook_file = hooks_dir.join("symposium.json");
-    let display = display_path(&hook_file);
+fn register_copilot_hooks(
+    hooks_dir: &Path,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
+    register_copilot_hooks_file(&hooks_dir.join("symposium.json"), true, out)
+}
 
-    if hook_file.exists() {
-        let existing = fs::read_to_string(&hook_file)?;
-        if existing.contains("cargo-agents hook") {
-            out.already_ok(format!("{display}: hooks already registered"));
-            return Ok(());
+fn register_copilot_hooks_file(
+    config_path: &Path,
+    project: bool,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
+    let display = display_path(config_path);
+    let mut config = load_json_or_empty(config_path)?;
+    let root = json_object_mut(&mut config, config_path, "")?;
+    let mut changed = false;
+    if project {
+        match root.get("version") {
+            Some(version) if version == &json!(1) => {}
+            Some(_) => return Err(config_shape(config_path, "/version", "version 1")),
+            None => {
+                root.insert("version".into(), json!(1));
+                changed = true;
+            }
         }
     }
-
-    let mut hooks_obj = serde_json::Map::new();
+    let hooks = json_object_entry_mut(root, "hooks", config_path, "/hooks")?;
     for (event, entry) in copilot_hook_entries() {
-        hooks_obj.insert(event.to_string(), json!([entry]));
+        changed |= ensure_hook_entry(
+            hooks,
+            event,
+            entry,
+            config_path,
+            "/hooks",
+            HookEntryShape::Flat("bash"),
+        )?;
     }
-
-    let hooks = json!({
-        "version": 1,
-        "hooks": hooks_obj
-    });
-
-    save_json(&hook_file, &hooks)?;
-    out.done(format!("{display}: added hooks"));
+    if changed {
+        save_json(config_path, &config)?;
+        out.done(format!("{display}: added hooks"));
+    } else {
+        out.already_ok(format!("{display}: hooks already registered"));
+    }
     Ok(())
 }
 
@@ -713,51 +777,43 @@ fn antigravity_handler(cli_arg: &str) -> serde_json::Value {
     })
 }
 
-fn register_antigravity_hooks(hooks_path: &Path, out: &Output) -> Result<()> {
+fn register_antigravity_hooks(
+    hooks_path: &Path,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
     let mut config = load_json_or_empty(hooks_path)?;
     let display = display_path(hooks_path);
-
-    let mut entry = serde_json::Map::new();
+    let root = json_object_mut(&mut config, hooks_path, "")?;
+    let hooks = json_object_entry_mut(root, ANTIGRAVITY_HOOK_NAME, hooks_path, "/symposium")?;
+    let mut added = Vec::new();
     for (event, cli_arg) in ANTIGRAVITY_EVENTS {
         let handler = antigravity_handler(cli_arg);
-        let value = if antigravity_is_tool_event(event) {
-            json!([{ "matcher": "*", "hooks": [handler] }])
+        let (entry, shape) = if antigravity_is_tool_event(event) {
+            (
+                json!({ "matcher": "*", "hooks": [handler] }),
+                HookEntryShape::Grouped,
+            )
         } else {
-            json!([handler])
+            (handler, HookEntryShape::Flat("command"))
         };
-        entry.insert((*event).to_string(), value);
+        if ensure_hook_entry(hooks, event, entry, hooks_path, "/symposium", shape)? {
+            added.push(*event);
+        }
     }
-    let entry = serde_json::Value::Object(entry);
-
-    let obj = config.as_object_mut().unwrap();
-    if obj.get(ANTIGRAVITY_HOOK_NAME) == Some(&entry) {
+    if added.is_empty() {
         out.already_ok(format!("{display}: hooks already registered"));
-        return Ok(());
+    } else {
+        save_json(hooks_path, &config)?;
+        out.done(format!("{display}: added hooks ({})", added.join(", ")));
     }
-
-    obj.insert(ANTIGRAVITY_HOOK_NAME.to_string(), entry);
-    save_json(hooks_path, &config)?;
-    let events: Vec<&str> = ANTIGRAVITY_EVENTS.iter().map(|(e, _)| *e).collect();
-    out.done(format!("{display}: added hooks ({})", events.join(", ")));
     Ok(())
 }
 
 /// Remove only symposium's own named entry, leaving hooks other tools or the
 /// user registered in the same file untouched.
+#[cfg(test)]
 fn unregister_antigravity_hooks(hooks_path: &Path, out: &Output) {
-    let display = display_path(hooks_path);
-
-    let Ok(mut config) = load_json_or_empty(hooks_path) else {
-        return;
-    };
-    let Some(obj) = config.as_object_mut() else {
-        return;
-    };
-    if obj.remove(ANTIGRAVITY_HOOK_NAME).is_some()
-        && let Ok(()) = save_json(hooks_path, &config)
-    {
-        out.removed(format!("{display}: removed hooks"));
-    }
+    unregister_hook_file(hooks_path, HookConfigLayout::Antigravity, out);
 }
 // ---------------------------------------------------------------------------
 // Kiro hook registration
@@ -771,8 +827,10 @@ fn unregister_antigravity_hooks(hooks_path: &Path, out: &Output) {
 fn merge_kiro_hooks(
     config: &mut serde_json::Value,
     default_name: &str,
-) -> (bool, Vec<&'static str>) {
-    let obj = config.as_object_mut().unwrap();
+    path: &Path,
+) -> std::result::Result<(bool, Vec<&'static str>), AgentConfigError> {
+    let obj = json_object_mut(config, path, "")?;
+    validate_kiro_fields(obj, path)?;
     let mut changed = false;
 
     // Use a helper to track insertions.
@@ -791,31 +849,36 @@ fn merge_kiro_hooks(
     // Auto-discover skills from the standard locations.
     ensure("resources", json!(["skill://.kiro/skills/**/SKILL.md",]));
 
-    let hooks = obj.entry("hooks").or_insert_with(|| {
-        changed = true;
-        json!({})
-    });
-
-    let hooks_obj = hooks.as_object_mut().unwrap();
+    changed |= !obj.contains_key("hooks");
+    let hooks_obj = json_object_entry_mut(obj, "hooks", path, "/hooks")?;
 
     let mut added = Vec::new();
     for (event, entry) in kiro_hook_entries() {
-        if ensure_kiro_hook_entry(hooks_obj, event, &entry) {
+        if ensure_hook_entry(
+            hooks_obj,
+            event,
+            entry,
+            path,
+            "/hooks",
+            HookEntryShape::Flat("command"),
+        )? {
             added.push(event);
             changed = true;
         }
     }
-    (changed, added)
+    Ok((changed, added))
 }
 
 /// Register hooks by creating a Kiro agent file (`.kiro/agents/symposium.json`).
-fn register_kiro_hooks(agents_dir: &Path, out: &Output) -> Result<()> {
-    fs::create_dir_all(agents_dir)?;
+fn register_kiro_hooks(
+    agents_dir: &Path,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
     let hook_file = agents_dir.join("symposium.json");
     let display = display_path(&hook_file);
 
     let mut config = load_json_or_empty(&hook_file)?;
-    let (changed, added) = merge_kiro_hooks(&mut config, "symposium");
+    let (changed, added) = merge_kiro_hooks(&mut config, "symposium", &hook_file)?;
 
     if !changed {
         out.already_ok(format!("{display}: hooks already registered"));
@@ -829,34 +892,6 @@ fn register_kiro_hooks(agents_dir: &Path, out: &Output) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Returns `true` if a new entry was added, `false` if already registered.
-fn ensure_kiro_hook_entry(
-    hooks: &mut serde_json::Map<String, serde_json::Value>,
-    event: &str,
-    entry: &serde_json::Value,
-) -> bool {
-    let event_hooks = hooks.entry(event).or_insert_with(|| json!([]));
-
-    let arr = match event_hooks.as_array_mut() {
-        Some(a) => a,
-        None => return false,
-    };
-
-    // Kiro uses a flat structure: each entry has `command` directly (no nested `hooks` array)
-    let already_registered = arr.iter().any(|e| {
-        e.get("command")
-            .and_then(|c| c.as_str())
-            .is_some_and(|c| c.starts_with("cargo-agents hook"))
-    });
-
-    if already_registered {
-        return false;
-    }
-
-    arr.push(entry.clone());
-    true
 }
 
 /// Kiro hook entries for all supported events.
@@ -892,114 +927,248 @@ fn kiro_hook_entries() -> Vec<(&'static str, serde_json::Value)> {
 }
 
 /// Remove the symposium agent file from a Kiro agents directory.
+#[cfg(test)]
 fn unregister_kiro_hooks(agents_dir: &Path, out: &Output) {
-    let hook_file = agents_dir.join("symposium.json");
-    if hook_file.exists() {
-        let display = display_path(&hook_file);
-        if fs::remove_file(&hook_file).is_ok() {
-            out.removed(format!("{display}: removed hooks"));
-        }
-    }
+    unregister_hook_file(
+        &agents_dir.join("symposium.json"),
+        HookConfigLayout::Kiro,
+        out,
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Hook unregistration
 // ---------------------------------------------------------------------------
 
-/// Remove symposium hooks from a Claude-style settings.json file.
-fn unregister_settings_hooks(settings_path: &Path, command_prefix: &str, out: &Output) {
-    let display = display_path(settings_path);
-
-    let Ok(mut settings) = load_json_or_empty(settings_path) else {
-        return;
-    };
-
-    let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
-        return;
-    };
-
-    let mut changed = false;
-    for (_event, arr) in hooks.iter_mut() {
-        if let Some(groups) = arr.as_array_mut() {
-            let before = groups.len();
-            groups.retain(|group| {
-                !group
-                    .get("hooks")
-                    .and_then(|h| h.as_array())
-                    .is_some_and(|hooks| {
-                        hooks.iter().any(|h| {
-                            h.get("command")
-                                .and_then(|c| c.as_str())
-                                .is_some_and(|c| c.starts_with(command_prefix))
-                        })
-                    })
-            });
-            if groups.len() < before {
-                changed = true;
-            }
-        }
-    }
-
-    if changed && let Ok(()) = save_json(settings_path, &settings) {
-        out.removed(format!("{display}: removed hooks"));
-    }
-}
-
+#[cfg(test)]
 fn unregister_claude_hooks(settings_path: &Path, out: &Output) {
-    unregister_settings_hooks(settings_path, "cargo-agents hook", out);
+    unregister_hook_file(settings_path, HookConfigLayout::Grouped, out);
 }
 
 /// Remove symposium hooks from a Copilot project hooks directory.
+#[cfg(test)]
 fn unregister_copilot_hooks(hooks_dir: &Path, out: &Output) {
-    let hook_file = hooks_dir.join("symposium.json");
-    if hook_file.exists() {
-        let display = display_path(&hook_file);
-        if fs::remove_file(&hook_file).is_ok() {
-            out.removed(format!("{display}: removed hooks"));
-        }
-    }
+    unregister_hook_file(
+        &hooks_dir.join("symposium.json"),
+        HookConfigLayout::CopilotProject,
+        out,
+    );
 }
 
 /// Remove symposium hooks from the global Copilot config.
+#[cfg(test)]
 fn unregister_copilot_hooks_global(config_path: &Path, out: &Output) {
-    unregister_flat_hooks(config_path, "bash", out);
+    unregister_hook_file(config_path, HookConfigLayout::CopilotSettings, out);
 }
 
-/// Remove symposium hooks from a JSON config where entries are flat objects
-/// with the command in `command_key` (e.g., `"command"` for Kiro, `"bash"` for Copilot).
-///
-/// Contrasts with `unregister_settings_hooks` which handles the nested
-/// `{ "hooks": [{ "command": "..." }] }` structure used by Claude/Codex.
-fn unregister_flat_hooks(config_path: &Path, command_key: &str, out: &Output) {
-    let display = display_path(config_path);
+#[derive(Clone, Copy)]
+enum HookConfigLayout {
+    Grouped,
+    CopilotSettings,
+    CopilotProject,
+    Kiro,
+    Antigravity,
+}
 
-    let Ok(mut config) = load_json_or_empty(config_path) else {
-        return;
-    };
-
-    let Some(hooks) = config.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
-        return;
-    };
-
-    let mut changed = false;
-    for (_event, arr) in hooks.iter_mut() {
-        if let Some(entries) = arr.as_array_mut() {
-            let before = entries.len();
-            entries.retain(|entry| {
-                !entry
-                    .get(command_key)
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|c| c.starts_with("cargo-agents hook"))
-            });
-            if entries.len() < before {
-                changed = true;
-            }
+impl HookConfigLayout {
+    fn container(self) -> &'static str {
+        match self {
+            Self::Antigravity => ANTIGRAVITY_HOOK_NAME,
+            Self::Grouped | Self::CopilotSettings | Self::CopilotProject | Self::Kiro => "hooks",
         }
     }
 
-    if changed && let Ok(()) = save_json(config_path, &config) {
-        out.removed(format!("{display}: removed hooks"));
+    fn event_shape(self, event: &str) -> Option<HookEntryShape> {
+        match self {
+            Self::Grouped
+                if matches!(
+                    event,
+                    "PreToolUse" | "PostToolUse" | "UserPromptSubmit" | "SessionStart" | "Stop"
+                ) =>
+            {
+                Some(HookEntryShape::Grouped)
+            }
+            Self::CopilotSettings | Self::CopilotProject
+                if matches!(
+                    event,
+                    "preToolUse" | "postToolUse" | "userPromptSubmitted" | "sessionStart"
+                ) =>
+            {
+                Some(HookEntryShape::Flat("bash"))
+            }
+            Self::Kiro
+                if matches!(
+                    event,
+                    "preToolUse" | "postToolUse" | "userPromptSubmit" | "agentSpawn"
+                ) =>
+            {
+                Some(HookEntryShape::Flat("command"))
+            }
+            Self::Antigravity if ANTIGRAVITY_EVENTS.iter().any(|(known, _)| *known == event) => {
+                Some(if antigravity_is_tool_event(event) {
+                    HookEntryShape::Grouped
+                } else {
+                    HookEntryShape::Flat("command")
+                })
+            }
+            Self::Grouped
+            | Self::CopilotSettings
+            | Self::CopilotProject
+            | Self::Kiro
+            | Self::Antigravity => None,
+        }
     }
+}
+
+fn try_unregister_hook_file_with_output(
+    path: &Path,
+    layout: HookConfigLayout,
+    out: &Output,
+) -> std::result::Result<(), AgentConfigError> {
+    if try_unregister_hook_file(path, layout)? {
+        out.removed(format!("{}: removed hooks", display_path(path)));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn unregister_hook_file(path: &Path, layout: HookConfigLayout, out: &Output) {
+    match try_unregister_hook_file(path, layout) {
+        Ok(true) => out.removed(format!("{}: removed hooks", display_path(path))),
+        Ok(false) => {}
+        Err(error) => out.warn(error),
+    }
+}
+
+fn try_unregister_hook_file(
+    path: &Path,
+    layout: HookConfigLayout,
+) -> std::result::Result<bool, AgentConfigError> {
+    let mut config = load_json_or_empty(path)?;
+    let root = json_object_mut(&mut config, path, "")?;
+    if matches!(layout, HookConfigLayout::CopilotProject)
+        && root
+            .get("version")
+            .is_some_and(|version| version != &json!(1))
+    {
+        return Err(config_shape(path, "/version", "version 1"));
+    }
+    if let HookConfigLayout::Kiro = layout {
+        validate_kiro_fields(root, path)?;
+    }
+    let container = layout.container();
+    let Some(value) = root.get_mut(container) else {
+        return Ok(false);
+    };
+    let parent_pointer = format!("/{container}");
+    let hooks = json_object_mut(value, path, &parent_pointer)?;
+    for (event, value) in hooks.iter() {
+        if let Some(shape) = layout.event_shape(event) {
+            let pointer = format!("{parent_pointer}/{event}");
+            let entries = value
+                .as_array()
+                .ok_or_else(|| config_shape(path, &pointer, "array"))?;
+            validate_hook_entries(entries, path, &pointer, shape)?;
+        }
+    }
+
+    let mut changed = false;
+    for (event, value) in hooks.iter_mut() {
+        let Some(shape) = layout.event_shape(event) else {
+            continue;
+        };
+        let pointer = format!("{parent_pointer}/{event}");
+        let entries = value
+            .as_array_mut()
+            .ok_or_else(|| config_shape(path, &pointer, "array"))?;
+        match shape {
+            HookEntryShape::Flat(key) => {
+                let before = entries.len();
+                entries.retain(|entry| !has_hook_command(entry, key));
+                changed |= before != entries.len();
+            }
+            HookEntryShape::Grouped => {
+                let mut remaining = Vec::with_capacity(entries.len());
+                for (index, mut group) in std::mem::take(entries).into_iter().enumerate() {
+                    let pointer = format!("{pointer}/{index}/hooks");
+                    let nested = group
+                        .get_mut("hooks")
+                        .and_then(Value::as_array_mut)
+                        .ok_or_else(|| config_shape(path, &pointer, "array"))?;
+                    let before = nested.len();
+                    nested.retain(|entry| !has_hook_command(entry, "command"));
+                    let removed = before != nested.len();
+                    changed |= removed;
+                    if !removed || !nested.is_empty() {
+                        remaining.push(group);
+                    }
+                }
+                *entries = remaining;
+            }
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+    if let HookConfigLayout::Antigravity = layout {
+        hooks.retain(|event, value| {
+            !(layout.event_shape(event).is_some() && value.as_array().is_some_and(Vec::is_empty))
+        });
+        if hooks.is_empty() {
+            root.remove(container);
+        }
+    }
+    if contains_only_generated_settings(&config, layout) {
+        fs::remove_file(path).map_err(|source| AgentConfigError::Remove {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    } else {
+        save_json(path, &config)?;
+    }
+    Ok(true)
+}
+
+fn contains_only_generated_settings(config: &Value, layout: HookConfigLayout) -> bool {
+    let defaults = match layout {
+        HookConfigLayout::CopilotProject => json!({"version": 1}),
+        HookConfigLayout::Kiro => {
+            json!({"name": "symposium", "tools": ["*"], "resources": ["skill://.kiro/skills/**/SKILL.md"]})
+        }
+        HookConfigLayout::Grouped
+        | HookConfigLayout::CopilotSettings
+        | HookConfigLayout::Antigravity => return false,
+    };
+    config.as_object().is_some_and(|root| {
+        root.iter().all(|(key, value)| {
+            if key == "hooks" {
+                value.as_object().is_some_and(|hooks| {
+                    hooks.iter().all(|(event, entries)| {
+                        layout.event_shape(event).is_some()
+                            && entries.as_array().is_some_and(Vec::is_empty)
+                    })
+                })
+            } else {
+                defaults.get(key) == Some(value)
+            }
+        })
+    })
+}
+
+fn validate_kiro_fields(
+    object: &Map<String, Value>,
+    path: &Path,
+) -> std::result::Result<(), AgentConfigError> {
+    for (key, expected, matches) in [
+        ("name", "string", Value::is_string as fn(&Value) -> bool),
+        ("tools", "array", Value::is_array),
+        ("resources", "array", Value::is_array),
+    ] {
+        if object.get(key).is_some_and(|value| !matches(value)) {
+            return Err(config_shape(path, &format!("/{key}"), expected));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,16 +1186,286 @@ fn event_to_cli_arg(event: &str) -> &str {
     }
 }
 
-fn load_json_or_empty(path: &Path) -> Result<serde_json::Value> {
-    if path.exists() {
-        let contents = fs::read_to_string(path)?;
-        if contents.trim().is_empty() {
-            return Ok(json!({}));
-        }
-        Ok(serde_json::from_str(&contents)?)
-    } else {
-        Ok(json!({}))
+/// Agent configuration failures with content-free diagnostics and structured sources.
+///
+/// Canonical `try_*` methods return this type directly. Legacy registration methods
+/// retain their compatible `anyhow::Result` signatures through the root 0.6 release.
+/// Format the top-level error for diagnostics: parser source displays can contain
+/// configuration contents.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum AgentConfigError {
+    /// A skill name is empty, traverses directories, or is otherwise unsafe as one component.
+    #[error("unsafe skill directory name")]
+    UnsafeSkillName,
+    /// The requested name is not one of the supported agents.
+    #[error(
+        "unknown agent (expected antigravity, claude, codex, copilot, goose, kiro, or opencode)"
+    )]
+    UnknownAgent,
+    /// A newer transport variant cannot be represented safely by this adapter.
+    #[error("unsupported MCP server transport")]
+    UnsupportedMcpServer,
+    /// The agent configuration could not be read.
+    #[error("failed to read agent configuration {path}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Existing JSON could not be parsed.
+    #[error("invalid JSON in agent configuration {path}")]
+    Json {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Existing TOML could not be parsed.
+    #[error("invalid TOML in agent configuration {path}")]
+    Toml {
+        path: PathBuf,
+        #[source]
+        source: toml_edit::TomlError,
+    },
+    /// The destination directory could not be created.
+    #[error("failed to create agent configuration directory {path}")]
+    CreateDirectory {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The proposed JSON could not be serialized.
+    #[error("failed to serialize agent configuration {path}")]
+    Serialize {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    /// The replacement contents could not be written.
+    #[error("failed to write agent configuration {path}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The atomic replacement could not be completed.
+    #[error("failed to replace agent configuration {path}")]
+    Replace {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// A generated configuration file could not be removed.
+    #[error("failed to remove agent configuration {path}")]
+    Remove {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// An existing value has an incompatible shape at the specified pointer.
+    #[error("agent configuration {path} at {pointer:?}: expected {expected}")]
+    Shape {
+        path: PathBuf,
+        pointer: String,
+        expected: &'static str,
+    },
+}
+
+fn config_shape(path: &Path, pointer: &str, expected: &'static str) -> AgentConfigError {
+    AgentConfigError::Shape {
+        path: path.to_path_buf(),
+        pointer: pointer.into(),
+        expected,
     }
+}
+
+fn json_object_mut<'a>(
+    value: &'a mut Value,
+    path: &Path,
+    pointer: &str,
+) -> std::result::Result<&'a mut Map<String, Value>, AgentConfigError> {
+    value
+        .as_object_mut()
+        .ok_or_else(|| config_shape(path, pointer, "object"))
+}
+
+fn json_object_entry_mut<'a>(
+    object: &'a mut Map<String, Value>,
+    key: &str,
+    path: &Path,
+    pointer: &str,
+) -> std::result::Result<&'a mut Map<String, Value>, AgentConfigError> {
+    json_object_mut(
+        object.entry(key).or_insert_with(|| json!({})),
+        path,
+        pointer,
+    )
+}
+
+fn json_array_entry_mut<'a>(
+    object: &'a mut Map<String, Value>,
+    key: &str,
+    path: &Path,
+    pointer: &str,
+) -> std::result::Result<&'a mut Vec<Value>, AgentConfigError> {
+    object
+        .entry(key)
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| config_shape(path, pointer, "array"))
+}
+
+#[derive(Clone, Copy)]
+enum HookEntryShape {
+    Grouped,
+    Flat(&'static str),
+}
+
+fn validate_hook_entries(
+    entries: &[Value],
+    path: &Path,
+    pointer: &str,
+    shape: HookEntryShape,
+) -> std::result::Result<(), AgentConfigError> {
+    for (index, entry) in entries.iter().enumerate() {
+        let pointer = format!("{pointer}/{index}");
+        let object = entry
+            .as_object()
+            .ok_or_else(|| config_shape(path, &pointer, "object"))?;
+        if object
+            .get("matcher")
+            .is_some_and(|matcher| !matcher.is_string())
+        {
+            return Err(config_shape(path, &format!("{pointer}/matcher"), "string"));
+        }
+        if let HookEntryShape::Flat(key) = shape
+            && object.get(key).is_some_and(|command| !command.is_string())
+        {
+            return Err(config_shape(path, &format!("{pointer}/{key}"), "string"));
+        }
+        if let HookEntryShape::Grouped = shape {
+            let nested_pointer = format!("{pointer}/hooks");
+            let hooks = object
+                .get("hooks")
+                .and_then(Value::as_array)
+                .ok_or_else(|| config_shape(path, &nested_pointer, "array"))?;
+            validate_hook_entries(
+                hooks,
+                path,
+                &nested_pointer,
+                HookEntryShape::Flat("command"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn has_hook_command(entry: &Value, key: &str) -> bool {
+    has_hook_command_prefix(entry, key, "cargo-agents hook")
+        || has_hook_command_prefix(entry, key, "symposium hook")
+}
+
+fn has_hook_command_prefix(entry: &Value, key: &str, prefix: &str) -> bool {
+    entry
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(|command| command.strip_prefix(prefix))
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(char::is_whitespace))
+}
+
+fn ensure_hook_entry(
+    hooks: &mut Map<String, Value>,
+    event: &str,
+    entry: Value,
+    path: &Path,
+    parent_pointer: &str,
+    shape: HookEntryShape,
+) -> std::result::Result<bool, AgentConfigError> {
+    let pointer = format!("{parent_pointer}/{event}");
+    let entries = json_array_entry_mut(hooks, event, path, &pointer)?;
+    validate_hook_entries(entries, path, &pointer, shape)?;
+    let mut already_registered = entries.iter().any(|entry| match shape {
+        HookEntryShape::Grouped => {
+            entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_some_and(|hooks| {
+                    hooks
+                        .iter()
+                        .any(|hook| has_hook_command_prefix(hook, "command", "cargo-agents hook"))
+                })
+        }
+        HookEntryShape::Flat(key) => has_hook_command_prefix(entry, key, "cargo-agents hook"),
+    });
+    let command_key = match shape {
+        HookEntryShape::Grouped => "command",
+        HookEntryShape::Flat(key) => key,
+    };
+    let generated_command = match shape {
+        HookEntryShape::Grouped => entry
+            .get("hooks")
+            .and_then(Value::as_array)
+            .and_then(|hooks| hooks.first())
+            .and_then(|hook| hook.get(command_key)),
+        HookEntryShape::Flat(_) => entry.get(command_key),
+    }
+    .and_then(Value::as_str)
+    .ok_or_else(|| config_shape(path, &pointer, "generated hook command"))?;
+    let mut changed = false;
+    // Replace the renamed binary in place so foreign handler and group settings survive.
+    let mut reconcile = |handlers: &mut Vec<Value>| {
+        if !already_registered
+            && let Some(legacy) = handlers
+                .iter_mut()
+                .find(|hook| has_hook_command_prefix(hook, command_key, "symposium hook"))
+        {
+            legacy[command_key] = Value::String(generated_command.to_owned());
+            already_registered = true;
+            changed = true;
+        }
+        let before = handlers.len();
+        handlers.retain(|hook| !has_hook_command_prefix(hook, command_key, "symposium hook"));
+        changed |= before != handlers.len();
+    };
+    match shape {
+        HookEntryShape::Grouped => {
+            for registered in entries.iter_mut() {
+                let handlers = registered
+                    .get_mut("hooks")
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| config_shape(path, &pointer, "hook array"))?;
+                reconcile(handlers);
+            }
+        }
+        HookEntryShape::Flat(_) => reconcile(entries),
+    }
+    if already_registered {
+        return Ok(changed);
+    }
+    entries.push(entry);
+    Ok(true)
+}
+
+fn load_json_or_empty(path: &Path) -> std::result::Result<Value, AgentConfigError> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(json!({})),
+        Err(source) => {
+            return Err(AgentConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if contents.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    let mut value = serde_json::from_str(&contents).map_err(|source| AgentConfigError::Json {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    json_object_mut(&mut value, path, "")?;
+    Ok(value)
 }
 
 /// Write JSON config, replacing the file atomically.
@@ -1037,18 +1476,33 @@ fn load_json_or_empty(path: &Path) -> Result<serde_json::Value> {
 ///
 /// Bounds torn reads, not lost updates. What keeps that window from mattering is
 /// that registration writes only when an entry actually differs.
-fn save_json(path: &Path, value: &serde_json::Value) -> Result<()> {
+fn save_json(path: &Path, value: &serde_json::Value) -> std::result::Result<(), AgentConfigError> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|source| AgentConfigError::CreateDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
-    let contents = serde_json::to_string_pretty(value)?;
+    let contents =
+        serde_json::to_string_pretty(value).map_err(|source| AgentConfigError::Serialize {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
     // Pid-suffixed so two concurrent syncs cannot share a temp path.
     let temp = path.with_extension(format!("symposium-tmp-{}", std::process::id()));
-    fs::write(&temp, contents)?;
-    if let Err(e) = fs::rename(&temp, path) {
-        let _ = fs::remove_file(&temp);
-        return Err(e.into());
+    fs::write(&temp, contents).map_err(|source| AgentConfigError::Write {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if let Err(source) = fs::rename(&temp, path) {
+        if let Err(cleanup) = fs::remove_file(&temp) {
+            tracing::warn!(error_kind = ?cleanup.kind(), "failed to remove temporary agent configuration");
+        }
+        return Err(AgentConfigError::Replace {
+            path: path.to_path_buf(),
+            source,
+        });
     }
     Ok(())
 }
@@ -1056,6 +1510,628 @@ fn save_json(path: &Path, value: &serde_json::Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_agent_name_rejects_without_echoing_untrusted_input() {
+        let error = Agent::try_from_config_name("synthetic-secret-canary").unwrap_err();
+        assert!(matches!(error, AgentConfigError::UnknownAgent));
+        assert!(!error.to_string().contains("synthetic-secret-canary"));
+        let legacy = Agent::from_config_name("synthetic-secret-canary").unwrap_err();
+        assert!(matches!(
+            legacy.downcast_ref::<AgentConfigError>(),
+            Some(AgentConfigError::UnknownAgent)
+        ));
+    }
+
+    #[test]
+    fn checked_skill_paths_validate_without_panicking_or_changing_valid_paths() {
+        let base = Path::new("root");
+        for agent in Agent::all() {
+            for name in ["", ".", "..", "../outside", "synthetic-secret-canary/child"] {
+                for error in [
+                    agent.try_project_skill_dir(base, name).unwrap_err(),
+                    agent.try_global_skill_dir(base, name).unwrap_err(),
+                ] {
+                    assert!(matches!(error, AgentConfigError::UnsafeSkillName));
+                    assert!(!error.to_string().contains("synthetic-secret-canary"));
+                }
+            }
+            assert_eq!(
+                agent.try_project_skill_dir(base, "safe-skill").unwrap(),
+                agent.project_skill_dir(base, "safe-skill"),
+            );
+            assert_eq!(
+                agent.try_global_skill_dir(base, "safe-skill").unwrap(),
+                agent.global_skill_dir(base, "safe-skill"),
+            );
+        }
+    }
+
+    #[test]
+    fn checked_public_hook_changes_preserve_parser_sources_and_rejected_bytes() {
+        use std::error::Error as _;
+
+        for (agent, file) in [
+            (Agent::Antigravity, ".agents/hooks.json"),
+            (Agent::Claude, ".claude/settings.json"),
+            (Agent::Codex, ".codex/hooks.json"),
+            (Agent::Copilot, ".github/hooks/symposium.json"),
+            (Agent::Kiro, ".kiro/agents/symposium.json"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let sym = Symposium::try_from_dir(&tmp.path().join("symposium")).unwrap();
+            let path = tmp.path().join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let original = "{invalid-json synthetic-secret-canary";
+            fs::write(&path, original).unwrap();
+            for error in [
+                agent
+                    .try_register_project_hooks(tmp.path(), &sym, &Output::quiet())
+                    .unwrap_err(),
+                agent
+                    .try_unregister_project_hooks(tmp.path(), &sym, &Output::quiet())
+                    .unwrap_err(),
+            ] {
+                assert!(matches!(error, AgentConfigError::Json { .. }));
+                assert!(error.source().unwrap().is::<serde_json::Error>());
+                assert!(!error.to_string().contains("synthetic-secret-canary"));
+                assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            }
+            let legacy = agent
+                .register_project_hooks(tmp.path(), &sym, &Output::quiet())
+                .unwrap_err();
+            assert!(matches!(
+                legacy.downcast_ref::<AgentConfigError>(),
+                Some(AgentConfigError::Json { .. })
+            ));
+        }
+    }
+
+    type HookRegistrar = fn(&Path, &Output) -> std::result::Result<(), AgentConfigError>;
+
+    struct HookRegistration {
+        register: HookRegistrar,
+        unregister: fn(&Path, &Output),
+        target: &'static str,
+        file: &'static str,
+        container: &'static str,
+        event: &'static str,
+        shape: HookEntryShape,
+    }
+
+    fn hook_registrations() -> [HookRegistration; 6] {
+        [
+            HookRegistration {
+                register: register_claude_hooks,
+                unregister: unregister_claude_hooks,
+                target: "claude.json",
+                file: "claude.json",
+                container: "hooks",
+                event: "PreToolUse",
+                shape: HookEntryShape::Grouped,
+            },
+            HookRegistration {
+                register: register_codex_hooks,
+                unregister: unregister_codex_hooks,
+                target: "codex.json",
+                file: "codex.json",
+                container: "hooks",
+                event: "PreToolUse",
+                shape: HookEntryShape::Grouped,
+            },
+            HookRegistration {
+                register: register_copilot_hooks_global,
+                unregister: unregister_copilot_hooks_global,
+                target: "copilot-global.json",
+                file: "copilot-global.json",
+                container: "hooks",
+                event: "preToolUse",
+                shape: HookEntryShape::Flat("bash"),
+            },
+            HookRegistration {
+                register: register_copilot_hooks,
+                unregister: unregister_copilot_hooks,
+                target: "copilot-project",
+                file: "copilot-project/symposium.json",
+                container: "hooks",
+                event: "preToolUse",
+                shape: HookEntryShape::Flat("bash"),
+            },
+            HookRegistration {
+                register: register_antigravity_hooks,
+                unregister: unregister_antigravity_hooks,
+                target: "antigravity.json",
+                file: "antigravity.json",
+                container: "symposium",
+                event: "PreToolUse",
+                shape: HookEntryShape::Grouped,
+            },
+            HookRegistration {
+                register: register_kiro_hooks,
+                unregister: unregister_kiro_hooks,
+                target: "kiro",
+                file: "kiro/symposium.json",
+                container: "hooks",
+                event: "preToolUse",
+                shape: HookEntryShape::Flat("command"),
+            },
+        ]
+    }
+
+    #[test]
+    fn hook_unregistration_rejects_invalid_shapes_and_reports_without_rewriting() {
+        let tmp = tempfile::tempdir().unwrap();
+        for case in hook_registrations() {
+            let file = tmp.path().join(case.file);
+            let target = tmp.path().join(case.target);
+            (case.register)(&target, &Output::quiet()).unwrap();
+            let valid: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+            let mut invalid = vec![
+                "null".to_string(),
+                "[]".to_string(),
+                "{synthetic-secret-canary".to_string(),
+            ];
+            for value in [json!(null), json!([]), json!("synthetic-secret-canary")] {
+                let mut root = valid.clone();
+                root[case.container] = value;
+                invalid.push(root.to_string());
+            }
+            for value in [
+                json!(null),
+                json!({}),
+                json!("synthetic-secret-canary"),
+                json!([null]),
+            ] {
+                let mut root = valid.clone();
+                root[case.container][case.event] = value;
+                invalid.push(root.to_string());
+            }
+            let mut bad_entry = valid.clone();
+            bad_entry[case.container][case.event] = match case.shape {
+                HookEntryShape::Grouped => {
+                    json!([{ "hooks": [{ "command": ["synthetic-secret-canary"] }] }])
+                }
+                HookEntryShape::Flat(key) => {
+                    let mut entry = json!({});
+                    entry[key] = json!(["synthetic-secret-canary"]);
+                    json!([entry])
+                }
+            };
+            invalid.push(bad_entry.to_string());
+            bad_entry[case.container][case.event] = json!([{ "matcher": null, "hooks": [] }]);
+            invalid.push(bad_entry.to_string());
+            for original in invalid {
+                fs::write(&file, &original).unwrap();
+                let output = Output::capturing();
+                (case.unregister)(&target, &output);
+                assert_eq!(
+                    original,
+                    fs::read_to_string(&file).unwrap(),
+                    "{}",
+                    case.file
+                );
+                let diagnostics = output.captured();
+                assert_eq!(diagnostics.len(), 1, "{}", case.file);
+                assert!(!diagnostics[0].contains("synthetic-secret-canary"));
+                assert!(diagnostics[0].starts_with("⚠️"));
+            }
+        }
+    }
+
+    #[test]
+    fn hook_unregistration_preserves_foreign_command_prefix_and_unknown_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        for case in hook_registrations() {
+            let target = tmp.path().join(case.target);
+            (case.register)(&target, &Output::quiet()).unwrap();
+            let file = tmp.path().join(case.file);
+            let mut original: Value =
+                serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+            original["unknown"] = json!({"preserve": true});
+            original[case.container]["FutureEvent"] = json!({"preserve": true});
+            let foreign = match case.shape {
+                HookEntryShape::Grouped => {
+                    json!({"type": "command", "command": "cargo-agents hook-custom --keep", "vendor": true})
+                }
+                HookEntryShape::Flat(key) => {
+                    let mut entry = json!({"vendor": true});
+                    entry[key] = json!("cargo-agents hook-custom --keep");
+                    entry
+                }
+            };
+            match case.shape {
+                HookEntryShape::Grouped => {
+                    original[case.container][case.event][0]["vendor"] = json!({"keep": true});
+                    original[case.container][case.event][0]["hooks"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(foreign.clone());
+                }
+                HookEntryShape::Flat(_) => original[case.container][case.event]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(foreign.clone()),
+            }
+            fs::write(&file, original.to_string()).unwrap();
+            (case.unregister)(&target, &Output::quiet());
+            let first = fs::read_to_string(&file).unwrap();
+            let updated: Value = serde_json::from_str(&first).unwrap();
+            assert_eq!(updated["unknown"], original["unknown"]);
+            assert_eq!(
+                updated[case.container]["FutureEvent"],
+                original[case.container]["FutureEvent"]
+            );
+            match case.shape {
+                HookEntryShape::Grouped => {
+                    assert_eq!(
+                        updated[case.container][case.event][0]["hooks"],
+                        json!([foreign])
+                    );
+                    assert_eq!(
+                        updated[case.container][case.event][0]["vendor"],
+                        json!({"keep": true})
+                    );
+                }
+                HookEntryShape::Flat(_) => {
+                    assert_eq!(updated[case.container][case.event], json!([foreign]))
+                }
+            }
+            (case.unregister)(&target, &Output::quiet());
+            assert_eq!(first, fs::read_to_string(&file).unwrap());
+        }
+    }
+
+    #[test]
+    fn hook_command_ownership_requires_complete_tokens() {
+        for prefix in ["cargo-agents hook", "symposium hook"] {
+            for suffix in ["", " claude pre-tool-use", "\tkiro pre-tool-use"] {
+                assert!(has_hook_command(
+                    &json!({"command": format!("{prefix}{suffix}")}),
+                    "command"
+                ));
+            }
+            for suffix in ["-custom --keep", "er --keep", "/other"] {
+                assert!(!has_hook_command(
+                    &json!({"command": format!("{prefix}{suffix}")}),
+                    "command"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn historical_hook_commands_migrate_and_cleanup_without_touching_foreign_settings() {
+        for case in hook_registrations() {
+            for (register_first, has_current) in [(false, false), (true, false), (true, true)] {
+                let tmp = tempfile::tempdir().unwrap();
+                let target = tmp.path().join(case.target);
+                let file = tmp.path().join(case.file);
+                (case.register)(&target, &Output::quiet()).unwrap();
+                let mut original: Value =
+                    serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+                original["unknown"] = json!({"preserve": [1, 2]});
+                original[case.container]["FutureEvent"] = json!({"preserve": true});
+                let key = match case.shape {
+                    HookEntryShape::Grouped => "command",
+                    HookEntryShape::Flat(key) => key,
+                };
+                let current = match case.shape {
+                    HookEntryShape::Grouped => {
+                        original[case.container][case.event][0]["hooks"][0].clone()
+                    }
+                    HookEntryShape::Flat(_) => original[case.container][case.event][0].clone(),
+                };
+                let mut historical = current.clone();
+                historical[key] = json!("symposium hook");
+                historical["legacy-extension"] = json!({"preserve": true});
+                let mut duplicate = current.clone();
+                duplicate[key] = json!("symposium hook historical-agent historical-event");
+                let foreign: Vec<Value> = [
+                    "symposium hook-custom --keep",
+                    "symposium hooker --keep",
+                    "cargo-agents hook-custom --keep",
+                    "symposium-other hook --keep",
+                ]
+                .map(|command| {
+                    let mut handler = json!({"vendor": true});
+                    handler[key] = json!(command);
+                    handler
+                })
+                .into();
+                let mut handlers = vec![historical.clone(), duplicate];
+                handlers.extend(foreign.iter().cloned());
+                if has_current {
+                    handlers.push(current.clone());
+                }
+                match case.shape {
+                    HookEntryShape::Grouped => {
+                        original[case.container][case.event][0]["vendor"] = json!({"keep": true});
+                        original[case.container][case.event][0]["hooks"] = json!(handlers);
+                    }
+                    HookEntryShape::Flat(_) => {
+                        original[case.container][case.event] = json!(handlers)
+                    }
+                }
+                fs::write(&file, original.to_string()).unwrap();
+                if register_first {
+                    (case.register)(&target, &Output::quiet()).unwrap();
+                    let first = fs::read_to_string(&file).unwrap();
+                    let registered: Value = serde_json::from_str(&first).unwrap();
+                    let handlers = match case.shape {
+                        HookEntryShape::Grouped => {
+                            &registered[case.container][case.event][0]["hooks"]
+                        }
+                        HookEntryShape::Flat(_) => &registered[case.container][case.event],
+                    }
+                    .as_array()
+                    .unwrap();
+                    assert_eq!(
+                        handlers
+                            .iter()
+                            .filter(|handler| has_hook_command_prefix(
+                                handler,
+                                key,
+                                "cargo-agents hook"
+                            ))
+                            .count(),
+                        1,
+                        "{}",
+                        case.file
+                    );
+                    assert!(!handlers.iter().any(|handler| has_hook_command_prefix(
+                        handler,
+                        key,
+                        "symposium hook"
+                    )));
+                    if !has_current {
+                        historical[key] = current[key].clone();
+                        assert_eq!(handlers[0], historical);
+                    }
+                    (case.register)(&target, &Output::quiet()).unwrap();
+                    assert_eq!(first, fs::read_to_string(&file).unwrap(), "{}", case.file);
+                }
+                (case.unregister)(&target, &Output::quiet());
+                let first = fs::read_to_string(&file).unwrap();
+                let removed: Value = serde_json::from_str(&first).unwrap();
+                assert_eq!(removed["unknown"], original["unknown"]);
+                assert_eq!(
+                    removed[case.container]["FutureEvent"],
+                    original[case.container]["FutureEvent"]
+                );
+                match case.shape {
+                    HookEntryShape::Grouped => {
+                        assert_eq!(
+                            removed[case.container][case.event][0]["vendor"],
+                            json!({"keep": true})
+                        );
+                        assert_eq!(
+                            removed[case.container][case.event][0]["hooks"],
+                            json!(foreign)
+                        );
+                    }
+                    HookEntryShape::Flat(_) => {
+                        assert_eq!(removed[case.container][case.event], json!(foreign))
+                    }
+                }
+                (case.unregister)(&target, &Output::quiet());
+                assert_eq!(first, fs::read_to_string(&file).unwrap(), "{}", case.file);
+            }
+        }
+    }
+
+    #[test]
+    fn unregistration_deletes_only_generated_dedicated_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        for case in hook_registrations() {
+            let target = tmp.path().join(case.target);
+            let file = tmp.path().join(case.file);
+            (case.register)(&target, &Output::quiet()).unwrap();
+            (case.unregister)(&target, &Output::quiet());
+            let dedicated = case.target == "kiro" || case.target == "copilot-project";
+            assert_eq!(file.exists(), !dedicated, "{}", case.file);
+            let output = Output::capturing();
+            (case.unregister)(&target, &output);
+            assert!(output.captured().is_empty());
+        }
+    }
+
+    #[test]
+    fn hook_registration_rejects_invalid_json_without_rewriting() {
+        let tmp = tempfile::tempdir().unwrap();
+        for case in hook_registrations() {
+            let file = tmp.path().join(case.file);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            let mut invalid = vec![
+                "null".to_string(),
+                "[]".to_string(),
+                "12".to_string(),
+                r#""synthetic-secret-canary""#.to_string(),
+                "{broken-json".to_string(),
+            ];
+            for value in [json!(null), json!([]), json!("synthetic-secret-canary")] {
+                let mut root = json!({"unrelated": {"keep": true}});
+                root[case.container] = value.clone();
+                invalid.push(root.to_string());
+                if !value.is_array() {
+                    root[case.container] = json!({});
+                    root[case.container][case.event] = value;
+                    invalid.push(root.to_string());
+                }
+            }
+            let mut malformed_entry = json!({});
+            malformed_entry[case.container] = json!({});
+            malformed_entry[case.container][case.event] = json!([null]);
+            invalid.push(malformed_entry.to_string());
+            malformed_entry[case.container][case.event] = json!([{ "matcher": 12, "hooks": [] }]);
+            invalid.push(malformed_entry.to_string());
+            match case.shape {
+                HookEntryShape::Grouped => {
+                    malformed_entry[case.container][case.event] =
+                        json!([{ "hooks": [{ "command": ["invalid"] }] }]);
+                    invalid.push(malformed_entry.to_string());
+                }
+                HookEntryShape::Flat(key) => {
+                    let mut entry = json!({});
+                    entry[key] = json!(["invalid"]);
+                    malformed_entry[case.container][case.event] = json!([entry]);
+                    invalid.push(malformed_entry.to_string());
+                }
+            }
+            if let HookEntryShape::Grouped = case.shape {
+                for value in [json!(null), json!({}), json!([null])] {
+                    malformed_entry[case.container][case.event] = json!([{ "hooks": value }]);
+                    invalid.push(malformed_entry.to_string());
+                }
+            }
+            for original in invalid {
+                fs::write(&file, &original).unwrap();
+                let error =
+                    (case.register)(&tmp.path().join(case.target), &Output::quiet()).unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        AgentConfigError::Json { .. } | AgentConfigError::Shape { .. }
+                    ),
+                    "{error}"
+                );
+                assert!(!error.to_string().contains("synthetic-secret-canary"));
+                assert_eq!(
+                    original,
+                    fs::read_to_string(&file).unwrap(),
+                    "{}",
+                    case.file
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hook_registration_preserves_foreign_command_prefix_and_unknown_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        for case in hook_registrations() {
+            let file = tmp.path().join(case.file);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            let entry = match case.shape {
+                HookEntryShape::Grouped => {
+                    json!({"matcher": "custom", "hooks": [{"type": "command", "command": "cargo-agents hook-custom --keep", "vendor": true}], "vendor": 1})
+                }
+                HookEntryShape::Flat(key) => {
+                    let mut entry = json!({"vendor": 1});
+                    entry[key] = json!("cargo-agents hook-custom --keep");
+                    entry
+                }
+            };
+            let mut original = json!({"unknown": {"preserve": [1, 2]}, "version": 1});
+            original[case.container] = json!({"FutureEvent": {"vendor": true}});
+            original[case.container][case.event] = json!([entry.clone()]);
+            fs::write(&file, original.to_string()).unwrap();
+            let target = tmp.path().join(case.target);
+            (case.register)(&target, &Output::quiet()).unwrap();
+            let first = fs::read_to_string(&file).unwrap();
+            let result: Value = serde_json::from_str(&first).unwrap();
+            assert_eq!(result["unknown"], original["unknown"]);
+            assert_eq!(
+                result[case.container]["FutureEvent"],
+                original[case.container]["FutureEvent"]
+            );
+            assert_eq!(result[case.container][case.event][0], entry);
+            assert_eq!(
+                result[case.container][case.event].as_array().unwrap().len(),
+                2,
+                "foreign command must not suppress registration"
+            );
+            (case.register)(&target, &Output::quiet()).unwrap();
+            assert_eq!(first, fs::read_to_string(&file).unwrap(), "{}", case.file);
+        }
+    }
+
+    #[test]
+    fn hook_registration_accepts_missing_and_whitespace_files() {
+        for contents in [None, Some("  \n\t")] {
+            let tmp = tempfile::tempdir().unwrap();
+            for case in hook_registrations() {
+                let file = tmp.path().join(case.file);
+                if let Some(contents) = contents {
+                    fs::create_dir_all(file.parent().unwrap()).unwrap();
+                    fs::write(&file, contents).unwrap();
+                }
+                (case.register)(&tmp.path().join(case.target), &Output::quiet()).unwrap();
+                let result: Value =
+                    serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+                assert!(
+                    result[case.container][case.event].is_array(),
+                    "{}",
+                    case.file
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn json_read_failure_and_parse_failure_preserve_sources() {
+        use std::error::Error as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let read = load_json_or_empty(tmp.path()).unwrap_err();
+        assert!(matches!(read, AgentConfigError::Read { .. }));
+        assert!(read.source().is_some());
+        let file = tmp.path().join("invalid.json");
+        fs::write(&file, "{synthetic-secret-canary").unwrap();
+        let parse = load_json_or_empty(&file).unwrap_err();
+        assert!(matches!(parse, AgentConfigError::Json { .. }));
+        assert!(parse.source().is_some());
+        assert!(!parse.to_string().contains("synthetic-secret-canary"));
+    }
+
+    #[test]
+    fn registration_validates_all_events_even_when_one_is_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        for case in hook_registrations() {
+            let target = tmp.path().join(case.target);
+            (case.register)(&target, &Output::quiet()).unwrap();
+            let file = tmp.path().join(case.file);
+            let mut original: Value =
+                serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+            let next_event = if case.container == "symposium" || case.event == "PreToolUse" {
+                "PostToolUse"
+            } else {
+                "postToolUse"
+            };
+            original[case.container][next_event] = json!(null);
+            let bytes = original.to_string();
+            fs::write(&file, &bytes).unwrap();
+            assert!((case.register)(&target, &Output::quiet()).is_err());
+            assert_eq!(bytes, fs::read_to_string(&file).unwrap());
+        }
+    }
+
+    #[test]
+    fn kiro_defaults_and_copilot_version_reject_wrong_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kiro = tmp.path().join("kiro");
+        fs::create_dir_all(&kiro).unwrap();
+        for original in [
+            r#"{"name":null}"#,
+            r#"{"tools":"*"}"#,
+            r#"{"resources":{}}"#,
+        ] {
+            fs::write(kiro.join("symposium.json"), original).unwrap();
+            assert!(register_kiro_hooks(&kiro, &Output::quiet()).is_err());
+            assert_eq!(
+                original,
+                fs::read_to_string(kiro.join("symposium.json")).unwrap()
+            );
+        }
+        let copilot = tmp.path().join("copilot");
+        fs::create_dir_all(&copilot).unwrap();
+        for original in [r#"{"version":2}"#, r#"{"version":"1"}"#] {
+            fs::write(copilot.join("symposium.json"), original).unwrap();
+            assert!(register_copilot_hooks(&copilot, &Output::quiet()).is_err());
+            assert_eq!(
+                original,
+                fs::read_to_string(copilot.join("symposium.json")).unwrap()
+            );
+        }
+    }
 
     #[test]
     fn agent_from_config_name() {

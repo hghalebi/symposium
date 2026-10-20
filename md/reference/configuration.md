@@ -120,6 +120,18 @@ Defines additional registries — directories or repositories offering plugins. 
 | `path` | string | — | Local directory containing plugins. Relative paths are resolved from `~/.symposium/`. |
 | `auto-update` | bool | `true` | Check for updates on startup. Only applies to `git` registries. |
 
+An operation rejects entries with both `git` and `path`, entries with neither
+field, and invalid Git sources. It reports the registry name and source rule
+without echoing the configured URL, and leaves the configuration file intact.
+This replaces the earlier implicit Git precedence for entries that set both
+fields. Keep exactly one source when repairing an existing configuration.
+
+The optional built-in `plugins/` registry may be absent. A failure to inspect
+that path is an error rather than evidence that it is absent; an existing
+unreadable registry also prevents stale-skill cleanup from treating its content
+as removed. See [Registry resolution](../design/configuration-loading.md#registry-resolution)
+for the raw-format and library compatibility boundaries.
+
 ## `[plugins]`
 
 Enablement: which plugins are allowed to run at all, as distinct from the [predicates](./predicates.md) that decide *when* an enabled plugin applies.

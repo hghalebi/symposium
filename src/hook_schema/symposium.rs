@@ -18,6 +18,12 @@ pub use symposium_sdk::hook::{
 // Allows symposium-format plugins to receive canonical InputEvent JSON.
 
 impl super::AgentHookInput for InputEvent {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }

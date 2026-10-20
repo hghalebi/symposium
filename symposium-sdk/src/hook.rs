@@ -1,19 +1,21 @@
 //! SDK for writing symposium hook handlers in Rust.
 //!
 //! A symposium hook is a program that reads a JSON event on stdin and writes a
-//! JSON response to stdout. This crate provides the types and a `run()` harness
+//! JSON response to stdout. This crate provides the types and a [`try_run`] harness
 //! so you can focus on the logic.
 //!
 //! # Example
 //!
 //! ```no_run
+//! use std::convert::Infallible;
+//! use std::io::Write as _;
 //! use std::process::ExitCode;
-//! use symposium_sdk::hook::{HookHandler, PreToolUseInput, PreToolUseOutput, run};
+//! use symposium_sdk::hook::{HookHandler, PreToolUseInput, PreToolUseOutput, try_run};
 //!
 //! struct MyHook;
 //!
-//! impl HookHandler for MyHook {
-//!     async fn pre_tool_use(&self, event: &PreToolUseInput) -> anyhow::Result<PreToolUseOutput> {
+//! impl HookHandler<Infallible> for MyHook {
+//!     async fn pre_tool_use(&self, event: &PreToolUseInput) -> Result<PreToolUseOutput, Infallible> {
 //!         if event.tool_name == "Bash" {
 //!             Ok(PreToolUseOutput::context("Remember: prefer non-destructive commands"))
 //!         } else {
@@ -23,15 +25,40 @@
 //! }
 //!
 //! fn main() -> ExitCode {
-//!     run(MyHook)
+//!     match try_run(MyHook) {
+//!         Ok(exit) => exit,
+//!         Err(error) => {
+//!             if writeln!(std::io::stderr().lock(), "symposium-hook: {error}").is_err() {
+//!                 return ExitCode::FAILURE;
+//!             }
+//!             ExitCode::FAILURE
+//!         }
+//!     }
 //! }
 //! ```
 
 pub use anyhow;
 
 use serde::{Deserialize, Serialize};
-use std::io::Read as _;
+use std::io::{self, Read, Write};
 use std::process::ExitCode;
+
+/// A tool-event matcher is not a valid regular expression.
+///
+/// Display and Debug omit the pattern. The concrete parser source remains
+/// available through [`std::error::Error::source`] and can contain private input.
+#[derive(thiserror::Error)]
+#[error("invalid hook matcher regular expression")]
+pub struct MatcherError {
+    #[source]
+    source: regex::Error,
+}
+
+impl std::fmt::Debug for MatcherError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MatcherError")
+    }
+}
 
 // ── Event types ─────────────────────────────────────────────────────────
 
@@ -156,21 +183,34 @@ impl Input {
 
     /// Check whether this event matches the given matcher string.
     ///
-    /// For tool events (`PreToolUse`, `PostToolUse`), the matcher is a regex
-    /// tested against the tool name. For other events, all matchers match.
-    /// The wildcard `"*"` matches everything.
+    /// For tool events, the matcher is a regex tested against the tool name.
+    /// Other events and the wildcard `"*"` always match. This legacy Boolean
+    /// API returns `false` for an invalid tool-event regex until SDK 0.2; use
+    /// [`Self::try_matches_matcher`] to distinguish that error from a non-match.
     pub fn matches_matcher(&self, matcher: &str) -> bool {
-        if matcher == "*" {
-            return true;
-        }
+        self.try_matches_matcher(matcher).unwrap_or(false)
+    }
 
+    /// Check a tool-name regex without treating invalid syntax as a non-match.
+    ///
+    /// The wildcard `"*"` matches every event. Non-tool events do not inspect
+    /// the pattern and always match, preserving their event-selection contract.
+    ///
+    /// # Errors
+    /// Returns [`MatcherError`] if a tool-event regex cannot be compiled.
+    pub fn try_matches_matcher(&self, matcher: &str) -> Result<bool, MatcherError> {
+        if matcher == "*" {
+            return Ok(true);
+        }
         let tool_name = match self {
             Input::PreToolUse(p) => &p.tool_name,
             Input::PostToolUse(p) => &p.tool_name,
-            Input::UserPromptSubmit(_) | Input::SessionStart(_) | Input::Stop(_) => return true,
+            Input::UserPromptSubmit(_) | Input::SessionStart(_) | Input::Stop(_) => {
+                return Ok(true);
+            }
         };
-
-        regex::Regex::new(matcher).is_ok_and(|re| re.is_match(tool_name))
+        let regex = regex::Regex::new(matcher).map_err(|source| MatcherError { source })?;
+        Ok(regex.is_match(tool_name))
     }
 }
 
@@ -518,13 +558,33 @@ impl StopOutput {
 
 // ── Handler trait ───────────────────────────────────────────────────────
 
-/// Default dispatch logic: matches on the event variant and calls the
-/// corresponding method on the handler, wrapping the result in the appropriate
-/// `Output` variant.
-pub async fn default_handle_event(
-    handler: &(impl HookHandler + ?Sized),
-    input: &Input,
-) -> anyhow::Result<Output> {
+/// Default dispatch for handlers using the SDK 0.1 `anyhow` contract.
+///
+/// This supported compatibility entry point retains its single handler type
+/// parameter until SDK 0.2. New typed handlers use [`try_default_handle_event`].
+///
+/// # Errors
+///
+/// Returns the error from the event-specific handler unchanged.
+pub async fn default_handle_event<H>(handler: &H, input: &Input) -> anyhow::Result<Output>
+where
+    H: HookHandler + ?Sized,
+{
+    try_default_handle_event(handler, input).await
+}
+
+/// Dispatch an event while preserving the handler's concrete error type.
+///
+/// No thread-safety or lifetime bounds are needed: handlers execute on the
+/// calling thread and may borrow state.
+///
+/// # Errors
+///
+/// Returns the error from the event-specific handler unchanged.
+pub async fn try_default_handle_event<H, E>(handler: &H, input: &Input) -> Result<Output, E>
+where
+    H: HookHandler<E> + ?Sized,
+{
     match input {
         Input::PreToolUse(event) => Ok(Output::PreToolUse(handler.pre_tool_use(event).await?)),
         Input::PostToolUse(event) => Ok(Output::PostToolUse(handler.post_tool_use(event).await?)),
@@ -536,28 +596,25 @@ pub async fn default_handle_event(
     }
 }
 
-/// Trait for implementing a symposium hook handler.
+/// Implement the events a hook handles, selecting a concrete error type `E`.
 ///
-/// Override the methods for the events you care about. The defaults return
-/// the default (empty) output for each event type.
+/// Defaults return empty outputs. The default `anyhow::Error` parameter retains
+/// existing SDK 0.1 implementations; new handlers should select their own error
+/// type, or [`std::convert::Infallible`] when their decisions cannot fail.
 #[allow(async_fn_in_trait)] // Hook handlers run on a single-threaded runtime; Send is not needed.
-pub trait HookHandler {
-    /// Dispatch an input event to the appropriate handler method.
-    ///
-    /// The default implementation calls [`default_handle_event`], which matches
-    /// on the event variant, calls the corresponding method, and wraps the
-    /// result in the appropriate `Output` variant.
-    async fn handle_event(&self, input: &Input) -> anyhow::Result<Output> {
-        default_handle_event(self, input).await
+pub trait HookHandler<E = anyhow::Error> {
+    /// Dispatch an input to its event-specific method, preserving `E`.
+    async fn handle_event(&self, input: &Input) -> Result<Output, E> {
+        try_default_handle_event(self, input).await
     }
 
     /// Called before the agent invokes a tool.
-    async fn pre_tool_use(&self, _event: &PreToolUseInput) -> anyhow::Result<PreToolUseOutput> {
+    async fn pre_tool_use(&self, _event: &PreToolUseInput) -> Result<PreToolUseOutput, E> {
         Ok(PreToolUseOutput::default())
     }
 
     /// Called after a tool completes.
-    async fn post_tool_use(&self, _event: &PostToolUseInput) -> anyhow::Result<PostToolUseOutput> {
+    async fn post_tool_use(&self, _event: &PostToolUseInput) -> Result<PostToolUseOutput, E> {
         Ok(PostToolUseOutput::default())
     }
 
@@ -565,83 +622,446 @@ pub trait HookHandler {
     async fn user_prompt_submit(
         &self,
         _event: &UserPromptSubmitInput,
-    ) -> anyhow::Result<UserPromptSubmitOutput> {
+    ) -> Result<UserPromptSubmitOutput, E> {
         Ok(UserPromptSubmitOutput::default())
     }
 
     /// Called when an agent session begins.
-    async fn session_start(
-        &self,
-        _event: &SessionStartInput,
-    ) -> anyhow::Result<SessionStartOutput> {
+    async fn session_start(&self, _event: &SessionStartInput) -> Result<SessionStartOutput, E> {
         Ok(SessionStartOutput::default())
     }
 
     /// Called when an agent session/turn ends.
-    async fn stop(&self, _event: &StopInput) -> anyhow::Result<StopOutput> {
+    async fn stop(&self, _event: &StopInput) -> Result<StopOutput, E> {
         Ok(StopOutput::default())
     }
 }
 
 // ── Harness ─────────────────────────────────────────────────────────────
 
-/// Run a hook handler. Reads the input event from stdin, dispatches to the
-/// handler, and writes the output to stdout with the correct exit code.
+/// Failure to initialize, execute, or deliver a hook response.
 ///
-/// - Empty output (all fields `None`) → exit 0, no stdout.
-/// - Non-empty output → exit 0, JSON on stdout.
-/// - `Err(...)` → exit 1, error message on stderr.
-pub fn run(handler: impl HookHandler) -> ExitCode {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to create tokio runtime");
-    rt.block_on(run_async(handler))
+/// Display and Debug report only the failing operation. Sources remain available
+/// for structured inspection and may contain private input or handler data.
+/// The standard error implementation is available when `E` is a standard error;
+/// harness execution itself does not require that capability.
+#[derive(thiserror::Error)]
+#[non_exhaustive]
+pub enum HarnessError<E> {
+    /// A synchronous harness cannot own a runtime inside an entered runtime.
+    #[error("cannot run synchronous hook harness inside an active runtime")]
+    RuntimeAlreadyActive,
+    /// The current-thread runtime could not be created.
+    #[error("could not create hook runtime")]
+    Runtime {
+        /// The runtime construction failure.
+        #[source]
+        source: io::Error,
+    },
+    /// Standard input could not be read as UTF-8.
+    #[error("could not read hook input")]
+    ReadInput {
+        /// The input read failure.
+        #[source]
+        source: io::Error,
+    },
+    /// Input did not match the canonical hook protocol.
+    #[error("could not parse hook input")]
+    InputJson {
+        /// The original JSON parse failure.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// The selected handler returned an error.
+    #[error("hook handler failed")]
+    Handler {
+        /// The unchanged handler error.
+        #[source]
+        source: E,
+    },
+    /// The handler output could not be serialized.
+    #[error("could not serialize hook output")]
+    OutputJson {
+        /// The original JSON serialization failure.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Standard output rejected response bytes.
+    #[error("could not write hook output")]
+    WriteOutput {
+        /// The output write failure.
+        #[source]
+        source: io::Error,
+    },
+    /// Standard output could not flush the response.
+    #[error("could not flush hook output")]
+    FlushOutput {
+        /// The output flush failure.
+        #[source]
+        source: io::Error,
+    },
 }
 
-async fn run_async(handler: impl HookHandler) -> ExitCode {
-    let mut input_str = String::new();
-    if std::io::stdin().read_to_string(&mut input_str).is_err() {
-        return ExitCode::FAILURE;
+impl<E> std::fmt::Debug for HarnessError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::RuntimeAlreadyActive => "HarnessError::RuntimeAlreadyActive",
+            Self::Runtime { .. } => "HarnessError::Runtime",
+            Self::ReadInput { .. } => "HarnessError::ReadInput",
+            Self::InputJson { .. } => "HarnessError::InputJson",
+            Self::Handler { .. } => "HarnessError::Handler",
+            Self::OutputJson { .. } => "HarnessError::OutputJson",
+            Self::WriteOutput { .. } => "HarnessError::WriteOutput",
+            Self::FlushOutput { .. } => "HarnessError::FlushOutput",
+        })
     }
+}
 
-    let input: Input = match serde_json::from_str(&input_str) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("symposium-hook: failed to parse input: {e}");
-            return ExitCode::FAILURE;
+/// Run an SDK 0.1 handler, reporting a fixed diagnostic on failure.
+///
+/// This supported adapter retains its single handler type parameter until SDK
+/// 0.2. It returns exit 0 on success and exit 1 on failure. Diagnostic delivery
+/// is best effort because [`ExitCode`] cannot retain a stderr error. Prefer
+/// [`try_run`] to inspect concrete failures at the executable boundary.
+pub fn run<H: HookHandler>(handler: H) -> ExitCode {
+    match try_run(handler) {
+        Ok(exit_code) => exit_code,
+        Err(error) => {
+            let mut stderr = io::stderr().lock();
+            if writeln!(stderr, "symposium-hook: {error}")
+                .and_then(|()| stderr.flush())
+                .is_err()
+            {
+                return ExitCode::FAILURE;
+            }
+            ExitCode::FAILURE
         }
-    };
+    }
+}
 
-    let output = match handler.handle_event(&input).await {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("symposium-hook: handler error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+/// Read one canonical input, dispatch it, and deliver the canonical response.
+///
+/// Runs the handler on a current-thread runtime, without `Send`, `Sync`, or
+/// `'static` requirements. Empty allowing output writes nothing. A denial is
+/// always serialized, including when it has no additional context. Other output
+/// is one JSON line. This function emits no diagnostics; callers decide how to
+/// report errors without exposing their sources.
+///
+/// # Errors
+///
+/// Returns a typed runtime, input, handler, serialization, write, or flush error.
+/// An already entered Tokio runtime is rejected before reading input. A stream
+/// error can leave a partial response; it never indicates successful delivery.
+pub fn try_run<H, E>(handler: H) -> Result<ExitCode, HarnessError<E>>
+where
+    H: HookHandler<E>,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(HarnessError::RuntimeAlreadyActive);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| HarnessError::Runtime { source })?;
+    runtime.block_on(try_run_with(
+        &handler,
+        &mut io::stdin().lock(),
+        &mut io::stdout().lock(),
+    ))
+}
+
+async fn try_run_with<H, E>(
+    handler: &H,
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+) -> Result<ExitCode, HarnessError<E>>
+where
+    H: HookHandler<E> + ?Sized,
+{
+    let mut input_str = String::new();
+    reader
+        .read_to_string(&mut input_str)
+        .map_err(|source| HarnessError::ReadInput { source })?;
+    let input: Input =
+        serde_json::from_str(&input_str).map_err(|source| HarnessError::InputJson { source })?;
+    let output = handler
+        .handle_event(&input)
+        .await
+        .map_err(|source| HarnessError::Handler { source })?;
 
     if is_empty_output(&output) {
-        return ExitCode::SUCCESS;
+        return Ok(ExitCode::SUCCESS);
     }
 
-    match serde_json::to_string(&output) {
-        Ok(json) => println!("{json}"),
-        Err(e) => {
-            eprintln!("symposium-hook: failed to serialize output: {e}");
-            return ExitCode::FAILURE;
-        }
-    }
-
-    ExitCode::SUCCESS
+    // Complete serialization before writing any protocol bytes.
+    let json = serde_json::to_vec(&output).map_err(|source| HarnessError::OutputJson { source })?;
+    writer
+        .write_all(&json)
+        .and_then(|()| writer.write_all(b"\n"))
+        .map_err(|source| HarnessError::WriteOutput { source })?;
+    writer
+        .flush()
+        .map_err(|source| HarnessError::FlushOutput { source })?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn is_empty_output(output: &Output) -> bool {
     match output {
-        Output::PreToolUse(o) => o.additional_context.is_none() && o.updated_input.is_none(),
+        Output::PreToolUse(o) => {
+            o.decision == Decision::Allow
+                && o.additional_context.is_none()
+                && o.updated_input.is_none()
+        }
         Output::PostToolUse(o) => o.additional_context.is_none(),
         Output::UserPromptSubmit(o) => o.additional_context.is_none(),
         Output::SessionStart(o) => o.additional_context.is_none(),
         Output::Stop(o) => o.additional_context.is_none(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::convert::Infallible;
+    use std::error::Error as _;
+    use std::rc::Rc;
+
+    fn input() -> &'static [u8] {
+        br#"{"PreToolUse":{"tool_name":"Bash"}}"#
+    }
+
+    struct Allow;
+    impl HookHandler<Infallible> for Allow {}
+
+    struct Deny;
+    impl HookHandler<Infallible> for Deny {
+        async fn pre_tool_use(&self, _: &PreToolUseInput) -> Result<PreToolUseOutput, Infallible> {
+            Ok(PreToolUseOutput::new(Decision::Deny, None, None))
+        }
+    }
+
+    fn execute<H, E>(
+        handler: &H,
+        reader: &mut impl Read,
+        writer: &mut impl Write,
+    ) -> Result<ExitCode, HarnessError<E>>
+    where
+        H: HookHandler<E>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(try_run_with(handler, reader, writer))
+    }
+
+    #[test]
+    fn denial_without_context_is_delivered_as_canonical_json() {
+        let mut stdout = Vec::new();
+        assert_eq!(
+            execute(&Deny, &mut input(), &mut stdout).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(stdout, b"{\"PreToolUse\":{\"decision\":\"deny\"}}\n");
+    }
+
+    #[test]
+    fn empty_allowing_outputs_remain_silent_for_every_event() {
+        for input in [
+            r#"{"PreToolUse":{"tool_name":"Bash"}}"#,
+            r#"{"PostToolUse":{"tool_name":"Bash"}}"#,
+            r#"{"UserPromptSubmit":{}}"#,
+            r#"{"SessionStart":{}}"#,
+            r#"{"Stop":{}}"#,
+        ] {
+            let mut stdout = Vec::new();
+            assert_eq!(
+                execute(&Allow, &mut input.as_bytes(), &mut stdout).unwrap(),
+                ExitCode::SUCCESS
+            );
+            assert!(stdout.is_empty());
+        }
+    }
+
+    struct FailedRead;
+    impl Read for FailedRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "PRIVATE_READ_CANARY",
+            ))
+        }
+    }
+
+    #[test]
+    fn input_read_failure_preserves_source_and_writes_nothing() {
+        let mut stdout = Vec::new();
+        let error = execute(&Allow, &mut FailedRead, &mut stdout).unwrap_err();
+        assert!(matches!(error, HarnessError::ReadInput { .. }));
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(!format!("{error} {error:?}").contains("PRIVATE_READ_CANARY"));
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn invalid_json_preserves_parser_source_without_rendering_input() {
+        let mut stdout = Vec::new();
+        let error = execute(
+            &Allow,
+            &mut br#"{"PRIVATE_JSON_CANARY":{}}"#.as_slice(),
+            &mut stdout,
+        )
+        .unwrap_err();
+        assert!(matches!(error, HarnessError::InputJson { .. }));
+        assert!(error.source().unwrap().is::<serde_json::Error>());
+        assert!(!format!("{error} {error:?}").contains("PRIVATE_JSON_CANARY"));
+        assert!(stdout.is_empty());
+    }
+
+    struct FailedWrite;
+    impl Write for FailedWrite {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "PRIVATE_WRITE_CANARY",
+            ))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn rejected_response_is_a_typed_write_failure() {
+        let error = execute(&Deny, &mut input(), &mut FailedWrite).unwrap_err();
+        assert!(matches!(error, HarnessError::WriteOutput { .. }));
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(!format!("{error} {error:?}").contains("PRIVATE_WRITE_CANARY"));
+    }
+
+    #[derive(Default)]
+    struct FailedFlush(Vec<u8>);
+    impl Write for FailedFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "PRIVATE_FLUSH_CANARY",
+            ))
+        }
+    }
+
+    #[test]
+    fn flush_failure_does_not_claim_delivery_success() {
+        let mut stdout = FailedFlush::default();
+        let error = execute(&Deny, &mut input(), &mut stdout).unwrap_err();
+        assert!(matches!(error, HarnessError::FlushOutput { .. }));
+        assert_eq!(stdout.0, b"{\"PreToolUse\":{\"decision\":\"deny\"}}\n");
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(!format!("{error} {error:?}").contains("PRIVATE_FLUSH_CANARY"));
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("PRIVATE_HANDLER_CANARY")]
+    struct LocalError(Rc<()>);
+
+    struct LocalHandler<'a> {
+        has_run: &'a Cell<bool>,
+        marker: Rc<()>,
+    }
+
+    impl HookHandler<LocalError> for LocalHandler<'_> {
+        async fn pre_tool_use(&self, _: &PreToolUseInput) -> Result<PreToolUseOutput, LocalError> {
+            let marker = self.marker.clone();
+            std::future::ready(()).await;
+            self.has_run.set(true);
+            Err(LocalError(marker))
+        }
+    }
+
+    #[test]
+    fn borrowed_non_send_handler_and_error_need_no_extra_bounds() {
+        let has_run = Cell::new(false);
+        let marker = Rc::new(());
+        let handler = LocalHandler {
+            has_run: &has_run,
+            marker: marker.clone(),
+        };
+        let mut stdout = Vec::new();
+        let error = execute(&handler, &mut input(), &mut stdout).unwrap_err();
+        assert!(has_run.get());
+        assert!(!format!("{error} {error:?}").contains("PRIVATE_HANDLER_CANARY"));
+        let source = error
+            .source()
+            .unwrap()
+            .downcast_ref::<LocalError>()
+            .unwrap();
+        assert!(Rc::ptr_eq(&source.0, &marker));
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn typed_matcher_preserves_valid_matching_and_non_tool_contracts() {
+        let event: Input = serde_json::from_slice(input()).unwrap();
+        assert!(event.try_matches_matcher("^(Bash|Write)$").unwrap());
+        assert!(!event.try_matches_matcher("^Read$").unwrap());
+        assert!(event.try_matches_matcher("*").unwrap());
+        let non_tool = Input::SessionStart(SessionStartInput::new(None, None));
+        assert!(non_tool.try_matches_matcher("(").unwrap());
+    }
+
+    #[test]
+    fn invalid_matcher_has_a_safe_typed_source_and_legacy_false_result() {
+        let event: Input = serde_json::from_slice(input()).unwrap();
+        let pattern = "(PRIVATE_MATCHER_CANARY";
+        let error = event.try_matches_matcher(pattern).unwrap_err();
+        let source = error
+            .source()
+            .unwrap()
+            .downcast_ref::<regex::Error>()
+            .unwrap();
+        assert!(source.to_string().contains("PRIVATE_MATCHER_CANARY"));
+        assert!(!format!("{error} {error:?}").contains("PRIVATE_MATCHER_CANARY"));
+        assert!(!event.matches_matcher(pattern));
+    }
+
+    #[test]
+    fn entered_runtime_is_rejected_before_touching_process_streams() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        assert!(matches!(
+            try_run(Allow),
+            Err(HarnessError::RuntimeAlreadyActive)
+        ));
     }
 }

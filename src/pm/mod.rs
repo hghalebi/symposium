@@ -31,12 +31,18 @@ use symposium_install::UpdateLevel;
 
 use crate::plugins::Plugin;
 
+/// A concrete failure while reading a package's Cargo manifest metadata.
+pub use crate::crate_metadata::MetadataError;
+/// A concrete failure while locating a Cargo package's source directory.
+pub use crate::crate_sources::CrateSourceError;
+
 mod cargo;
 mod git;
 pub mod layout;
 mod path;
 pub use cargo::{
-    CargoPm, LoadedWorkspace, WorkspaceCrate, WorkspaceDeps, file_mtime, workspace_dir_name,
+    CargoPm, LoadedWorkspace, WorkspaceCrate, WorkspaceDeps, WorkspaceError, file_mtime,
+    try_file_mtime, try_find_workspace_root, workspace_dir_name,
 };
 pub use git::GitPm;
 pub use path::PathPm;
@@ -51,6 +57,203 @@ pub use symposium_sdk::pm::{ANY_VERSION, CARGO_PM, PackageId, PluginInfo, Unvali
 pub struct FetchedPackage {
     pub id: PackageId,
     pub root: PathBuf,
+}
+
+/// A package-manager failure with its original source and a safe diagnostic.
+///
+/// Source chains may contain registry response text or URLs. Display describes
+/// the operation without rendering those sources; callers must not print an
+/// unrestricted source chain for user-controlled package data.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PackageManagerError {
+    /// Required workspace metadata could not be resolved.
+    #[error("failed to resolve workspace dependencies")]
+    Workspace {
+        /// The original shared workspace failure.
+        source: Arc<WorkspaceError>,
+    },
+    /// No registered manager owns the package's manager tag.
+    #[error("unknown package manager `{manager}`")]
+    UnknownManager {
+        /// The requested manager tag.
+        manager: String,
+        /// The unresolved package identity.
+        id: PackageId,
+    },
+    /// A package was sent directly to a manager for a different ecosystem.
+    #[error("package manager `{expected}` cannot handle manager `{actual}`")]
+    WrongManager {
+        /// The manager that received the request.
+        expected: String,
+        /// The package's manager tag.
+        actual: String,
+    },
+    /// A registry package name could escape its configured source directory.
+    #[error("registry package path must be nonempty and relative without parent components")]
+    InvalidPackagePath {
+        /// The rejected package identity, retained without rendering its input.
+        id: PackageId,
+    },
+    /// A Git registry has no readable cached source yet.
+    #[error("registry `{name}` has not been fetched yet; run `cargo agents plugin sync {name}`")]
+    RegistryNotFetched {
+        /// The configured registry name.
+        name: String,
+    },
+    /// A local registry directory could not be inspected.
+    #[error("cannot read registry `{name}` at {}", path.display())]
+    ReadRegistry {
+        /// The configured registry name.
+        name: String,
+        /// The registry directory.
+        path: PathBuf,
+        /// The original filesystem failure.
+        source: std::io::Error,
+    },
+    /// A fetched package's source directory is absent, unreadable, or not a directory.
+    #[error("cannot read package source directory at {}", path.display())]
+    PackageSource {
+        /// The source directory returned by the package fetcher.
+        path: PathBuf,
+        /// The original filesystem failure, or a rejected non-directory kind.
+        source: std::io::Error,
+    },
+    /// A registry directory could not be enumerated as a complete source.
+    #[error("cannot enumerate registry `{name}`")]
+    RegistryLayout {
+        /// The configured registry name.
+        name: String,
+        /// The original layout or filesystem failure.
+        source: layout::LayoutError,
+    },
+    /// Cargo package-source discovery failed.
+    #[error("failed to locate Cargo package sources")]
+    FetchCrate {
+        /// The requested package identity.
+        id: PackageId,
+        /// The original source-discovery failure.
+        source: Box<CrateSourceError>,
+    },
+    /// The crates.io HTTP client could not be constructed.
+    #[error("failed to build the crates.io search client")]
+    Client {
+        /// The original client-construction failure.
+        source: reqwest::Error,
+    },
+    /// The crates.io search request or response failed.
+    #[error("crates.io search failed")]
+    SearchCrates {
+        /// The original registry failure.
+        source: crates_io_api::Error,
+    },
+    /// A Git registry could not be refreshed.
+    #[error("failed to refresh Git registry `{name}`")]
+    RefreshGitRegistry {
+        /// The configured registry name.
+        name: String,
+        /// The original Git acquisition failure.
+        source: symposium_install::git::GitError,
+    },
+    /// A package's plugin manifest could not be read or parsed.
+    #[error("failed to load a plugin: {source}")]
+    PluginLoad {
+        /// The package whose plugin could not be loaded.
+        id: PackageId,
+        /// The safe outer failure with its original parser or I/O source.
+        source: Box<crate::plugins::PluginLoadError>,
+    },
+    /// A package's parsed plugin violated the contributor contract.
+    #[error("invalid plugin at `{}`", path.display())]
+    PluginValidation {
+        /// The package whose plugin was rejected.
+        id: PackageId,
+        /// The plugin's source directory.
+        path: PathBuf,
+        /// The semantic validation failure.
+        source: Box<crate::plugins::PluginValidationError>,
+    },
+    /// A package's Cargo metadata could not be read or parsed.
+    #[error("failed to read Cargo plugin metadata")]
+    PluginMetadata {
+        /// The package whose metadata could not be loaded.
+        id: PackageId,
+        /// The concrete metadata failure.
+        source: Box<MetadataError>,
+    },
+    /// An external implementation supplies only the pre-0.6 dynamic contract.
+    ///
+    /// Built-in managers return the concrete variants above. This bridge keeps
+    /// existing downstream trait implementations source-compatible through 0.6.
+    #[error("legacy package manager `{manager}` failed to {operation}")]
+    LegacyImplementation {
+        /// The external manager's name.
+        manager: String,
+        /// The requested operation.
+        operation: &'static str,
+        /// The external implementation's original error chain.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl PackageManagerError {
+    fn legacy(manager: &str, operation: &'static str, error: anyhow::Error) -> Self {
+        Self::LegacyImplementation {
+            manager: manager.to_owned(),
+            operation,
+            source: error.reallocate_into_boxed_dyn_error_without_backtrace(),
+        }
+    }
+}
+
+/// Plugins collected together with failures and knowledge of source completeness.
+///
+/// Legacy implementations may contribute valid plugins without exposing their
+/// omitted failures. Their outcomes remain incomplete so that absence cannot
+/// authorize deletion. A collection with any reported error is always incomplete.
+#[derive(Debug)]
+pub struct PluginCollection<T> {
+    pub(crate) plugins: Vec<T>,
+    pub(crate) errors: Vec<PackageManagerError>,
+    pub(crate) is_complete: bool,
+}
+
+impl<T> PluginCollection<T> {
+    /// A producer successfully enumerated every plugin in its source.
+    pub fn complete(plugins: Vec<T>) -> Self {
+        Self {
+            plugins,
+            errors: Vec::new(),
+            is_complete: true,
+        }
+    }
+
+    /// Retain valid contributions when failures or legacy limitations hide others.
+    pub fn incomplete(plugins: Vec<T>, errors: Vec<PackageManagerError>) -> Self {
+        Self {
+            plugins,
+            errors,
+            is_complete: false,
+        }
+    }
+
+    /// Whether the producer knows no source or plugin was omitted.
+    pub fn is_complete(&self) -> bool {
+        self.is_complete && self.errors.is_empty()
+    }
+
+    /// Consume the valid plugins, reported failures, and completeness evidence.
+    pub fn into_parts(self) -> (Vec<T>, Vec<PackageManagerError>, bool) {
+        let is_complete = self.is_complete();
+        (self.plugins, self.errors, is_complete)
+    }
+
+    pub(crate) fn into_result(self) -> Result<Vec<T>, PackageManagerError> {
+        match self.errors.into_iter().next() {
+            Some(error) => Err(error),
+            None => Ok(self.plugins),
+        }
+    }
 }
 
 /// The operations every package manager implements (per the registry-centric
@@ -74,6 +277,10 @@ pub struct FetchedPackage {
 /// Validating an [`UnvalidatedPlugin`] into a [`Plugin`] is [`PmInstance`]'s
 /// job, not the PM's, because the policy depends on where the plugin came from rather than
 /// on what it says. That is the whole trust boundary: see [`PluginKind`].
+///
+/// The original fallible methods retain their dynamic error contract through
+/// root 0.6. New callers use the additive `try_*` methods; existing external
+/// implementations need not add methods until they adopt the typed contract.
 #[async_trait::async_trait]
 pub trait PackageManager {
     /// The PM's registry name — the `pm` component of every id it owns. For
@@ -93,21 +300,90 @@ pub trait PackageManager {
         Ok(self.active_plugins(&[]).await)
     }
 
+    /// List a complete registry source with a typed failure.
+    ///
+    /// The default bridges a legacy external implementation. Built-in managers
+    /// override this method to preserve their concrete error variants.
+    async fn try_registry_plugins(&self) -> Result<Vec<UnvalidatedPlugin>, PackageManagerError> {
+        self.registry_plugins().await.map_err(|error| {
+            PackageManagerError::legacy(self.name(), "list registry plugins", error)
+        })
+    }
+
+    /// Retain valid registry plugins and explicit completeness evidence.
+    ///
+    /// The default preserves a legacy implementation's contributions but cannot
+    /// know which errors its old listing suppressed, so completeness is unknown.
+    async fn registry_plugins_outcome(
+        &self,
+    ) -> Result<PluginCollection<UnvalidatedPlugin>, PackageManagerError> {
+        self.registry_plugins()
+            .await
+            .map(|plugins| PluginCollection::incomplete(plugins, Vec::new()))
+            .map_err(|error| {
+                PackageManagerError::legacy(self.name(), "list registry plugins", error)
+            })
+    }
+
     /// The plugin(s) a specific id maps to — zero, one, or many. Used for
     /// `[[plugins]]` chained references and explicitly enabled crates.
     async fn load_plugin(&self, id: &PackageId) -> Vec<UnvalidatedPlugin>;
+
+    /// Load a named plugin while propagating failures the producer can report.
+    ///
+    /// Legacy implementations keep their existing contributions. Callers that
+    /// may remove missing content must inspect [`Self::load_plugin_outcome`].
+    async fn try_load_plugin(
+        &self,
+        id: &PackageId,
+    ) -> Result<Vec<UnvalidatedPlugin>, PackageManagerError> {
+        Ok(self.load_plugin(id).await)
+    }
+
+    /// Load plugins with completeness evidence for absence-sensitive operations.
+    ///
+    /// Legacy producers keep their valid plugins; their suppressed failures are
+    /// unknown, so this default never authorizes stale-content cleanup.
+    async fn load_plugin_outcome(&self, id: &PackageId) -> PluginCollection<UnvalidatedPlugin> {
+        PluginCollection::incomplete(self.load_plugin(id).await, Vec::new())
+    }
 
     /// The package ids the current workspace depends on. Empty for PMs with no
     /// workspace notion.
     async fn list_deps(&self) -> Result<Vec<PackageId>>;
 
+    /// List dependencies with a typed failure, preserving legacy implementors.
+    async fn try_list_deps(&self) -> Result<Vec<PackageId>, PackageManagerError> {
+        self.list_deps()
+            .await
+            .map_err(|error| PackageManagerError::legacy(self.name(), "list dependencies", error))
+    }
+
     /// Find packages matching a partial query (backs `use` / `search`). PMs
     /// without a searchable registry return an empty list.
     async fn search(&self, query: &str) -> Result<Vec<PluginInfo>>;
 
+    /// Search with a typed failure, preserving legacy implementors.
+    async fn try_search(&self, query: &str) -> Result<Vec<PluginInfo>, PackageManagerError> {
+        self.search(query)
+            .await
+            .map_err(|error| PackageManagerError::legacy(self.name(), "search packages", error))
+    }
+
     /// Acquire a package's source content, canonicalizing the id's version.
     /// `update` controls how aggressively an already-cached package is refreshed.
     async fn fetch(&self, id: &PackageId, update: UpdateLevel) -> Result<FetchedPackage>;
+
+    /// Fetch with a typed failure, preserving legacy implementors.
+    async fn try_fetch(
+        &self,
+        id: &PackageId,
+        update: UpdateLevel,
+    ) -> Result<FetchedPackage, PackageManagerError> {
+        self.fetch(id, update)
+            .await
+            .map_err(|error| PackageManagerError::legacy(self.name(), "fetch a package", error))
+    }
 
     /// Refresh this PM's backing source — for a registry, pull the latest
     /// content onto disk. `force` ignores the source's auto-update opt-out
@@ -117,6 +393,17 @@ pub trait PackageManager {
     /// transport, a path registry) has nothing to pull.
     async fn refresh(&self, _update: UpdateLevel, _force: bool) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Refresh with a typed failure, preserving legacy implementors.
+    async fn try_refresh(
+        &self,
+        update: UpdateLevel,
+        force: bool,
+    ) -> Result<bool, PackageManagerError> {
+        self.refresh(update, force)
+            .await
+            .map_err(|error| PackageManagerError::legacy(self.name(), "refresh a source", error))
     }
 
     /// How a registry instance's content is sourced, for `plugin list`
@@ -176,12 +463,15 @@ impl PmInstance {
     }
 
     pub async fn registry_plugins(&self) -> Option<Vec<Plugin>> {
-        match self.pm.registry_plugins().await {
-            Ok(plugins) => Some(self.validate_all(plugins)),
+        match self.registry_plugins_outcome().await {
+            Ok(collection) => {
+                self.report_failures(&collection.errors);
+                Some(collection.plugins)
+            }
             Err(e) => {
                 tracing::warn!(
                     report = %crate::report::ReportEvent::Warning {
-                        message: format!("{e:#}"),
+                        message: e.to_string(),
                     },
                 );
                 None
@@ -189,37 +479,92 @@ impl PmInstance {
         }
     }
 
+    /// Load and validate this registry, rejecting reported plugin failures.
+    ///
+    /// # Errors
+    /// Returns the manager's concrete source or validation failure. Legacy
+    /// producers cannot prove completeness; absence-sensitive callers must use
+    /// the collection outcome rather than infer completeness from this result.
+    pub async fn try_registry_plugins(&self) -> Result<Vec<Plugin>, PackageManagerError> {
+        self.registry_plugins_outcome().await?.into_result()
+    }
+
+    pub(crate) async fn registry_plugins_outcome(
+        &self,
+    ) -> Result<PluginCollection<Plugin>, PackageManagerError> {
+        Ok(self.validate_collection(self.pm.registry_plugins_outcome().await?))
+    }
+
     /// The plugin(s) an id maps to, validated.
     pub async fn load_plugin(&self, id: &PackageId) -> Vec<Plugin> {
-        self.validate_all(self.pm.load_plugin(id).await)
+        let collection = self.load_plugin_outcome(id).await;
+        self.report_failures(&collection.errors);
+        collection.plugins
+    }
+
+    /// Load a named plugin while retaining its concrete reported failures.
+    ///
+    /// # Errors
+    /// Returns a source or validation failure reported by the producer. Legacy
+    /// producer completeness remains unknown even when this returns success.
+    pub async fn try_load_plugin(
+        &self,
+        id: &PackageId,
+    ) -> Result<Vec<Plugin>, PackageManagerError> {
+        self.load_plugin_outcome(id).await.into_result()
+    }
+
+    async fn load_plugin_outcome(&self, id: &PackageId) -> PluginCollection<Plugin> {
+        self.validate_collection(self.pm.load_plugin_outcome(id).await)
     }
 
     /// A registry entry that fails validation is the user's to fix, so it is
     /// reported. A package's is its author's, and the hook path must not print
     /// it next to the agent's JSON, so it is only logged.
     fn validate_all(&self, unvalidated: Vec<UnvalidatedPlugin>) -> Vec<Plugin> {
-        unvalidated
-            .into_iter()
-            .filter_map(|plugin| {
-                let id = plugin.id.clone();
-                match crate::plugins::validate_plugin(plugin, self.kind) {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        match self.kind {
-                            PluginKind::Registry => tracing::warn!(
-                                report = %crate::report::ReportEvent::Warning {
-                                    message: format!("skipping {e:#}"),
-                                },
-                            ),
-                            PluginKind::Package => {
-                                tracing::warn!(id = %id, error = %e, "failed to validate plugin")
-                            }
-                        }
-                        None
-                    }
+        let collection = self.validate_collection(PluginCollection::complete(unvalidated));
+        self.report_failures(&collection.errors);
+        collection.plugins
+    }
+
+    fn validate_collection(
+        &self,
+        unvalidated: PluginCollection<UnvalidatedPlugin>,
+    ) -> PluginCollection<Plugin> {
+        let mut plugins = Vec::new();
+        let mut errors = unvalidated.errors;
+        for plugin in unvalidated.plugins {
+            let id = plugin.id.clone();
+            let path = plugin.root.clone();
+            match crate::plugins::validate_plugin(plugin, self.kind) {
+                Ok(plugin) => plugins.push(plugin),
+                Err(source) => errors.push(PackageManagerError::PluginValidation {
+                    id,
+                    path,
+                    source: Box::new(source),
+                }),
+            }
+        }
+        if unvalidated.is_complete && errors.is_empty() {
+            PluginCollection::complete(plugins)
+        } else {
+            PluginCollection::incomplete(plugins, errors)
+        }
+    }
+
+    fn report_failures(&self, errors: &[PackageManagerError]) {
+        for error in errors {
+            match self.kind {
+                PluginKind::Registry => tracing::warn!(
+                    report = %crate::report::ReportEvent::Warning {
+                        message: format!("skipping {error}"),
+                    },
+                ),
+                PluginKind::Package => {
+                    tracing::warn!(error = %error, "failed to load package plugin")
                 }
-            })
-            .collect()
+            }
+        }
     }
 }
 
@@ -241,25 +586,56 @@ impl PmRegistry {
     }
 
     /// The instance owning the named ecosystem/registry.
-    fn owner(&self, pm: &str, id: &PackageId) -> Result<&(dyn PackageManager + Send + Sync)> {
+    fn owner(
+        &self,
+        pm: &str,
+        id: &PackageId,
+    ) -> Result<&(dyn PackageManager + Send + Sync), PackageManagerError> {
         self.instances
             .iter()
             .find(|inst| inst.pm.name() == pm)
             .map(|inst| inst.pm.as_ref())
-            .ok_or_else(|| anyhow::anyhow!("unknown package manager `{pm}` in package id `{id}`"))
+            .ok_or_else(|| PackageManagerError::UnknownManager {
+                manager: pm.to_owned(),
+                id: id.clone(),
+            })
     }
 
     /// Fetch a package via the instance named in its id.
+    ///
+    /// Legacy adapter retained until root 0.6; use [`Self::try_fetch`].
     pub async fn fetch(&self, id: &PackageId, update: UpdateLevel) -> Result<FetchedPackage> {
-        self.owner(&id.pm, id)?.fetch(id, update).await
+        Ok(self.try_fetch(id, update).await?)
+    }
+
+    /// Fetch a package with a concrete manager failure.
+    ///
+    /// # Errors
+    /// Returns an unknown-manager error or the owning manager's typed failure.
+    pub async fn try_fetch(
+        &self,
+        id: &PackageId,
+        update: UpdateLevel,
+    ) -> Result<FetchedPackage, PackageManagerError> {
+        self.owner(&id.pm, id)?.try_fetch(id, update).await
     }
 
     /// Union of `list_deps` across the instances — the workspace's full
     /// dependency set for discovery and `depends-on` predicate evaluation.
+    ///
+    /// Legacy adapter retained until root 0.6; use [`Self::try_list_deps`].
     pub async fn list_deps(&self) -> Result<Vec<PackageId>> {
+        Ok(self.try_list_deps().await?)
+    }
+
+    /// Union every instance's dependencies without erasing its error source.
+    ///
+    /// # Errors
+    /// Returns the first manager listing failure; no partial union is returned.
+    pub async fn try_list_deps(&self) -> Result<Vec<PackageId>, PackageManagerError> {
         let mut deps = Vec::new();
         for inst in &self.instances {
-            deps.extend(inst.pm.list_deps().await?);
+            deps.extend(inst.pm.try_list_deps().await?);
         }
         Ok(deps)
     }
@@ -275,13 +651,43 @@ impl PmRegistry {
         out
     }
 
+    /// Load named plugins while rejecting failures reported by their producers.
+    ///
+    /// # Errors
+    /// Returns the first concrete loading or validation failure. A successful
+    /// legacy producer may still have unknown completeness; cleanup must inspect
+    /// the collection outcome rather than treat this result as proof of absence.
+    pub async fn try_load_plugin(
+        &self,
+        id: &PackageId,
+    ) -> Result<Vec<Plugin>, PackageManagerError> {
+        self.load_plugin_outcome(id).await.into_result()
+    }
+
+    pub(crate) async fn load_plugin_outcome(&self, id: &PackageId) -> PluginCollection<Plugin> {
+        let mut plugins = Vec::new();
+        let mut errors = Vec::new();
+        let mut is_complete = true;
+        for instance in &self.instances {
+            let collection = instance.load_plugin_outcome(id).await;
+            is_complete &= collection.is_complete();
+            plugins.extend(collection.plugins);
+            errors.extend(collection.errors);
+        }
+        if is_complete && errors.is_empty() {
+            PluginCollection::complete(plugins)
+        } else {
+            PluginCollection::incomplete(plugins, errors)
+        }
+    }
+
     /// Search every instance for packages matching `query`, tagged with the
     /// instance's display name. A failing instance is skipped with a debug log
     /// rather than failing the union.
     pub async fn search(&self, query: &str) -> Vec<(String, PluginInfo)> {
         let mut out = Vec::new();
         for inst in self.instances() {
-            match inst.pm.search(query).await {
+            match inst.pm.try_search(query).await {
                 Ok(infos) => out.extend(infos.into_iter().map(|i| (inst.name.clone(), i))),
                 Err(e) => {
                     tracing::debug!(instance = %inst.name, error = %e, "search failed, skipping");
@@ -294,18 +700,40 @@ impl PmRegistry {
 
 /// The workspace's dependency set as package ids — every PM's `list_deps`
 /// unioned. This is what `depends-on` predicates evaluate against
-/// ([`crate::predicate::PredicateContext`]). Failures are logged and yield an
+/// (the internal predicate context). Failures are logged and yield an
 /// empty list so predicate evaluation degrades to "no deps" rather than
 /// aborting the caller.
+/// Legacy best-effort adapter retained through root 0.6. Use
+/// [`try_workspace_dep_ids`] before operations that rely on the configured set.
 pub async fn workspace_dep_ids(
     sym: &crate::config::Symposium,
     deps: &Arc<WorkspaceDeps>,
 ) -> Vec<PackageId> {
-    match sym.package_managers(deps).list_deps().await {
-        Ok(deps) => deps,
+    match try_workspace_dep_ids(sym, deps).await {
+        Ok(ids) => ids,
+        Err(_) => {
+            tracing::warn!("dependency discovery skipped: invalid registry configuration");
+            Vec::new()
+        }
+    }
+}
+
+/// The workspace dependency union, rejecting invalid configured registry sources.
+///
+/// Package-manager listing failures retain the existing visible best-effort
+/// behavior; an invalid source configuration always returns an error.
+///
+/// # Errors
+/// Returns [`crate::config::RegistryError`] when a configured source is invalid.
+pub async fn try_workspace_dep_ids(
+    sym: &crate::config::Symposium,
+    deps: &Arc<WorkspaceDeps>,
+) -> Result<Vec<PackageId>, crate::config::RegistryError> {
+    match sym.try_package_managers(deps)?.try_list_deps().await {
+        Ok(deps) => Ok(deps),
         Err(e) => {
             tracing::warn!(error = %e, "failed to list workspace dependencies");
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 }
@@ -356,6 +784,7 @@ mod tests {
     /// The report events emitted while validating the stub's plugin under `kind`.
     async fn reports_for_invalid_plugin(kind: PluginKind) -> Vec<serde_json::Value> {
         use tracing_subscriber::layer::SubscriberExt;
+        symposium_testlib::install_tracing_baseline();
         let (layer, handle) =
             crate::report::ReportLayer::new(crate::report::ReportMode::Json, tracing::Level::DEBUG);
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
@@ -383,6 +812,55 @@ mod tests {
     async fn invalid_package_plugin_is_not_reported() {
         let reports = reports_for_invalid_plugin(PluginKind::Package).await;
         assert!(reports.is_empty(), "{reports:?}");
+    }
+
+    #[tokio::test]
+    async fn registry_validation_preserves_good_siblings_without_claiming_completeness() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["good", "invalid"] {
+            std::fs::create_dir(temp.path().join(name)).unwrap();
+        }
+        std::fs::write(temp.path().join("good/Symposium.toml"), "name = 'good'").unwrap();
+        std::fs::write(
+            temp.path().join("invalid/Symposium.toml"),
+            "name = 'invalid'\n[[skills]]\n",
+        )
+        .unwrap();
+        let instance = PmInstance {
+            name: "local".into(),
+            trusted: true,
+            kind: PluginKind::Registry,
+            pm: Box::new(PathPm::new("local", temp.path())),
+        };
+        let collection = instance.registry_plugins_outcome().await.unwrap();
+        assert_eq!(collection.plugins.len(), 1);
+        assert_eq!(collection.plugins[0].manifest.name, "good");
+        assert!(!collection.is_complete());
+        assert!(matches!(
+            collection.errors.as_slice(),
+            [PackageManagerError::PluginValidation { .. }]
+        ));
+        assert_eq!(instance.registry_plugins().await.unwrap().len(), 1);
+        assert!(matches!(
+            instance.try_registry_plugins().await,
+            Err(PackageManagerError::PluginValidation { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn validated_legacy_plugin_outcomes_preserve_unknown_completeness() {
+        let registry = PmRegistry::new(vec![PmInstance {
+            name: "stub".into(),
+            trusted: false,
+            kind: PluginKind::Package,
+            pm: Box::new(InvalidPluginPm),
+        }]);
+        let collection = registry
+            .load_plugin_outcome(&PackageId::any_version("stub", "missing"))
+            .await;
+        assert!(collection.plugins.is_empty());
+        assert!(collection.errors.is_empty());
+        assert!(!collection.is_complete());
     }
 
     #[tokio::test]

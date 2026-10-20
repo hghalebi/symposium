@@ -1,5 +1,3 @@
 [alias]
-setup = "run -p setup --"
-ci = "run -p ci --"
 xtask = "run -p xtask --"
 test-agent = "test --test hook_agent --"

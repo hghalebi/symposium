@@ -30,7 +30,91 @@
 //!
 //! Within a [`PredicateSet`] the entries are ANDed.
 
-use anyhow::{Context, Result, bail};
+/// A predicate name, grammar, dependency atom, or version requirement is invalid.
+///
+/// Diagnostics identify the failed rule without echoing command, path, or
+/// environment contents. Underlying version-parser errors remain inspectable.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PredicateSyntaxError {
+    /// A custom predicate identifier is empty.
+    #[error("predicate name is empty")]
+    EmptyName,
+    /// A custom identifier does not begin with an ASCII letter.
+    #[error("predicate name must start with a letter")]
+    NameMustStartWithLetter,
+    /// A custom identifier contains a character outside its allowed alphabet.
+    #[error(
+        "predicate name contains an invalid character at position {position}; only ASCII alphanumeric and `_` are allowed"
+    )]
+    InvalidNameCharacter {
+        /// The offending character's byte position in the identifier.
+        position: usize,
+        /// The offending character, retained for structured inspection.
+        character: char,
+    },
+    /// A custom identifier collides with a builtin or retired builtin name.
+    #[error("predicate name collides with a builtin predicate name")]
+    ReservedName,
+    /// Function-call syntax is required at this position.
+    #[error("predicate is not a function call; expected `name(arg)`")]
+    ExpectedFunctionCall,
+    /// A function-call expression lacks its final closing parenthesis.
+    #[error("predicate must end with `)`")]
+    MissingClosingParen,
+    /// The retired crate function must be replaced with depends-on.
+    #[error("`crate(...)` is no longer supported; use `depends-on(...)` instead")]
+    RetiredCrateSyntax,
+    /// A builtin that takes no arguments received one.
+    #[error("`{predicate}()` takes no argument")]
+    UnexpectedArgument {
+        /// The builtin predicate, never an input argument.
+        predicate: &'static str,
+    },
+    /// An any/all combinator needs at least one child predicate.
+    #[error("`{predicate}(...)` requires at least one predicate")]
+    EmptyCombinator {
+        /// The builtin combinator name.
+        predicate: &'static str,
+    },
+    /// An environment predicate needs a variable name.
+    #[error("`env(...)` requires a non-empty variable name")]
+    EmptyEnvironmentName,
+    /// A single dependency atom is empty.
+    #[error("empty depends-on predicate")]
+    EmptyDependency,
+    /// A dependency atom does not begin with a valid dependency name.
+    #[error("expected dependency name at position {position}")]
+    ExpectedDependencyName {
+        /// The byte position at which a name was required.
+        position: usize,
+    },
+    /// Function calls belong in predicates rather than depends-on atom fields.
+    #[error(
+        "function-call syntax is not valid in the `depends-on` field; use the `predicates` field instead"
+    )]
+    FunctionCallInDependency,
+    /// A dependency atom has unconsumed trailing input.
+    #[error("unexpected trailing input at position {position}")]
+    TrailingInput {
+        /// The first unconsumed byte position.
+        position: usize,
+    },
+    /// A dependency's version constraint is not valid SemVer syntax.
+    #[error("invalid dependency version requirement")]
+    VersionRequirement {
+        /// The original version-parser failure.
+        #[from]
+        source: semver::Error,
+    },
+    /// One atom in a depends-on list failed to parse.
+    #[error("failed to parse depends-on predicate")]
+    DependencyAtom {
+        /// The atom's specific syntax failure.
+        #[source]
+        source: Box<PredicateSyntaxError>,
+    },
+}
 
 /// Names reserved for builtin predicates. Custom predicates must not use
 /// these. `crate` is retired syntax but stays reserved so a custom predicate
@@ -83,8 +167,12 @@ impl Predicate {
             Predicate::DependsOn(n, _) => n == name,
             Predicate::Not(p) => p.references_dep(name),
             Predicate::Any(v) | Predicate::All(v) => v.iter().any(|p| p.references_dep(name)),
-            Predicate::Custom { .. } => false,
-            _ => false,
+            Predicate::DependsOnWildcard
+            | Predicate::Shell(_)
+            | Predicate::PathExists(_)
+            | Predicate::Env(..)
+            | Predicate::WorkspaceMember
+            | Predicate::Custom { .. } => false,
         }
     }
 
@@ -95,8 +183,11 @@ impl Predicate {
             Predicate::DependsOn(..) | Predicate::DependsOnWildcard => true,
             Predicate::Not(p) => p.mentions_dep(),
             Predicate::Any(v) | Predicate::All(v) => v.iter().any(Predicate::mentions_dep),
-            Predicate::Custom { .. } => false,
-            _ => false,
+            Predicate::Shell(_)
+            | Predicate::PathExists(_)
+            | Predicate::Env(..)
+            | Predicate::WorkspaceMember
+            | Predicate::Custom { .. } => false,
         }
     }
 
@@ -108,8 +199,12 @@ impl Predicate {
             Predicate::DependsOn(..) => true,
             Predicate::Not(p) => p.has_concrete_dep(),
             Predicate::Any(v) | Predicate::All(v) => v.iter().any(Predicate::has_concrete_dep),
-            Predicate::Custom { .. } => false,
-            _ => false,
+            Predicate::DependsOnWildcard
+            | Predicate::Shell(_)
+            | Predicate::PathExists(_)
+            | Predicate::Env(..)
+            | Predicate::WorkspaceMember
+            | Predicate::Custom { .. } => false,
         }
     }
 
@@ -129,8 +224,12 @@ impl Predicate {
                     p.collect_dep_names(out);
                 }
             }
-            Predicate::Custom { .. } => {}
-            _ => {}
+            Predicate::DependsOnWildcard
+            | Predicate::Shell(_)
+            | Predicate::PathExists(_)
+            | Predicate::Env(..)
+            | Predicate::WorkspaceMember
+            | Predicate::Custom { .. } => {}
         }
     }
 }
@@ -143,18 +242,41 @@ pub struct PredicateSet {
 
 impl PredicateSet {
     /// Parse a comma-separated list of **function-call** predicate expressions.
-    pub fn parse(input: &str) -> Result<Self> {
+    ///
+    /// Compatibility adapter retained until SDK 0.2. Prefer [`Self::try_parse`].
+    pub fn parse(input: &str) -> anyhow::Result<Self> {
+        Ok(Self::try_parse(input)?)
+    }
+
+    /// Parse a comma-separated list of function-call predicates.
+    ///
+    /// # Errors
+    /// Returns the specific syntax failure without echoing argument contents.
+    pub fn try_parse(input: &str) -> Result<Self, PredicateSyntaxError> {
         Ok(Self {
-            predicates: parse_comma_separated(input)?,
+            predicates: try_parse_comma_separated(input)?,
         })
     }
 
     /// Build a set from **dependency-atom** syntax (the `depends-on` field),
     /// lowering the OR-combined atoms into a single `any(...)` predicate.
     /// Empty input yields an empty set.
-    pub fn from_depends_on(input: &str) -> Result<Self> {
+    ///
+    /// Compatibility adapter retained until SDK 0.2. Prefer
+    /// [`Self::try_from_depends_on`].
+    pub fn from_depends_on(input: &str) -> anyhow::Result<Self> {
+        Ok(Self::try_from_depends_on(input)?)
+    }
+
+    /// Lower dependency atoms into an OR-combined predicate in this set.
+    ///
+    /// Empty input yields an empty set.
+    ///
+    /// # Errors
+    /// Returns a typed syntax error for an invalid dependency atom.
+    pub fn try_from_depends_on(input: &str) -> Result<Self, PredicateSyntaxError> {
         Ok(Self {
-            predicates: DependsOnList::parse(input)?
+            predicates: DependsOnList::try_parse(input)?
                 .into_predicate()
                 .into_iter()
                 .collect(),
@@ -218,16 +340,27 @@ impl DependsOnList {
     ///
     /// Commas inside balanced parentheses are preserved so that custom
     /// predicates like `battery_pack(a, b)` are not split incorrectly.
-    pub fn parse(input: &str) -> Result<Self> {
+    /// Compatibility adapter retained until SDK 0.2. Prefer [`Self::try_parse`].
+    pub fn parse(input: &str) -> anyhow::Result<Self> {
+        Ok(Self::try_parse(input)?)
+    }
+
+    /// Parse comma-separated dependency atoms, preserving nested comma groups.
+    ///
+    /// # Errors
+    /// Returns [`PredicateSyntaxError::DependencyAtom`] with the specific atom
+    /// failure attached, without including the raw atom in its diagnostic.
+    pub fn try_parse(input: &str) -> Result<Self, PredicateSyntaxError> {
         let atoms = split_top_level(input)
             .iter()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .map(|s| {
-                parse_dep_atom(s)
-                    .with_context(|| format!("failed to parse depends-on predicate: {s:?}"))
+                try_parse_dep_atom(s).map_err(|source| PredicateSyntaxError::DependencyAtom {
+                    source: Box::new(source),
+                })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self(atoms))
     }
 
@@ -277,8 +410,8 @@ impl<'de> serde::Deserialize<'de> for DependsOnList {
         };
         let predicates = atoms
             .iter()
-            .map(|s| parse_dep_atom(s.trim()))
-            .collect::<Result<Vec<_>>>()
+            .map(|s| try_parse_dep_atom(s.trim()))
+            .collect::<Result<Vec<_>, _>>()
             .map_err(serde::de::Error::custom)?;
         Ok(Self(predicates))
     }
@@ -291,35 +424,58 @@ impl<'de> serde::Deserialize<'de> for DependsOnList {
 ///
 /// Shared by both the expression parser (encountering an unknown function
 /// name) and the `[[predicate]]` definition validator.
-pub fn validate_custom_predicate_name(name: &str) -> Result<()> {
+/// Compatibility adapter retained until SDK 0.2. Prefer
+/// [`try_validate_custom_predicate_name`].
+pub fn validate_custom_predicate_name(name: &str) -> anyhow::Result<()> {
+    Ok(try_validate_custom_predicate_name(name)?)
+}
+
+/// Validate a custom identifier without including its contents in diagnostics.
+///
+/// # Errors
+/// Returns the violated naming rule and any invalid character's byte position.
+pub fn try_validate_custom_predicate_name(name: &str) -> Result<(), PredicateSyntaxError> {
     if name.is_empty() {
-        bail!("predicate name is empty");
+        return Err(PredicateSyntaxError::EmptyName);
     }
-    if !name.as_bytes()[0].is_ascii_alphabetic() {
-        bail!("predicate `{name}` must start with a letter");
+    if !name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) {
+        return Err(PredicateSyntaxError::NameMustStartWithLetter);
     }
-    if let Some(pos) = name.find(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
-        bail!(
-            "predicate `{name}` contains invalid character '{}' at position {pos} \
-             (only ASCII alphanumeric and `_` allowed)",
-            name.as_bytes()[pos] as char,
-        );
+    if let Some((position, character)) = name
+        .char_indices()
+        .find(|(_, character)| !character.is_ascii_alphanumeric() && *character != '_')
+    {
+        return Err(PredicateSyntaxError::InvalidNameCharacter {
+            position,
+            character,
+        });
     }
     if BUILTIN_PREDICATE_NAMES.contains(&name) {
-        bail!("predicate `{name}` collides with a builtin predicate name");
+        return Err(PredicateSyntaxError::ReservedName);
     }
     Ok(())
 }
 
 /// Parse a single function-call predicate expression (`depends-on(serde)`,
 /// `any(env(CI), shell(test -f x))`).
-pub fn parse_predicate(input: &str) -> Result<Predicate> {
+///
+/// Compatibility adapter retained until SDK 0.2. Prefer [`try_parse_predicate`].
+pub fn parse_predicate(input: &str) -> anyhow::Result<Predicate> {
+    Ok(try_parse_predicate(input)?)
+}
+
+/// Parse one function-call expression into a predicate tree.
+///
+/// # Errors
+/// Returns a specific naming, grammar, dependency, or version failure. Argument
+/// contents are excluded from its diagnostic.
+pub fn try_parse_predicate(input: &str) -> Result<Predicate, PredicateSyntaxError> {
     let trimmed = input.trim();
     let Some(open) = trimmed.find('(') else {
-        bail!("predicate {trimmed:?} is not a function call (expected `name(arg)`)");
+        return Err(PredicateSyntaxError::ExpectedFunctionCall);
     };
     if !trimmed.ends_with(')') {
-        bail!("predicate {trimmed:?} must end with `)`");
+        return Err(PredicateSyntaxError::MissingClosingParen);
     }
     let name = trimmed[..open].trim();
     // Everything between the first `(` and the final `)` is the argument; an
@@ -327,34 +483,36 @@ pub fn parse_predicate(input: &str) -> Result<Predicate> {
     let arg = trimmed[open + 1..trimmed.len() - 1].trim();
 
     match name {
-        "depends-on" => parse_dep_atom(arg),
-        "crate" => bail!("`crate({arg})` is no longer supported; use `depends-on({arg})` instead"),
+        "depends-on" => try_parse_dep_atom(arg),
+        "crate" => Err(PredicateSyntaxError::RetiredCrateSyntax),
         "shell" => Ok(Predicate::Shell(arg.to_string())),
         "path_exists" => Ok(Predicate::PathExists(arg.to_string())),
         "env" => parse_env(arg),
         "workspace-member" => {
             if !arg.is_empty() {
-                bail!("`workspace-member()` takes no argument, got {arg:?}");
+                return Err(PredicateSyntaxError::UnexpectedArgument {
+                    predicate: "workspace-member",
+                });
             }
             Ok(Predicate::WorkspaceMember)
         }
-        "not" => Ok(Predicate::Not(Box::new(parse_predicate(arg)?))),
+        "not" => Ok(Predicate::Not(Box::new(try_parse_predicate(arg)?))),
         "any" => {
-            let preds = parse_comma_separated(arg)?;
+            let preds = try_parse_comma_separated(arg)?;
             if preds.is_empty() {
-                bail!("`any(...)` requires at least one predicate");
+                return Err(PredicateSyntaxError::EmptyCombinator { predicate: "any" });
             }
             Ok(Predicate::Any(preds))
         }
         "all" => {
-            let preds = parse_comma_separated(arg)?;
+            let preds = try_parse_comma_separated(arg)?;
             if preds.is_empty() {
-                bail!("`all(...)` requires at least one predicate");
+                return Err(PredicateSyntaxError::EmptyCombinator { predicate: "all" });
             }
             Ok(Predicate::All(preds))
         }
         other => {
-            validate_custom_predicate_name(other)?;
+            try_validate_custom_predicate_name(other)?;
             Ok(Predicate::Custom {
                 name: other.to_string(),
                 arg: arg.to_string(),
@@ -365,27 +523,38 @@ pub fn parse_predicate(input: &str) -> Result<Predicate> {
 
 /// Parse a comma-separated list of function-call predicate expressions.
 /// Commas inside parentheses are not separators.
-pub fn parse_comma_separated(input: &str) -> Result<Vec<Predicate>> {
+///
+/// Compatibility adapter retained until SDK 0.2. Prefer
+/// [`try_parse_comma_separated`].
+pub fn parse_comma_separated(input: &str) -> anyhow::Result<Vec<Predicate>> {
+    Ok(try_parse_comma_separated(input)?)
+}
+
+/// Parse function-call predicates separated by top-level commas.
+///
+/// # Errors
+/// Returns the first predicate's typed syntax failure.
+pub fn try_parse_comma_separated(input: &str) -> Result<Vec<Predicate>, PredicateSyntaxError> {
     split_top_level(input)
         .iter()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .map(parse_predicate)
+        .map(try_parse_predicate)
         .collect()
 }
 
-fn parse_env(arg: &str) -> Result<Predicate> {
+fn parse_env(arg: &str) -> Result<Predicate, PredicateSyntaxError> {
     match arg.split_once('=') {
         Some((name, value)) => {
             let name = name.trim();
             if name.is_empty() {
-                bail!("`env(...)` variable name must not be empty");
+                return Err(PredicateSyntaxError::EmptyEnvironmentName);
             }
             Ok(Predicate::Env(name.to_string(), Some(value.to_string())))
         }
         None => {
             if arg.is_empty() {
-                bail!("`env(...)` requires a variable name");
+                return Err(PredicateSyntaxError::EmptyEnvironmentName);
             }
             Ok(Predicate::Env(arg.to_string(), None))
         }
@@ -419,10 +588,20 @@ fn split_top_level(input: &str) -> Vec<String> {
 
 /// Parse a single dependency atom into a `DependsOn` / `DependsOnWildcard`
 /// predicate.
-pub fn parse_dep_atom(input: &str) -> Result<Predicate> {
+///
+/// Compatibility adapter retained until SDK 0.2. Prefer [`try_parse_dep_atom`].
+pub fn parse_dep_atom(input: &str) -> anyhow::Result<Predicate> {
+    Ok(try_parse_dep_atom(input)?)
+}
+
+/// Parse a dependency name, optional version requirement, or wildcard atom.
+///
+/// # Errors
+/// Returns a grammar or version requirement failure without echoing input.
+pub fn try_parse_dep_atom(input: &str) -> Result<Predicate, PredicateSyntaxError> {
     let input = input.trim();
     if input.is_empty() {
-        bail!("empty depends-on predicate");
+        return Err(PredicateSyntaxError::EmptyDependency);
     }
     if input == "*" {
         return Ok(Predicate::DependsOnWildcard);
@@ -431,11 +610,9 @@ pub fn parse_dep_atom(input: &str) -> Result<Predicate> {
     let pred = parser.parse_atom()?;
     parser.skip_whitespace();
     if parser.pos < parser.input.len() {
-        bail!(
-            "unexpected trailing input at position {}: {:?}",
-            parser.pos,
-            &parser.input[parser.pos..]
-        );
+        return Err(PredicateSyntaxError::TrailingInput {
+            position: parser.pos,
+        });
     }
     Ok(pred)
 }
@@ -456,11 +633,7 @@ impl<'a> AtomParser<'a> {
         }
     }
 
-    fn remaining(&self) -> &'a str {
-        &self.input[self.pos..]
-    }
-
-    fn parse_atom(&mut self) -> Result<Predicate> {
+    fn parse_atom(&mut self) -> Result<Predicate, PredicateSyntaxError> {
         self.skip_whitespace();
         let start = self.pos;
 
@@ -476,11 +649,7 @@ impl<'a> AtomParser<'a> {
 
         let name = &self.input[start..self.pos];
         if name.is_empty() {
-            bail!(
-                "expected dependency name at position {}: {:?}",
-                start,
-                self.remaining()
-            );
+            return Err(PredicateSyntaxError::ExpectedDependencyName { position: start });
         }
 
         // Function-call syntax is NOT valid in dependency-atom position. The
@@ -488,10 +657,7 @@ impl<'a> AtomParser<'a> {
         // constraints. Full predicate expressions (including custom
         // predicates) belong in the `predicates` field.
         if self.pos < self.input.len() && self.input.as_bytes()[self.pos] == b'(' {
-            bail!(
-                "function-call syntax `{name}(...)` is not valid in the `depends-on` field; \
-                 use the `predicates` field instead"
-            );
+            return Err(PredicateSyntaxError::FunctionCallInDependency);
         }
 
         // Version constraint (starts with >=, <=, >, <, =, ^, ~). Bare `=` is
@@ -538,7 +704,7 @@ impl serde::Serialize for Predicate {
 impl<'de> serde::Deserialize<'de> for Predicate {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
-        parse_predicate(&s).map_err(serde::de::Error::custom)
+        try_parse_predicate(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -603,10 +769,11 @@ mod tests {
             "all(depends-on(serde), env(CI))",
             "my_pred(arg)",
         ] {
-            let parsed = parse_predicate(input).unwrap();
+            let parsed = try_parse_predicate(input).unwrap();
+            assert_eq!(parse_predicate(input).unwrap(), parsed);
             let redisplayed = parsed.to_string();
             assert_eq!(
-                parse_predicate(&redisplayed).unwrap(),
+                try_parse_predicate(&redisplayed).unwrap(),
                 parsed,
                 "{input} did not round-trip (rendered as {redisplayed})"
             );
@@ -626,5 +793,236 @@ mod tests {
     fn depends_on_accepts_a_bare_string() {
         let list: DependsOnList = serde_json::from_str(r#""serde""#).unwrap();
         assert_eq!(list.0, vec![Predicate::DependsOn("serde".into(), None)]);
+    }
+
+    #[test]
+    fn canonical_parsers_report_structured_grammar_failures() {
+        assert!(matches!(
+            try_validate_custom_predicate_name(""),
+            Err(PredicateSyntaxError::EmptyName)
+        ));
+        assert!(matches!(
+            try_validate_custom_predicate_name("0custom"),
+            Err(PredicateSyntaxError::NameMustStartWithLetter)
+        ));
+        assert!(matches!(
+            try_validate_custom_predicate_name("custom_é"),
+            Err(PredicateSyntaxError::InvalidNameCharacter {
+                position: 7,
+                character: 'é'
+            })
+        ));
+        assert!(matches!(
+            try_validate_custom_predicate_name("shell"),
+            Err(PredicateSyntaxError::ReservedName)
+        ));
+        assert!(matches!(
+            try_parse_predicate("shell"),
+            Err(PredicateSyntaxError::ExpectedFunctionCall)
+        ));
+        assert!(matches!(
+            try_parse_predicate("shell(true"),
+            Err(PredicateSyntaxError::MissingClosingParen)
+        ));
+        assert!(matches!(
+            try_parse_predicate("crate(serde)"),
+            Err(PredicateSyntaxError::RetiredCrateSyntax)
+        ));
+        assert!(matches!(
+            try_parse_predicate("workspace-member(unexpected)"),
+            Err(PredicateSyntaxError::UnexpectedArgument {
+                predicate: "workspace-member"
+            })
+        ));
+        for predicate in ["any", "all"] {
+            assert!(matches!(
+                try_parse_predicate(&format!("{predicate}()")),
+                Err(PredicateSyntaxError::EmptyCombinator { predicate: failed }) if failed == predicate
+            ));
+        }
+        for input in ["env()", "env(=value)"] {
+            assert!(matches!(
+                try_parse_predicate(input),
+                Err(PredicateSyntaxError::EmptyEnvironmentName)
+            ));
+        }
+        assert!(matches!(
+            try_parse_dep_atom(""),
+            Err(PredicateSyntaxError::EmptyDependency)
+        ));
+        assert!(matches!(
+            try_parse_dep_atom("@serde"),
+            Err(PredicateSyntaxError::ExpectedDependencyName { position: 0 })
+        ));
+        assert!(matches!(
+            try_parse_dep_atom("shell(true)"),
+            Err(PredicateSyntaxError::FunctionCallInDependency)
+        ));
+        assert!(matches!(
+            try_parse_dep_atom("serde trailing"),
+            Err(PredicateSyntaxError::TrailingInput { position: 6 })
+        ));
+    }
+
+    #[test]
+    fn version_and_depends_on_list_failures_preserve_sources() {
+        use std::error::Error as _;
+
+        let error = try_parse_dep_atom("serde>=invalid").unwrap_err();
+        assert!(matches!(
+            error,
+            PredicateSyntaxError::VersionRequirement { .. }
+        ));
+        assert!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<semver::Error>())
+                .is_some()
+        );
+
+        let error = DependsOnList::try_parse("serde, tokio>=invalid").unwrap_err();
+        assert!(matches!(error, PredicateSyntaxError::DependencyAtom { .. }));
+        let atom_error = error
+            .source()
+            .unwrap()
+            .downcast_ref::<Box<PredicateSyntaxError>>()
+            .unwrap()
+            .as_ref();
+        assert!(matches!(
+            atom_error,
+            PredicateSyntaxError::VersionRequirement { .. }
+        ));
+        assert!(
+            atom_error
+                .source()
+                .and_then(|source| source.downcast_ref::<semver::Error>())
+                .is_some()
+        );
+        assert!(
+            error
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .is::<semver::Error>()
+        );
+
+        let legacy = parse_dep_atom("serde>=invalid").unwrap_err();
+        assert!(matches!(
+            legacy.downcast_ref::<PredicateSyntaxError>(),
+            Some(PredicateSyntaxError::VersionRequirement { .. })
+        ));
+    }
+
+    #[test]
+    fn syntax_diagnostics_exclude_raw_arguments_and_dependency_input() {
+        const CANARY: &str = "SYNTHETIC_PREDICATE_SECRET_CANARY";
+        for input in [
+            CANARY.to_string(),
+            format!("shell(echo {CANARY}"),
+            format!("crate({CANARY})"),
+            format!("workspace-member({CANARY})"),
+            format!("env(={CANARY})"),
+            format!("custom-name({CANARY})"),
+        ] {
+            let error = anyhow::Error::from(try_parse_predicate(&input).unwrap_err());
+            assert!(!format!("{error:#}").contains(CANARY));
+        }
+        for input in [
+            format!("serde {CANARY}"),
+            format!("custom({CANARY})"),
+            format!("serde>={CANARY}"),
+        ] {
+            let error = anyhow::Error::from(DependsOnList::try_parse(&input).unwrap_err());
+            assert!(!format!("{error:#}").contains(CANARY));
+        }
+        let expression = serde_json::to_string(&format!("workspace-member({CANARY})")).unwrap();
+        let error = serde_json::from_str::<Predicate>(&expression).unwrap_err();
+        assert!(!error.to_string().contains(CANARY));
+        let atoms = serde_json::to_string(&vec![format!("custom({CANARY})")]).unwrap();
+        let error = serde_json::from_str::<DependsOnList>(&atoms).unwrap_err();
+        assert!(!error.to_string().contains(CANARY));
+    }
+
+    #[test]
+    fn legacy_parser_signatures_remain_available() {
+        let _: fn(&str) -> anyhow::Result<PredicateSet> = PredicateSet::parse;
+        let _: fn(&str) -> anyhow::Result<PredicateSet> = PredicateSet::from_depends_on;
+        let _: fn(&str) -> anyhow::Result<DependsOnList> = DependsOnList::parse;
+        let _: fn(&str) -> anyhow::Result<()> = validate_custom_predicate_name;
+        let _: fn(&str) -> anyhow::Result<Predicate> = parse_predicate;
+        let _: fn(&str) -> anyhow::Result<Vec<Predicate>> = parse_comma_separated;
+        let _: fn(&str) -> anyhow::Result<Predicate> = parse_dep_atom;
+        assert_eq!(
+            PredicateSet::try_parse("").unwrap(),
+            PredicateSet::default()
+        );
+        assert_eq!(
+            PredicateSet::try_from_depends_on("").unwrap(),
+            PredicateSet::default()
+        );
+    }
+
+    #[test]
+    fn dependency_introspection_covers_every_variant_and_nested_composition() {
+        use std::collections::BTreeSet;
+
+        let cases: Vec<(Predicate, &[&str], bool)> = vec![
+            (Predicate::DependsOn("serde".into(), None), &["serde"], true),
+            (Predicate::DependsOnWildcard, &[], true),
+            (Predicate::Shell("true".into()), &[], false),
+            (Predicate::PathExists("Cargo.toml".into()), &[], false),
+            (Predicate::Env("CI".into(), None), &[], false),
+            (Predicate::WorkspaceMember, &[], false),
+            (
+                Predicate::Custom {
+                    name: "custom".into(),
+                    arg: "serde".into(),
+                },
+                &[],
+                false,
+            ),
+            (
+                Predicate::Not(Box::new(Predicate::DependsOnWildcard)),
+                &[],
+                true,
+            ),
+            (
+                Predicate::Any(vec![
+                    Predicate::DependsOn("serde".into(), None),
+                    Predicate::Env("CI".into(), None),
+                ]),
+                &["serde"],
+                true,
+            ),
+            (
+                Predicate::All(vec![
+                    Predicate::Not(Box::new(Predicate::DependsOn("tokio".into(), None))),
+                    Predicate::Any(vec![
+                        Predicate::DependsOn("serde".into(), None),
+                        Predicate::DependsOn("serde".into(), None),
+                    ]),
+                ]),
+                &["serde", "tokio"],
+                true,
+            ),
+        ];
+        for (predicate, names, mentions) in cases {
+            let expected: BTreeSet<_> = names.iter().map(|name| name.to_string()).collect();
+            let nested = Predicate::All(vec![
+                Predicate::Any(vec![Predicate::Not(Box::new(predicate.clone()))]),
+                Predicate::PathExists("unrelated".into()),
+            ]);
+            for tree in [predicate, nested] {
+                let mut found = BTreeSet::new();
+                tree.collect_dep_names(&mut found);
+                assert_eq!(found, expected, "{tree}");
+                assert_eq!(tree.mentions_dep(), mentions, "{tree}");
+                assert_eq!(tree.has_concrete_dep(), !names.is_empty(), "{tree}");
+                for name in ["serde", "tokio", "absent"] {
+                    assert_eq!(tree.references_dep(name), expected.contains(name), "{tree}");
+                }
+            }
+        }
     }
 }

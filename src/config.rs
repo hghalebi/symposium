@@ -400,6 +400,65 @@ pub struct RegistryConfig {
     pub auto_update: bool,
 }
 
+enum RegistrySourceRef<'a> {
+    Git(&'a str),
+    Path(&'a str),
+}
+
+impl RegistryConfig {
+    fn validated_source(&self) -> Result<RegistrySourceRef<'_>, RegistryError> {
+        match (self.git.as_deref(), self.path.as_deref()) {
+            (Some(git), None) => Ok(RegistrySourceRef::Git(git)),
+            (None, Some(path)) => Ok(RegistrySourceRef::Path(path)),
+            (Some(_), Some(_)) => Err(RegistryError::BothSources {
+                name: self.name.clone(),
+            }),
+            (None, None) => Err(RegistryError::MissingSource {
+                name: self.name.clone(),
+            }),
+        }
+    }
+}
+
+/// Failure to resolve a complete set of configured registries.
+///
+/// Source URLs are never included in diagnostics. A failed resolution must not
+/// be treated as an empty registry set, particularly before stale-skill cleanup.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RegistryError {
+    /// A registry supplies both alternative source fields.
+    #[error("registry {name:?} sets both `git` and `path`; specify exactly one source")]
+    BothSources {
+        /// The configured registry's name.
+        name: String,
+    },
+    /// A registry supplies neither source field.
+    #[error("registry {name:?} names neither `git` nor `path`; specify exactly one source")]
+    MissingSource {
+        /// The configured registry's name.
+        name: String,
+    },
+    /// A Git registry could not be resolved without acquiring it.
+    #[error("failed to resolve Git registry {name:?}")]
+    Git {
+        /// The configured registry's name.
+        name: String,
+        /// The structured Git configuration or client-construction failure.
+        #[source]
+        source: symposium_install::git::GitError,
+    },
+    /// The optional built-in directory could not be inspected.
+    #[error("failed to inspect user-plugin registry {}", path.display())]
+    ProbeUserPlugins {
+        /// The optional registry path that could not be inspected.
+        path: PathBuf,
+        /// The underlying filesystem failure, distinct from absence.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Merged configuration view
 // ---------------------------------------------------------------------------
@@ -408,6 +467,97 @@ pub struct RegistryConfig {
 pub const REGISTRY_CACHE_SUBDIR: &str = "plugin-sources";
 
 const BUILTIN_RECOMMENDATIONS_URL: &str = "https://github.com/symposium-dev/recommendations";
+
+/// Failure to load, persist, or prepare the application configuration and paths.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    /// The user configuration could not be serialized.
+    #[error("failed to serialize user configuration")]
+    Serialize {
+        /// The serialization failure, retained for inspection without printing values.
+        #[source]
+        source: toml::ser::Error,
+    },
+    /// The user configuration could not be written.
+    #[error("failed to write user configuration {}", path.display())]
+    Write {
+        /// The intended configuration file.
+        path: PathBuf,
+        /// The underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A required warning could not be delivered before selecting defaults.
+    #[error("failed to write configuration warning")]
+    Warning(#[source] std::io::Error),
+    /// A required directory could not be resolved.
+    #[error(transparent)]
+    Directory(#[from] crate::dirs::DirectoryError),
+    /// A configuration or cache directory could not be created.
+    #[error("failed to create {kind} directory {}: {source}", path.display())]
+    CreateDirectory {
+        /// The directory's role in startup.
+        kind: &'static str,
+        /// The requested directory path.
+        path: PathBuf,
+        /// The underlying filesystem failure.
+        source: std::io::Error,
+    },
+    /// An existing configuration file could not be read.
+    #[error("failed to read configuration {}: {source}", path.display())]
+    Read {
+        /// The configuration file path.
+        path: PathBuf,
+        /// The underlying filesystem failure.
+        source: std::io::Error,
+    },
+}
+
+/// Failure to prepare the log destination or install the tracing subscriber.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum LoggingError {
+    /// The warning about an invalid logging level could not be delivered.
+    #[error("failed to write logging warning")]
+    Warning(#[source] std::io::Error),
+    /// The log directory could not be created.
+    #[error("failed to create log directory {}: {source}", path.display())]
+    CreateDirectory {
+        /// The requested log directory.
+        path: PathBuf,
+        /// The underlying filesystem failure.
+        source: std::io::Error,
+    },
+    /// The log file could not be opened for appending.
+    #[error("failed to open log file {}: {source}", path.display())]
+    OpenFile {
+        /// The requested log file.
+        path: PathBuf,
+        /// The underlying filesystem failure.
+        source: std::io::Error,
+    },
+    /// A global tracing subscriber could not be installed.
+    #[error("failed to initialize logging: {source}")]
+    Subscriber {
+        /// The subscriber installation failure, including an existing subscriber.
+        source: tracing_subscriber::util::TryInitError,
+    },
+}
+
+// Legacy infallible APIs keep their return contracts while diagnosing failed effects.
+fn create_legacy_directory(path: &Path) {
+    if let Err(error) = fs::create_dir_all(path) {
+        let diagnostic_delivery = write_config_warning(format_args!(
+            "warning: legacy directory creation failed ({:?})",
+            error.kind()
+        ));
+        // A failed final stderr channel cannot carry its own delivery diagnostic.
+        if let Err(source) = diagnostic_delivery {
+            tracing::warn!(error_kind = ?source.kind(), "failed to deliver legacy directory warning");
+        }
+    }
+}
 
 /// Full application context: parsed config + resolved directory paths.
 ///
@@ -426,11 +576,24 @@ impl Symposium {
     /// 1. `SYMPOSIUM_HOME` env var
     /// 2. `XDG_CONFIG_HOME/symposium`
     /// 3. `~/.symposium`
+    ///
+    /// Legacy infallible entry point retained until the root crate's 0.6 release.
+    /// New callers should use [`Self::try_from_environment`].
+    ///
+    /// # Panics
+    /// Panics if the home directory is unavailable; use the canonical fallible constructor.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::expect_used,
+            reason = "legacy infallible constructor; removed in root 0.6"
+        )
+    )]
     pub fn from_environment() -> Self {
         let home_dir = dirs::home_dir().expect("could not determine home directory");
         let dirs = crate::dirs::SymposiumDirs::from_environment();
-        let _ = fs::create_dir_all(&dirs.config_dir);
-        let _ = fs::create_dir_all(&dirs.cache_dir);
+        create_legacy_directory(&dirs.config_dir);
+        create_legacy_directory(&dirs.cache_dir);
 
         let config = load_config_from(&dirs.config_dir);
 
@@ -446,15 +609,18 @@ impl Symposium {
 
     /// Test constructor: everything rooted under a single directory.
     ///
-    /// Creates `config.toml` from the provided config if not already present.
+    /// Creates directories but does not create or rewrite `config.toml`.
+    ///
+    /// Legacy infallible entry point retained until the root crate's 0.6 release.
+    /// New callers should use [`Self::try_from_dir`].
     pub fn from_dir(root: &Path) -> Self {
         let config_dir = root.to_path_buf();
-        let _ = fs::create_dir_all(&config_dir);
+        create_legacy_directory(&config_dir);
 
         let config = load_config_from(&config_dir);
 
         let cache_dir = config_dir.join("cache");
-        let _ = fs::create_dir_all(&cache_dir);
+        create_legacy_directory(&cache_dir);
 
         // In test mode, use the root as the home directory so that
         // global hook registration writes into the tempdir.
@@ -467,6 +633,57 @@ impl Symposium {
             dirs,
             home_dir,
         }
+    }
+
+    /// Construct the application context from environment-resolved paths.
+    ///
+    /// Missing configuration uses defaults; malformed TOML warns on stderr and
+    /// uses defaults, preserving the supported configuration policy.
+    ///
+    /// # Errors
+    /// Returns an error if the home directory cannot be resolved, configuration
+    /// or cache directories cannot be created, or existing configuration cannot
+    /// be read. Filesystem errors retain their path and original source.
+    pub fn try_from_environment() -> Result<Self, ConfigError> {
+        let home_dir = dirs::home_dir().ok_or(crate::dirs::DirectoryError::HomeUnavailable)?;
+        let dirs = crate::dirs::SymposiumDirs::try_from_environment()?;
+        Self::try_from_paths(dirs, home_dir)
+    }
+
+    /// Construct an isolated context with configuration, cache, and home under `root`.
+    ///
+    /// This creates the directories, but does not create or rewrite `config.toml`.
+    /// Missing and malformed configuration have the same policy as
+    /// [`Self::try_from_environment`].
+    ///
+    /// # Errors
+    /// Returns an error for directory creation or existing configuration read
+    /// failures, retaining the affected path and underlying I/O error.
+    pub fn try_from_dir(root: &Path) -> Result<Self, ConfigError> {
+        let dirs = crate::dirs::SymposiumDirs::new(root.to_path_buf(), root.join("cache"), None);
+        Self::try_from_paths(dirs, root.to_path_buf())
+    }
+
+    fn try_from_paths(
+        dirs: crate::dirs::SymposiumDirs,
+        home_dir: PathBuf,
+    ) -> Result<Self, ConfigError> {
+        for (kind, path) in [
+            ("configuration", &dirs.config_dir),
+            ("cache", &dirs.cache_dir),
+        ] {
+            fs::create_dir_all(path).map_err(|source| ConfigError::CreateDirectory {
+                kind,
+                path: path.clone(),
+                source,
+            })?;
+        }
+        let config = try_load_config_from(&dirs.config_dir)?;
+        Ok(Self {
+            config,
+            dirs,
+            home_dir,
+        })
     }
 
     /// The resolved directory paths.
@@ -495,7 +712,7 @@ impl Symposium {
         }
     }
 
-    /// Create an [`InstallContext`] for use with `symposium-install` functions.
+    /// Create an [`InstallContext`](symposium_install::InstallContext) for installation.
     pub fn install_context(&self) -> symposium_install::InstallContext {
         let ctx = symposium_install::InstallContext::new(self.dirs.cache_dir.clone());
         match &self.dirs.cargo_override {
@@ -506,10 +723,13 @@ impl Symposium {
 
     /// The active package-manager set: the fixed ecosystem transports plus one
     /// [`PathPm`](crate::pm::PathPm) per configured registry
-    /// ([`registries`](Self::registries)) over its content directory —
+    /// ([`registry_instances`](Self::registry_instances)) over its content directory —
     /// including git registries, whose repository is unpacked into the cache
     /// before it is read. Each instance is named for its registry, since that
     /// name is what its plugins are attributed to.
+    ///
+    /// Legacy infallible entry point retained until the root crate's 0.6 release.
+    /// New callers should use [`Self::try_package_managers`].
     pub fn package_managers(
         &self,
         workspace: &Arc<crate::pm::WorkspaceDeps>,
@@ -526,11 +746,48 @@ impl Symposium {
         crate::pm::PmRegistry::new(instances)
     }
 
+    /// Resolve the complete package-manager set for a workspace.
+    ///
+    /// The Cargo transport is followed by trusted registry instances in their
+    /// configured order. Configuration is checked on every call, including
+    /// changes made through the public [`Self::config`] field.
+    ///
+    /// # Errors
+    /// Returns [`RegistryError`] rather than a partial manager set when a
+    /// registry cannot be resolved or the optional user directory cannot be
+    /// inspected. No source is fetched by this operation.
+    pub fn try_package_managers(
+        &self,
+        workspace: &Arc<crate::pm::WorkspaceDeps>,
+    ) -> Result<crate::pm::PmRegistry, RegistryError> {
+        let registries = self.try_registry_instances()?;
+        let mut instances = vec![crate::pm::PmInstance {
+            name: crate::pm::CARGO_PM.to_string(),
+            kind: crate::pm::PluginKind::Package,
+            trusted: false,
+            pm: Box::new(crate::pm::CargoPm::new(Arc::clone(workspace))),
+        }];
+        instances.extend(registries);
+        Ok(crate::pm::PmRegistry::new(instances))
+    }
+
     /// The package managers for a workspace-independent operation (registry
     /// listing, crates.io search): the cargo transport is built over a detached
     /// resolver that never runs `cargo metadata`.
+    ///
+    /// Legacy infallible entry point retained until the root crate's 0.6 release.
+    /// New callers should use [`Self::try_detached_managers`].
     pub fn detached_managers(&self) -> crate::pm::PmRegistry {
         self.package_managers(&Arc::new(crate::pm::WorkspaceDeps::detached()))
+    }
+
+    /// Resolve managers without a workspace or a Cargo metadata invocation.
+    ///
+    /// # Errors
+    /// Returns the same complete-set resolution errors as
+    /// [`Self::try_package_managers`]. No source is fetched.
+    pub fn try_detached_managers(&self) -> Result<crate::pm::PmRegistry, RegistryError> {
+        self.try_package_managers(&Arc::new(crate::pm::WorkspaceDeps::detached()))
     }
 
     /// Override the cargo binary path (test-only).
@@ -545,6 +802,20 @@ impl Symposium {
     /// subscriber so it receives events alongside the file logger.
     /// Per-layer filtering ensures the report layer can receive debug
     /// events even when the file log level is set higher.
+    ///
+    /// Legacy infallible entry point retained until the root crate's 0.6 release.
+    /// New callers should use [`Self::try_init_logging`].
+    ///
+    /// # Panics
+    /// Panics if the log file cannot be opened or a subscriber is already installed.
+    /// Use [`Self::try_init_logging`] for typed failures.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::expect_used,
+            reason = "legacy infallible logging; removed in root 0.6"
+        )
+    )]
     pub fn init_logging(&self, report_layer: Option<crate::report::ReportLayer>) {
         use std::fs::OpenOptions;
         use tracing_subscriber::EnvFilter;
@@ -563,7 +834,10 @@ impl Symposium {
             .open(&log_path)
             .expect("failed to open log file");
 
-        let level = self.log_level();
+        let level = self.log_level().unwrap_or_else(|source| {
+            tracing::warn!(error_kind = ?source.kind(), "failed to write legacy logging warning");
+            Level::INFO
+        });
         let file_filter = EnvFilter::new(level.as_str());
 
         let file_layer = tracing_subscriber::fmt::layer()
@@ -581,14 +855,48 @@ impl Symposium {
             .with(report_layer)
             .init();
 
-        tracing::debug!(
-            config_dir = %self.dirs.config_dir.display(),
-            cache_dir = %self.dirs.cache_dir.display(),
-            log_level = %level,
-            log_file = %log_path.display(),
-            "logging initialized"
-        );
-        tracing::trace!(config = ?self.config, "loaded config");
+        tracing::debug!(log_level = %level, "logging initialized");
+    }
+
+    /// Initialize logging, returning directory, file, or subscriber failures.
+    ///
+    /// Call once at startup. The optional report layer retains the same filtering
+    /// behavior as [`Self::init_logging`]. Hook callers must omit a stdout report
+    /// layer because stdout belongs to the agent protocol.
+    ///
+    /// # Errors
+    /// Returns a contextual filesystem error or a subscriber installation error,
+    /// including when a global subscriber has already been installed.
+    pub fn try_init_logging(
+        &self,
+        report_layer: Option<crate::report::ReportLayer>,
+    ) -> Result<(), LoggingError> {
+        use tracing_subscriber::EnvFilter;
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let logs = self.try_logs_dir()?;
+        let filename = chrono::Local::now()
+            .format("symposium-%Y%m%d-%H%M%S.log")
+            .to_string();
+        let log_path = logs.join(filename);
+        let file = open_log_file(&log_path)?;
+        let level = self.log_level().map_err(LoggingError::Warning)?;
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(file)
+            .with_ansi(false)
+            .with_filter(EnvFilter::new(level.as_str()));
+        let report_layer = report_layer.map(|layer| layer.with_filter(EnvFilter::new("trace")));
+
+        tracing_subscriber::registry()
+            .with(file_layer)
+            .with(report_layer)
+            .try_init()
+            .map_err(|source| LoggingError::Subscriber { source })?;
+
+        tracing::debug!(log_level = %level, "logging initialized");
+        Ok(())
     }
 
     pub fn config_dir(&self) -> &Path {
@@ -611,6 +919,11 @@ impl Symposium {
     /// a separate step. A registry whose source can't be resolved (a malformed
     /// git URL, or an entry naming neither `git` nor `path`) is skipped with a
     /// warning.
+    ///
+    /// Legacy infallible entry point retained until the root crate's 0.6 release.
+    /// It preserves Git precedence for entries with both fields and treats an
+    /// unsuccessful user-directory probe as absence. New callers must use
+    /// [`Self::try_registry_instances`] so failures cannot authorize cleanup.
     pub fn registry_instances(&self) -> Vec<crate::pm::PmInstance> {
         let mut configs: Vec<RegistryConfig> = Vec::new();
 
@@ -641,6 +954,84 @@ impl Symposium {
             .collect()
     }
 
+    /// Resolve every configured registry before returning a usable set.
+    ///
+    /// Order is the built-in recommendations repository, the optional built-in
+    /// user directory, then user-configured entries. Relative paths resolve
+    /// against the configuration directory. The public raw configuration is
+    /// validated on each call; no source is fetched or rewritten.
+    ///
+    /// # Errors
+    /// Returns [`RegistryError::BothSources`] or [`RegistryError::MissingSource`]
+    /// for invalid alternatives, a typed Git failure for an invalid repository
+    /// source, or a filesystem error when the optional directory cannot be
+    /// inspected. Only `NotFound` means that optional directory is absent.
+    pub fn try_registry_instances(&self) -> Result<Vec<crate::pm::PmInstance>, RegistryError> {
+        let mut instances = Vec::new();
+        if self.config.defaults.symposium_recommendations {
+            instances.push(self.try_registry_instance(&RegistryConfig {
+                name: "symposium-recommendations".to_string(),
+                git: Some(BUILTIN_RECOMMENDATIONS_URL.to_string()),
+                path: None,
+                auto_update: true,
+            })?);
+        }
+        if self.config.defaults.user_plugins {
+            let path = self.dirs.config_dir.join("plugins");
+            match fs::symlink_metadata(&path) {
+                Ok(_) => instances.push(self.try_registry_instance(&RegistryConfig {
+                    name: "user-plugins".to_string(),
+                    git: None,
+                    path: Some("plugins".to_string()),
+                    auto_update: true,
+                })?),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(RegistryError::ProbeUserPlugins { path, source }),
+            }
+        }
+        for config in &self.config.registries {
+            instances.push(self.try_registry_instance(config)?);
+        }
+        Ok(instances)
+    }
+
+    fn try_registry_instance(
+        &self,
+        config: &RegistryConfig,
+    ) -> Result<crate::pm::PmInstance, RegistryError> {
+        let name = config.name.clone();
+        let pm: Box<dyn crate::pm::PackageManager + Send + Sync> =
+            match config.validated_source()? {
+                RegistrySourceRef::Git(url) => Box::new(
+                    crate::pm::GitPm::try_new(
+                        name.clone(),
+                        url,
+                        config.auto_update,
+                        self.install_context(),
+                    )
+                    .map_err(|source| RegistryError::Git {
+                        name: name.clone(),
+                        source,
+                    })?,
+                ),
+                RegistrySourceRef::Path(path) => {
+                    let path = PathBuf::from(path);
+                    let dir = if path.is_absolute() {
+                        path
+                    } else {
+                        self.dirs.config_dir.join(path)
+                    };
+                    Box::new(crate::pm::PathPm::new(name.clone(), dir))
+                }
+            };
+        Ok(crate::pm::PmInstance {
+            name,
+            trusted: true,
+            kind: crate::pm::PluginKind::Registry,
+            pm,
+        })
+    }
+
     /// Build the registry instance for one config entry. Relative `path` values
     /// resolve against the config dir.
     fn registry_instance(&self, cfg: RegistryConfig) -> Option<crate::pm::PmInstance> {
@@ -654,7 +1045,7 @@ impl Symposium {
             ) {
                 Some(git) => Box::new(git),
                 None => {
-                    tracing::warn!(registry = %name, url = %url, "bad registry URL");
+                    tracing::warn!("bad registry URL");
                     return None;
                 }
             }
@@ -667,7 +1058,7 @@ impl Symposium {
             };
             Box::new(crate::pm::PathPm::new(name.clone(), dir))
         } else {
-            tracing::warn!(registry = %name, "registry names neither git nor path");
+            tracing::warn!("registry names neither git nor path");
             return None;
         };
         Some(crate::pm::PmInstance {
@@ -678,39 +1069,58 @@ impl Symposium {
         })
     }
 
-    /// Write the user config to disk.
-    pub fn save_config(&self) -> anyhow::Result<()> {
+    /// Write the user configuration to disk with a structured serialization or I/O error.
+    pub fn try_save_config(&self) -> Result<(), ConfigError> {
         let path = self.dirs.config_dir.join("config.toml");
-        let contents = toml::to_string_pretty(&self.config)?;
-        fs::write(&path, contents)?;
-        Ok(())
+        let contents = toml::to_string_pretty(&self.config)
+            .map_err(|source| ConfigError::Serialize { source })?;
+        fs::write(&path, contents).map_err(|source| ConfigError::Write { path, source })
+    }
+
+    /// Write the user config to disk.
+    ///
+    /// Legacy error-erasing adapter retained until the root crate's 0.6 release.
+    /// Prefer [`Self::try_save_config`] for structured failures.
+    pub fn save_config(&self) -> anyhow::Result<()> {
+        self.try_save_config().map_err(Into::into)
     }
 
     #[cfg(test)]
     pub fn plugins_dir(&self) -> PathBuf {
         let dir = self.dirs.config_dir.join("plugins");
-        let _ = fs::create_dir_all(&dir);
+        create_legacy_directory(&dir);
         dir
     }
 
     fn logs_dir(&self) -> PathBuf {
         let dir = resolve_logs_dir(&self.dirs.config_dir);
-        let _ = fs::create_dir_all(&dir);
+        create_legacy_directory(&dir);
         dir
     }
 
-    fn log_level(&self) -> Level {
-        match self.config.logging.level.to_lowercase().as_str() {
+    fn try_logs_dir(&self) -> Result<PathBuf, LoggingError> {
+        let dir = resolve_logs_dir(&self.dirs.config_dir);
+        fs::create_dir_all(&dir).map_err(|source| LoggingError::CreateDirectory {
+            path: dir.clone(),
+            source,
+        })?;
+        Ok(dir)
+    }
+
+    fn log_level(&self) -> std::io::Result<Level> {
+        Ok(match self.config.logging.level.to_lowercase().as_str() {
             "trace" => Level::TRACE,
             "debug" => Level::DEBUG,
             "info" => Level::INFO,
             "warn" => Level::WARN,
             "error" => Level::ERROR,
-            other => {
-                eprintln!("warning: unknown log level '{other}', defaulting to info");
+            _ => {
+                write_config_warning(format_args!(
+                    "warning: unknown log level, defaulting to info"
+                ))?;
                 Level::INFO
             }
-        }
+        })
     }
 }
 
@@ -718,13 +1128,47 @@ impl Symposium {
 ///
 /// Resolution: SYMPOSIUM_HOME/logs → XDG_STATE_HOME/symposium/logs → config_dir/logs.
 fn resolve_logs_dir(config_dir: &Path) -> PathBuf {
-    if let Ok(home) = env::var("SYMPOSIUM_HOME") {
+    if let Some(home) = env::var_os("SYMPOSIUM_HOME") {
         return PathBuf::from(home).join("logs");
     }
-    if let Ok(xdg) = env::var("XDG_STATE_HOME") {
+    if let Some(xdg) = env::var_os("XDG_STATE_HOME") {
         return PathBuf::from(xdg).join("symposium").join("logs");
     }
     config_dir.join("logs")
+}
+
+fn open_log_file(path: &Path) -> Result<fs::File, LoggingError> {
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| LoggingError::OpenFile {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn try_load_config_from(config_dir: &Path) -> Result<Config, ConfigError> {
+    let path = config_dir.join("config.toml");
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Config::default());
+        }
+        Err(source) => return Err(ConfigError::Read { path, source }),
+    };
+    let raw = match toml::from_str::<RawConfig>(&contents) {
+        Ok(raw) => raw,
+        Err(_) => {
+            write_config_warning(format_args!(
+                "warning: failed to parse {}: invalid TOML; using defaults",
+                path.display()
+            ))
+            .map_err(ConfigError::Warning)?;
+            RawConfig::default()
+        }
+    };
+    Ok(raw.validate())
 }
 
 /// Load config from a config directory.
@@ -732,13 +1176,25 @@ fn load_config_from(config_dir: &Path) -> Config {
     let path = config_dir.join("config.toml");
     match fs::read_to_string(&path) {
         Ok(contents) => toml::from_str::<RawConfig>(&contents)
-            .unwrap_or_else(|e| {
-                eprintln!("warning: failed to parse {}: {e}", path.display());
+            .unwrap_or_else(|_error| {
+                if let Err(source) = write_config_warning(format_args!(
+                    "warning: failed to parse {}: invalid TOML; using defaults",
+                    path.display()
+                )) {
+                    tracing::warn!(error_kind = ?source.kind(), "failed to write legacy configuration warning");
+                }
                 RawConfig::default()
             })
             .validate(),
         Err(_) => Config::default(),
     }
+}
+
+fn write_config_warning(message: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut stderr = std::io::stderr().lock();
+    writeln!(stderr, "{message}")?;
+    stderr.flush()
 }
 
 fn default_true() -> bool {
@@ -760,6 +1216,123 @@ mod tests {
 
     fn parse_config(toml: &str) -> Config {
         toml::from_str::<RawConfig>(toml).unwrap().validate()
+    }
+
+    #[test]
+    fn fallible_constructor_preserves_default_and_malformed_config_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        assert!(sym.config.defaults.symposium_recommendations);
+        assert!(sym.cache_dir().is_dir());
+        assert_eq!(sym.home_dir(), tmp.path());
+        let path = tmp.path().join("config.toml");
+        assert!(!path.exists(), "construction must not create a config file");
+
+        fs::write(&path, "").unwrap();
+        assert!(
+            Symposium::try_from_dir(tmp.path())
+                .unwrap()
+                .config
+                .defaults
+                .symposium_recommendations
+        );
+
+        let valid = "auto-sync = false\n";
+        fs::write(&path, valid).unwrap();
+        assert!(
+            !Symposium::try_from_dir(tmp.path())
+                .unwrap()
+                .config
+                .auto_sync
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), valid);
+
+        let malformed = "invalid = [";
+        fs::write(&path, malformed).unwrap();
+        let sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        assert!(sym.config.defaults.symposium_recommendations);
+        assert_eq!(fs::read_to_string(path).unwrap(), malformed);
+    }
+
+    #[test]
+    fn fallible_constructor_reports_directory_role_path_and_source() {
+        use std::error::Error as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        fs::write(&root, "keep").unwrap();
+        let error = match Symposium::try_from_dir(&root) {
+            Ok(_) => panic!("file cannot be a configuration directory"),
+            Err(error) => error,
+        };
+        assert!(error.source().is_some());
+        assert!(matches!(
+            error,
+            ConfigError::CreateDirectory { kind: "configuration", ref path, .. } if path == &root
+        ));
+        assert_eq!(fs::read_to_string(root).unwrap(), "keep");
+
+        let cache = tmp.path().join("cache");
+        fs::write(&cache, "cache conflict").unwrap();
+        assert!(matches!(
+            Symposium::try_from_dir(tmp.path()),
+            Err(ConfigError::CreateDirectory { kind: "cache", path, .. }) if path == cache
+        ));
+    }
+
+    #[test]
+    fn fallible_constructor_distinguishes_unreadable_config_from_absence() {
+        use std::error::Error as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::create_dir(&path).unwrap();
+        let error = match Symposium::try_from_dir(tmp.path()) {
+            Ok(_) => panic!("directory cannot be read as configuration"),
+            Err(error) => error,
+        };
+        assert!(error.source().is_some());
+        assert!(matches!(error, ConfigError::Read { path: actual, .. } if actual == path));
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn checked_config_save_preserves_typed_failure_and_existing_destination() {
+        use std::error::Error as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        sym.try_save_config().unwrap();
+        let path = tmp.path().join("config.toml");
+        let contents = fs::read_to_string(&path).unwrap();
+        let _: RawConfig = toml::from_str(&contents).unwrap();
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let sentinel = path.join("foreign-data");
+        fs::write(&sentinel, "keep").unwrap();
+        let error = sym.try_save_config().unwrap_err();
+        assert!(error.source().unwrap().is::<std::io::Error>());
+        assert!(matches!(error, ConfigError::Write { path: actual, .. } if actual == path));
+        let legacy = sym.save_config().unwrap_err();
+        assert!(matches!(
+            legacy.downcast_ref::<ConfigError>(),
+            Some(ConfigError::Write { .. })
+        ));
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), "keep");
+    }
+
+    #[test]
+    fn log_file_failure_preserves_path_and_source() {
+        use std::error::Error as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let error = open_log_file(tmp.path()).unwrap_err();
+        assert!(error.source().is_some());
+        assert!(matches!(
+            error,
+            LoggingError::OpenFile { ref path, .. } if path == tmp.path()
+        ));
     }
 
     #[test]

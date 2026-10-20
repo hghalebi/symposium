@@ -60,6 +60,14 @@ A listing that swallows read errors returns the same empty list for "nothing the
 
 ## Windows portability (tests)
 
+Use the exact `Symposium.toml` manifest filename in generated fixtures. A
+lowercase `symposium.toml` can appear to work on a case-insensitive macOS or
+Windows filesystem while Linux discovers no plugin and returns a neutral hook
+response. Check the fixture filename before changing dispatch when only Linux
+loses plugin context. The diagnostic process tests assert that the plugin ran
+and its expected content reached the protocol, so an undiscovered fixture
+cannot produce a false privacy pass.
+
 The test suite runs on `windows-latest`, where CI passes `--no-fail-fast` so that one failing test binary does not hide the failures in every binary cargo would otherwise skip. A few patterns recur when writing tests that touch paths or scripts:
 
 - **Paths in TOML/JSON string literals.** A Windows path like `C:\Users\...` is invalid inside a TOML or JSON string (the backslashes read as escapes). When substituting a real path into fixture text, convert to forward slashes first; Windows accepts `/` in paths. See `setup_fixture` in `symposium-testlib`.
@@ -74,3 +82,164 @@ The test suite runs on `windows-latest`, where CI passes `--no-fail-fast` so tha
 A test that asserts on `ReportEvent`s installs a `ReportLayer` with `tracing::subscriber::set_default`, which is thread-local. tracing caches callsite interest and the global max level process-wide, recomputing both from whichever dispatchers are alive the first time a callsite is reached. Tests run in parallel, so a thread with no subscriber can reach a reporting callsite first and pin it to `Interest::never()` for every thread; the capturing test then drains zero events, which looks like the command reporting nothing. The failure is timing-dependent, so it shows up as a platform-specific flake rather than a reproducible failure.
 
 `install_tracing_baseline` (in `symposium-testlib`) installs a permissive global default subscriber once per test process to keep that cache open, and a thread-local `set_default` still takes precedence over it. `setup_fixture` calls it, and so must any helper that installs its own report layer.
+
+A repeated parallel run confirmed this setup omission in
+`pm::tests::reports_for_invalid_plugin`. It and the shared sync fixture helper
+initialize the baseline before report capture. When an expected warning event
+is missing, inspect that setup before changing the production reporting policy.
+Assert the event's intended content; an empty capture is not evidence that no
+failure occurred. Verify the repair with the full parallel suite, since one
+isolated pass cannot qualify process-wide callsite behavior.
+
+## Executable fixtures are not mutable response files
+
+On Linux, `ETXTBSY` means the kernel refused to execute a file that was open for
+writing. See the Linux [execve(2) manual](https://man7.org/linux/man-pages/man2/execve.2.html).
+A diagnostic run captured OS code 26, `ExecutableFileBusy`, when an installation
+test spawned a freshly written executable. This establishes that fixture's
+failure; it does not identify the writer or establish the cause of an earlier
+Cargo-output assertion whose actual error was not recorded. Keep unexpected
+`Result` values in assertion diagnostics, including the concrete variant and
+native I/O kind/OS code where relevant.
+
+Use the checked-in `cargo-stub.sh` dispatchers for workspace discovery and
+installer acquisition tests. Keep each case's response body in its own ordinary
+`cargo-stub-response` file, which the dispatcher sources. The helper can vary
+exit status, bytes and arguments without rewriting the executable file. Preserve
+the dispatchers' executable Git mode and include the installer's fixture in its
+package. No production retries, delays or permission changes are needed for this
+test setup.
+
+Keep permission assertions distinct from execution coverage. The writable-file
+matrix checks the resolved path, exact mode and unchanged bytes after acquisition;
+a separate Unix test acquires and spawns the existing `/bin/sh`, then verifies
+its mode is unchanged. Run both with the standalone installer feature checks
+and the full parallel workspace suite described in the [test guide](./running-tests.md).
+
+## Invalid agent configuration must not become an empty configuration
+
+Agent settings are user-owned data. A JSON root, `hooks`/MCP container, or
+supported hook event with the wrong shape is an error, not a missing field.
+Registration validates those shapes and preserves the original file bytes on
+rejection. Missing and whitespace-only files still initialize normally. Unknown
+settings and user hook entries are retained, including in Copilot's project
+`symposium.json`; finding one registered event does not skip the other events.
+MCP updates preserve unknown extension fields while reconciling managed
+transport fields and retaining an existing `enabled: false` setting.
+
+Codex MCP registration likewise rejects malformed TOML and non-table
+`mcp_servers` values rather than replacing them with an empty document. Normal
+and inline tables are supported. Configuration errors expose the path and
+expected shape without embedding source values; parser and filesystem sources
+remain attached for structured inspection.
+
+When registration reports a shape error, inspect the indicated JSON pointer (or
+TOML table) and repair it using the agent's supported configuration format.
+Retry the original registration command, then verify the expected hooks or MCP
+servers and unrelated settings. Do not delete the file as a recovery step.
+The registration tests cover invalid input, exact byte preservation, extension
+fields, and repeated registration; run `cargo test --lib agents::` with real-agent
+testing disabled as described in the [test guide](./running-tests.md).
+
+Hook unregistration validates every supported present event before removing
+anything and reports rejected input without rewriting it. It removes Symposium
+handlers individually, preserving other handlers in the same matcher group,
+unknown settings, and unknown events. A dedicated Copilot or Kiro file is deleted
+only when it contains generated defaults and no remaining foreign content;
+otherwise the edited file remains. This also makes repeated removal a no-op.
+
+Both complete owned prefixes, `cargo-agents hook` and historical `symposium hook`,
+participate in cleanup. Registration migrates a historical handler to the current
+generated command and removes historical duplicates while retaining unrelated
+handler/group fields. Names such as `symposium hook-custom` are foreign commands;
+ownership checks require a token boundary, not just a shared text prefix.
+
+
+## Typed errors and safe diagnostics carry different information
+
+A normal error message identifies an operation; its attached source keeps the
+original I/O or parser failure for structured inspection. Do not use alternate
+formatting (`{error:#}`) to print an entire chain at the CLI: TOML errors may
+contain a full input line, and request errors may contain private URLs.
+Use a typed `try_*` entry point and inspect its variant or `Error::source` in a
+test. Legacy adapters keep the old published signature through the documented
+root 0.6, SDK 0.2 or installer 0.2 boundary.
+
+Error wrappers and boxed recursive causes can have different source-chain
+shapes. Assert the concrete cause and intended context rather than assuming
+an arbitrary chain depth. Keep
+a private canary in the actual rejected input and verify that the top-level
+diagnostic excludes it while the source remains inspectable.
+
+## A failed scan does not prove a skill was removed
+
+Synchronization may continue with successfully loaded plugins when another
+source fails. That partial set cannot authorize deletion of previously installed
+skills. Registry, dependency, plugin and skill collection failures must reach
+the cleanup decision. Recovery is to repair the reported source, rerun sync,
+and check both the installed content and removal report. Do not delete caches
+or consent records to make an incomplete scan appear empty.
+
+
+## Production lint scope and macro-generated code
+
+Production crate roots deny explicit panic and unwrap lints under `not(test)`.
+The exact legacy infallible methods retain scoped expectations with removal
+versions. An unfulfilled expectation fails strict Clippy, which makes obsolete
+exceptions visible instead of hiding them indefinitely.
+
+Clippy may skip operations inside macro-generated bodies. If an audited legacy
+macro needs a common infallible serializer, put that exact operation in a small
+ordinary helper called only by the legacy methods, and scope the expectation
+there. Keep canonical serialization fallible. A broad macro/module allowance
+would conceal new errors. Existing native-schema compatibility tests protect
+wire values and external trait implementations while strict Clippy verifies the
+actual ordinary helper.
+
+If CI points a new lint at a derive attribute, compare the actual compiler
+versions and inspect the macro expansion. Rust 1.99.1 flags named `#[from]`
+initializers emitted by `thiserror` 2.0.18 and redundant `must_use` attributes
+from `async-trait` 0.1.89; the earlier local 1.97.1 checks pass. Compatible
+`thiserror` 2.0.21 and `async-trait` 0.1.92 releases repair those expansions.
+Inspect versions with `cargo search`/`cargo info`, update only the intended
+locked packages, and recheck public error/trait consumers and standalone
+features with the hosted compiler. No application-wide lint allowance is needed.
+
+Filesystem and spawn error categories also vary by platform. A child of a regular
+file can produce `NotFound` on Windows metadata probes or Intel macOS process
+spawning, even when another Unix implementation reports `NotADirectory`. When
+the contract preserves a native failure, compare its kind and OS code with the
+original platform operation. When absence controls cache freshness or cleanup,
+inspect invalid ancestors before converting `NotFound` into optional absence.
+
+## A lock guard must release the lock, not just close its handle
+
+If telemetry reports contention immediately after a guard is dropped, check for
+duplicated or inherited file handles before adding retries. On Unix, a duplicate
+can keep the same open-file description alive, so closing the guard's handle
+alone may leave the advisory lock held. The guard explicitly unlocks on drop;
+unlock failures report the operation and I/O category without private contents.
+
+The regression tests retain a duplicate through ordinary drop and unwinding,
+then acquire from a fresh open immediately. They also check that closing the old
+duplicate cannot release the new holder's lock. Run them locally with both agent
+variables removed:
+
+```sh
+env -u SYMPOSIUM_ENABLE_AGENT_TESTING -u SYMPOSIUM_TEST_AGENT \
+  cargo test --lib telemetry::storage::lock::tests --locked
+```
+
+This reproduces the handle-lifetime mechanism deterministically. A particular
+concurrent fork causing a full-suite failure remains an inference; a passing
+isolated test does not establish that handle lifetime matches guard lifetime.
+
+## Shared build directories can retain checkout-specific helper paths
+
+`xtask` embeds its workspace location through `CARGO_MANIFEST_DIR`. Sharing a
+target directory with another worktree can retain a helper pointing at that
+checkout after it is removed. A missing `md/SUMMARY.md` with the old checkout in
+the backtrace identifies this build-artifact problem. From the current checkout,
+run `cargo clean -p xtask`, then `cargo run --locked -p xtask -- md-orphan-check`.
+This rebuilds only the affected package; do not rewrite the book or remove its
+checks to hide a stale helper.

@@ -406,6 +406,55 @@ async fn sync_keeps_skills_of_a_registry_it_cannot_read() {
 }
 
 #[tokio::test]
+async fn sync_rejects_invalid_registry_sources_without_changing_managed_skills() {
+    with_fixture(
+        TestMode::SimulationOnly,
+        &["unreadable-registry0", "workspace-empty0"],
+        async |mut ctx| {
+            ctx.symposium(&["init", "--add-agent", "claude"]).await?;
+            ctx.symposium(&["sync"]).await?;
+            let workspace_root = ctx.workspace_root.as_ref().unwrap().clone();
+            let installed =
+                find_installed_skill(&workspace_root.join(".claude/skills"), "house-style");
+            let skill = installed.join("SKILL.md");
+            let marker = installed.join(".symposium");
+            let skill_bytes = std::fs::read(&skill)?;
+            let marker_bytes = std::fs::read(&marker)?;
+
+            for both_sources in [true, false] {
+                ctx.sym.config.registries = vec![symposium::config::RegistryConfig {
+                    name: "invalid-registry".into(),
+                    git: both_sources.then(|| "https://github.com/symposium-dev/unused".into()),
+                    path: both_sources.then(|| ctx.tempdir.join("ext").display().to_string()),
+                    auto_update: false,
+                }];
+                let deps = ctx.sym.workspace_deps(&workspace_root);
+                let error = symposium::sync::sync(&ctx.sym, &deps, symposium::UpdateLevel::None)
+                    .await
+                    .unwrap_err();
+                let source = error
+                    .chain()
+                    .find_map(|source| source.downcast_ref::<symposium::config::RegistryError>())
+                    .expect("sync must preserve its typed registry error");
+                assert!(matches!(
+                    (both_sources, source),
+                    (true, symposium::config::RegistryError::BothSources { .. })
+                        | (
+                            false,
+                            symposium::config::RegistryError::MissingSource { .. }
+                        )
+                ));
+                assert_eq!(std::fs::read(&skill)?, skill_bytes);
+                assert_eq!(std::fs::read(&marker)?, marker_bytes);
+            }
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn sync_cleans_up_without_a_user_plugins_directory() {
     with_fixture(
         TestMode::SimulationOnly,

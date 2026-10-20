@@ -144,7 +144,7 @@ A `[[installations]]` entry has a `name` plus any of:
 | `source` | string | Optional. How to acquire bits onto disk: `cargo` or `github`. Each source takes its own fields, listed under [Installation sources](#installation-sources). When omitted, no acquisition step runs. |
 | `install_commands` | array of strings | Optional. Shell commands run (in order) after the source step. Useful for post-install setup such as aliasing, or when *only* have manual commands. Each command must exit zero. |
 | `requirements` | array | Optional. Other installations to acquire whenever this one is referenced. Strings name `[[installations]]` entries; tables are inline declarations. |
-| `executable` | string | Optional. Path to a binary to run. For `cargo`, the binary name (looked up in the install's `bin/` dir). For `github`, a path inside the acquired tree. With no source, a path on disk, relative to the directory of the manifest that declares it. |
+| `executable` | string | Optional. Path to a binary to run. For `cargo`, the binary name (looked up in the install's `bin/` dir). For `github`, a path inside the acquired tree. With no source, a path on disk resolved from the process working directory, or a bare command resolved through `PATH`. |
 | `script` | string | Optional. Same resolution rules as `executable`, but invoked as `sh <path> <args>`. |
 | `args` | array of strings | Optional. Default invocation arguments. |
 
@@ -152,6 +152,21 @@ A `[[installations]]` entry has a `name` plus any of:
 `executable` and `script` are mutually exclusive — pick one. The hook layer applies the same rule, and **at most one of `executable` / `script` may be set across the hook AND the installation it references**. An installation may have neither (then it's pure setup — useful as a `requirements` entry). For a hook to run, the chosen layer pair must end up with exactly one runnable.
 
 > Inline installations (used as `command` or as a requirement entry) accept the same fields, including `requirements`.
+
+The same four-field rule is enforced at acquisition and refresh, including for
+installations constructed directly through Rust's public fields. Conflicting
+fields, empty or NUL-bearing runnable names, invalid managed paths, and Cargo
+source requirements are rejected before any source acquisition or
+`install_commands` run. Managed paths must be relative and cannot traverse a
+parent directory. A managed Cargo installation may infer its sole binary
+or select a script; Cargo Git and global Cargo require an explicit executable.
+Global Cargo cannot select a script. A setup-only requirement remains valid.
+
+No-source relative paths are not rebased to the plugin manifest directory.
+They retain the process working directory used by hook/subcommand dispatch;
+a bare executable retains `PATH` lookup. Missing optional executable metadata
+keeps its existing behavior, while actual metadata or permission failures are
+reported with a retained filesystem source instead of being silently ignored.
 
 ### Installation sources
 

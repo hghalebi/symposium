@@ -243,29 +243,33 @@ strict_versioned_row! {
 
 impl CommandV1 {
     /// Create a record for one completed eligible top-level command.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse error if the build version is not valid SemVer.
     pub(in crate::telemetry) fn new(
         observation: &BoundRecordingObservation<'_>,
         command: CommandCoordinate,
         duration_ms: u64,
         outcome: CommandOutcome,
-    ) -> Self {
+    ) -> Result<Self, semver::Error> {
+        let symposium = SymposiumVersion::current()?;
         let at = observation.completed_at();
         let day = observation.day();
         let command_subject = observation.identifier_window_scope().derive(&command);
 
-        Self {
+        Ok(Self {
             version: SchemaVersion::V1,
             kind: Self::KIND,
             event_id: EventId::new(),
             day,
             at,
-            symposium: SymposiumVersion::current(),
+            symposium,
             command,
             duration_ms,
             outcome,
             command_subject,
-        }
+        })
     }
 }
 
@@ -336,7 +340,7 @@ mod tests {
         let mut state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
         let observation = recording_observation(&mut state);
 
-        CommandV1::new(&observation, command, 820, CommandOutcome::Ok)
+        CommandV1::new(&observation, command, 820, CommandOutcome::Ok).unwrap()
     }
 
     #[test]
@@ -621,7 +625,7 @@ mod tests {
             serde_json::to_string(&row.at).unwrap(),
             r#""2026-08-03T10:02:11Z""#
         );
-        assert_eq!(row.symposium, SymposiumVersion::current());
+        assert_eq!(row.symposium, SymposiumVersion::current().unwrap());
         assert_eq!(row.command, command);
         assert_eq!(row.duration_ms, 820);
         assert_eq!(row.outcome, CommandOutcome::Ok);

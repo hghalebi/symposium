@@ -289,9 +289,12 @@ impl ExtensionInvocationAggregateStore {
             Entry::Occupied(entry) => Self::select_occupied(entry),
             Entry::Vacant(entry) => {
                 if bucket.is_public() {
-                    let PublicRowAdmission::Public = self.public_rows.admit_new() else {
-                        unreachable!("BUG: a non-exhausted public-row budget must admit a row");
-                    };
+                    match self.public_rows.admit_new() {
+                        PublicRowAdmission::Public => {}
+                        PublicRowAdmission::Overflow => {
+                            return Err(ExtensionInvocationAdmissionError::PublicBudgetInvariant);
+                        }
+                    }
                 }
                 Self::insert_vacant(entry, bucket)
             }
@@ -398,6 +401,7 @@ impl ExtensionInvocationAggregateStore {
 pub(in crate::telemetry) enum ExtensionInvocationAdmissionError {
     DayBeforeCurrent(DayBeforeCurrent),
     PrivateState(ExtensionAggregateSelectionError),
+    PublicBudgetInvariant,
 }
 
 impl From<DayBeforeCurrent> for ExtensionInvocationAdmissionError {
@@ -413,11 +417,21 @@ impl fmt::Display for ExtensionInvocationAdmissionError {
                 write!(formatter, "extension-invocation budget {error}")
             }
             Self::PrivateState(error) => error.fmt(formatter),
+            Self::PublicBudgetInvariant => formatter
+                .write_str("extension-invocation public-row budget changed during admission"),
         }
     }
 }
 
-impl std::error::Error for ExtensionInvocationAdmissionError {}
+impl std::error::Error for ExtensionInvocationAdmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DayBeforeCurrent(error) => Some(error),
+            Self::PrivateState(error) => Some(error),
+            Self::PublicBudgetInvariant => None,
+        }
+    }
+}
 
 /// A private entry selected with another aggregate key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

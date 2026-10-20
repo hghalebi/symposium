@@ -11,30 +11,32 @@ cargo new my-crate-hooks
 cd my-crate-hooks
 ```
 
-And then add symposium-sdk to your dependencies, along with `anyhow`, which the handler methods return:
+Add `symposium-sdk` to your dependencies:
 
 ```bash
-cargo add symposium-sdk anyhow
+cargo add symposium-sdk
 ```
 
 ## Step 2. Write the handler
 
-A hook handler is a program that reads a JSON event on stdin and writes a JSON response to stdout. The `symposium-sdk` crate provides a `HookHandler` trait and a `run()` harness that handles the plumbing.
+A hook handler is a program that reads a JSON event on stdin and writes a JSON response to stdout. The `symposium-sdk` crate provides a `HookHandler<E>` trait and a fallible `try_run()` harness that handles the plumbing while preserving the handler's error type.
 
-Implement `HookHandler` and override the methods for the events you care about:
+Implement `HookHandler<E>` and override the methods for the events you care about. This handler makes a pure decision, so `Infallible` states that its event methods cannot fail:
 
 ```rust
 // src/main.rs
+use std::convert::Infallible;
+use std::io::Write as _;
 use std::process::ExitCode;
-use symposium_sdk::hook::{HookHandler, PreToolUseInput, PreToolUseOutput, run};
+use symposium_sdk::hook::{HookHandler, PreToolUseInput, PreToolUseOutput, try_run};
 
 // The shell tool's name in Claude Code and Codex, Copilot, Antigravity, and Kiro.
 const SHELL_TOOLS: &[&str] = &["Bash", "bash", "run_command", "execute_bash"];
 
 struct MyHook;
 
-impl HookHandler for MyHook {
-    async fn pre_tool_use(&self, event: &PreToolUseInput) -> anyhow::Result<PreToolUseOutput> {
+impl HookHandler<Infallible> for MyHook {
+    async fn pre_tool_use(&self, event: &PreToolUseInput) -> Result<PreToolUseOutput, Infallible> {
         if SHELL_TOOLS.contains(&event.tool_name.as_str()) {
             Ok(PreToolUseOutput::context("Remember: prefer non-destructive commands"))
         } else {
@@ -44,16 +46,28 @@ impl HookHandler for MyHook {
 }
 
 fn main() -> ExitCode {
-    run(MyHook)
+    match try_run(MyHook) {
+        Ok(exit) => exit,
+        Err(error) => {
+            if writeln!(std::io::stderr().lock(), "symposium-hook: {error}").is_err() {
+                return ExitCode::FAILURE;
+            }
+            ExitCode::FAILURE
+        }
+    }
 }
 ```
 
-The `run()` function:
+The `try_run()` function:
 
-1. Reads symposium canonical JSON from stdin.
+1. Creates a current-thread runtime and reads symposium canonical JSON from stdin.
 2. Deserializes it into an `Input` event.
 3. Calls `handler.handle_event()`, which dispatches to the appropriate method.
-4. Serializes the output to stdout.
+4. Serializes nonempty output to stdout and flushes it. A denial is always nonempty, even when it carries no context.
+
+Runtime creation, input, handler, serialization, output, and flush failures return a `HarnessError<E>`. Keep stdout for the protocol; the example writes a safe diagnostic to stderr and returns failure if the hook or diagnostic cannot be delivered. `Display` identifies the failing operation without printing input or source-error contents. Inspect attached sources deliberately: parser and handler errors may contain private input, so avoid logging `Debug` output or unrestricted error chains.
+
+`try_run()` owns its runtime and must be called outside an existing Tokio runtime. Code already running asynchronously can call the handler or `try_default_handle_event()` directly. Handlers and their futures do not need `Send`, `Sync`, or `'static` bounds for this current-thread harness.
 
 You only need to override the methods you care about — unimplemented methods return the default (empty) output for their event type.
 
@@ -92,22 +106,24 @@ Each output type has convenience constructors:
 - `PreToolUseOutput::with_updated_input(value)`: replace the tool input. Not every agent can apply a rewrite; see [how each agent receives the decision](../reference/hook-events.md#pretooluse-output).
 - `PreToolUseOutput::deny("reason")`: block the tool call with a reason.
 
-Return `Err(...)` from any method to report an error (exit code 1, message on stderr).
+Return `Err(...)` from a method to preserve its failure in `HarnessError::Handler`. The executable decides how to report it and returns failure, as in the example above. The context example below uses `std::io::Error`: absent `NOTES.md` is optional, while permission, decoding, and other read failures remain errors.
 
 ## The `HookHandler` trait
 
 ```rust
-pub trait HookHandler {
-    async fn handle_event(&self, input: &Input) -> anyhow::Result<Output> { /* dispatches */ }
-    async fn pre_tool_use(&self, event: &PreToolUseInput) -> anyhow::Result<PreToolUseOutput> { /* default */ }
-    async fn post_tool_use(&self, event: &PostToolUseInput) -> anyhow::Result<PostToolUseOutput> { /* default */ }
-    async fn user_prompt_submit(&self, event: &UserPromptSubmitInput) -> anyhow::Result<UserPromptSubmitOutput> { /* default */ }
-    async fn session_start(&self, event: &SessionStartInput) -> anyhow::Result<SessionStartOutput> { /* default */ }
-    async fn stop(&self, event: &StopInput) -> anyhow::Result<StopOutput> { /* default */ }
+pub trait HookHandler<E = anyhow::Error> {
+    async fn handle_event(&self, input: &Input) -> Result<Output, E> { /* dispatches */ }
+    async fn pre_tool_use(&self, event: &PreToolUseInput) -> Result<PreToolUseOutput, E> { /* default */ }
+    async fn post_tool_use(&self, event: &PostToolUseInput) -> Result<PostToolUseOutput, E> { /* default */ }
+    async fn user_prompt_submit(&self, event: &UserPromptSubmitInput) -> Result<UserPromptSubmitOutput, E> { /* default */ }
+    async fn session_start(&self, event: &SessionStartInput) -> Result<SessionStartOutput, E> { /* default */ }
+    async fn stop(&self, event: &StopInput) -> Result<StopOutput, E> { /* default */ }
 }
 ```
 
-Override `handle_event` only if you need custom dispatch logic (e.g., shared state across events). Otherwise, just override the per-event methods.
+Override `handle_event` only if you need custom dispatch logic (e.g., shared state across events). Otherwise, just override the per-event methods. An override can delegate to `try_default_handle_event()` without erasing `E`.
+
+For compatibility until SDK 0.2, `impl HookHandler` still selects `anyhow::Error`, the `hook::anyhow` re-export remains available, and `run()` and `default_handle_event()` keep their existing signatures. Existing handlers continue to compile. Use an explicit error type with `try_run()` and `try_default_handle_event()` for new code; choose a typed `thiserror` error when several failure cases need distinct meaning.
 
 ## Testing locally
 

@@ -122,15 +122,30 @@ async fn unknown_subcommand_errors() {
         TestMode::SimulationOnly,
         &["subcommands0"],
         async |mut ctx| {
+            let canary = "synthetic-private-subcommand-canary";
             let err = ctx
-                .symposium(&["definitely-not-a-real-subcommand"])
+                .symposium(&[canary])
                 .await
                 .expect_err("dispatch should fail for an unknown name");
             let msg = err.to_string();
             assert!(
-                msg.contains("definitely-not-a-real-subcommand"),
-                "error should name the subcommand: {msg}"
+                msg.contains("no active plugin defines the requested subcommand"),
+                "error should identify the dispatch failure: {msg}"
             );
+            assert!(
+                msg.contains("cargo agents --help"),
+                "error should explain recovery: {msg}"
+            );
+            assert!(
+                !msg.contains(canary),
+                "diagnostics must not echo arbitrary command input"
+            );
+            assert!(matches!(
+                err.downcast_ref::<symposium::cli::CliError>(),
+                Some(symposium::cli::CliError::Subcommand(
+                    symposium::subcommand_dispatch::SubcommandError::NotFound
+                ))
+            ));
             Ok(())
         },
     )

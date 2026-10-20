@@ -6,14 +6,14 @@
 //! If clap's format ever drifts and a slice marker isn't found, we fall back to clap's unmodified help rather than panic.
 //!
 
-use std::{fmt::Write as _, path::Path};
+use std::path::Path;
 
 use clap::{Command, CommandFactory};
 
 use crate::{
     cli::{Cli, Commands, builtin_audience},
-    config::Symposium,
-    plugins::{Audience, Plugin, load_registry_with_workspace},
+    config::{RegistryError, Symposium},
+    plugins::{Audience, Plugin, try_load_registry_with_workspace},
     pm::PackageId,
     subcommand_dispatch::applicable_subcommands,
 };
@@ -31,34 +31,58 @@ pub const AGENTS_HEADING: &str = "Commands for agents";
 /// - no subcommand, or the bare `help` keyword -> top-level
 /// - `<built-in> --help` (incl. nested and required-arg commands) -> clap's own per command help, re-rendered;
 /// - a plugin-vended `<name> --help` -> `None`, so dispatch forwards `--help` to the child.
+///
+/// Legacy best-effort adapter retained through root 0.6. When registry
+/// configuration is invalid, show built-in help and emit a content-free warning.
 pub async fn help_text(
     parse: Result<&Cli, &clap::Error>,
     args: &[String],
     sym: &Symposium,
     cwd: &Path,
 ) -> Option<String> {
+    match try_help_text(parse, args, sym, cwd).await {
+        Ok(text) => text,
+        Err(_) => {
+            tracing::warn!("plugin help skipped: invalid registry configuration");
+            Some(render(&[], &[], &[]))
+        }
+    }
+}
+
+/// Return help for a help request, rejecting invalid plugin registry sources.
+///
+/// Built-in subcommand help does not need to resolve plugins.
+///
+/// # Errors
+/// Returns [`RegistryError`] when top-level help cannot resolve configured sources.
+pub async fn try_help_text(
+    parse: Result<&Cli, &clap::Error>,
+    args: &[String],
+    sym: &Symposium,
+    cwd: &Path,
+) -> Result<Option<String>, RegistryError> {
     match parse {
         Ok(cli) => {
             let help_keyword = matches!(&cli.command, Some(Commands::External(argv)) if argv.first().and_then(|fst| fst.to_str()) == Some("help"));
 
             if cli.command.is_none() || help_keyword {
-                return Some(render_help(sym, cwd).await);
+                return Ok(Some(try_render_help(sym, cwd).await?));
             }
 
             if cli.help {
-                // `<built-in> --help`; fall back to top-level if the target is a plugin (External) or `--help` come before any subcommand name.
+                // External commands receive their own --help through dispatch.
                 return match subcommand_help(args) {
-                    Some(text) => Some(text),
-                    None => Some(render_help(sym, cwd).await),
+                    Some(text) => Ok(Some(text)),
+                    None => Ok(Some(try_render_help(sym, cwd).await?)),
                 };
             }
 
-            None
+            Ok(None)
         }
-        // Parse failed. If help was requested on a built-in with required args/subcommands, recover by rendering that command's help; otherwise it's a genuine error and the caller let's clap report it.
+        // Recover built-in help when required arguments made parsing fail.
         Err(_) => {
             let asked = args.iter().any(|arg| arg == "-h" || arg == "--help");
-            asked.then(|| subcommand_help(args)).flatten()
+            Ok(asked.then(|| subcommand_help(args)).flatten())
         }
     }
 }
@@ -89,11 +113,28 @@ pub fn subcommand_help(args: &[String]) -> Option<String> {
     })
 }
 
+/// Render audience-grouped help using the legacy best-effort policy.
+///
+/// Retained through root 0.6; use [`try_render_help`] to reject invalid sources.
 pub async fn render_help(sym: &Symposium, cwd: &Path) -> String {
+    match try_render_help(sym, cwd).await {
+        Ok(text) => text,
+        Err(_) => {
+            tracing::warn!("plugin help skipped: invalid registry configuration");
+            render(&[], &[], &[])
+        }
+    }
+}
+
+/// Render audience-grouped help after validating configured registry sources.
+///
+/// # Errors
+/// Returns [`RegistryError`] when a configured source is invalid.
+pub async fn try_render_help(sym: &Symposium, cwd: &Path) -> Result<String, RegistryError> {
     let deps = sym.workspace_deps(cwd);
     let workspace = deps.load().cloned();
-    let registry = load_registry_with_workspace(sym, workspace.as_deref()).await;
-    let dep_ids = crate::pm::workspace_dep_ids(sym, &deps).await;
+    let registry = try_load_registry_with_workspace(sym, workspace.as_deref()).await?;
+    let dep_ids = crate::pm::try_workspace_dep_ids(sym, &deps).await?;
     let used = workspace
         .as_ref()
         .map(|ws| sym.config.plugins.used_names_in(&ws.root))
@@ -101,7 +142,7 @@ pub async fn render_help(sym: &Symposium, cwd: &Path) -> String {
 
     // Resolve the active plugin set so crate-sourced subcommands appear in help.
     let mut ctx = crate::predicate::PredicateContext::new(&dep_ids).with_used_names(&used);
-    let pms = sym.package_managers(&deps);
+    let pms = sym.try_package_managers(&deps)?;
     let active = crate::plugins::active_plugins(
         sym,
         &registry,
@@ -111,7 +152,7 @@ pub async fn render_help(sym: &Symposium, cwd: &Path) -> String {
     )
     .await;
 
-    render(&active, &dep_ids, &used)
+    Ok(render(&active, &dep_ids, &used))
 }
 
 fn render(plugins: &[Plugin], deps: &[PackageId], used: &[&str]) -> String {
@@ -140,19 +181,19 @@ fn render(plugins: &[Plugin], deps: &[PackageId], used: &[&str]) -> String {
 
     let mut out = String::new();
     out.push_str(header);
-    writeln!(out).unwrap();
+    out.push('\n');
 
     // Commands for Humans
-    writeln!(out, "{HUMANS_HEADING}:").unwrap();
+    out.push_str(&format!("{HUMANS_HEADING}:\n"));
     for (name, desc) in &humans {
-        writeln!(out, "{name:<col_width$}{desc}").unwrap();
+        out.push_str(&format!("{name:<col_width$}{desc}\n"));
     }
-    writeln!(out).unwrap();
+    out.push('\n');
 
     // Commands for Agents
-    writeln!(out, "{AGENTS_HEADING}:").unwrap();
+    out.push_str(&format!("{AGENTS_HEADING}:\n"));
     for (name, desc) in &agents {
-        writeln!(out, "{name:<col_width$}{desc}").unwrap();
+        out.push_str(&format!("{name:<col_width$}{desc}\n"));
     }
     out.push_str(options);
 

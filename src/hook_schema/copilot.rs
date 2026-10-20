@@ -44,11 +44,46 @@ impl Agent for Copilot {
 }
 
 macro_rules! copilot_event {
-    ($event:ident, $input:ident, $output:ident) => {
+    ($event:ident, $input:ident, $output:ident, $variant:ident) => {
         pub struct $event;
         impl AgentHookEvent for $event {
             type Input = $input;
             type Output = $output;
+
+            fn try_parse_input(
+                &self,
+                payload: &str,
+            ) -> Result<Self::Input, super::HookSchemaError> {
+                Self::Input::try_parse_input(payload)
+            }
+            fn try_parse_output(
+                &self,
+                output: &[u8],
+            ) -> Result<Self::Output, super::HookSchemaError> {
+                Self::Output::try_parse_output(output)
+            }
+            fn try_translate_input(
+                &self,
+                input: &symposium::InputEvent,
+            ) -> Result<Self::Input, super::HookSchemaError> {
+                super::validate_input_event(input, super::HookEvent::$variant)?;
+                Ok(Self::Input::from_symposium(input))
+            }
+            fn try_translate_output(
+                &self,
+                output: &symposium::OutputEvent,
+            ) -> Result<Self::Output, super::HookSchemaError> {
+                super::validate_output_event(output, super::HookEvent::$variant)?;
+                Ok(Self::Output::from_symposium(output))
+            }
+            fn try_respond(
+                &self,
+                output: &serde_json::Value,
+            ) -> Result<super::HookResponse, super::HookSchemaError> {
+                serde_json::to_vec(output)
+                    .map(super::HookResponse::success)
+                    .map_err(super::HookSchemaError::OutputSerialization)
+            }
         }
     };
 }
@@ -56,22 +91,26 @@ macro_rules! copilot_event {
 copilot_event!(
     CopilotPreToolUseEvent,
     CopilotPreToolUseInput,
-    CopilotPreToolUseOutput
+    CopilotPreToolUseOutput,
+    PreToolUse
 );
 copilot_event!(
     CopilotPostToolUseEvent,
     CopilotPostToolUseInput,
-    CopilotPostToolUseOutput
+    CopilotPostToolUseOutput,
+    PostToolUse
 );
 copilot_event!(
     CopilotUserPromptSubmitEvent,
     CopilotUserPromptSubmitInput,
-    CopilotUserPromptSubmitOutput
+    CopilotUserPromptSubmitOutput,
+    UserPromptSubmit
 );
 copilot_event!(
     CopilotSessionStartEvent,
     CopilotSessionStartInput,
-    CopilotSessionStartOutput
+    CopilotSessionStartOutput,
+    SessionStart
 );
 
 // Copilot output is flat (additionalContext at top level, no hookSpecificOutput).
@@ -79,6 +118,22 @@ copilot_event!(
 macro_rules! copilot_output_impl {
     ($ty:ident, PreToolUse, PreToolUseOutput { $($extra:tt)* }) => {
         impl AgentHookOutput for $ty {
+            fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+                serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+            }
+            fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+                if output.is_empty() {
+                    return Ok(Self::default());
+                }
+                let parsed: Self =
+                    serde_json::from_slice(output).map_err(super::HookSchemaError::OutputParse)?;
+                super::validate_decision(
+                    parsed.permission_decision.as_deref(),
+                    &["allow", "deny", "ask"],
+                    "permissionDecision",
+                )?;
+                Ok(parsed)
+            }
             fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
                 if output.is_empty() {
                     return Ok(Self::default());
@@ -118,8 +173,14 @@ macro_rules! copilot_output_impl {
                     self.modified_args.as_ref().map(parse_copilot_tool_args),
                 ))
             }
+            /// Legacy infallible serialization retained until root 0.6.
+            ///
+            /// Use [`crate::hook_schema::AgentHookOutput::try_to_hook_output`] for typed failure.
+            ///
+            /// # Panics
+            /// Panics if the output cannot be serialized as JSON.
             fn to_hook_output(&self) -> serde_json::Value {
-                serde_json::to_value(self).unwrap()
+                super::legacy_to_hook_output(self)
             }
             fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
                 self
@@ -128,6 +189,15 @@ macro_rules! copilot_output_impl {
     };
     ($ty:ident, $variant:ident, $struct:ident { }) => {
         impl AgentHookOutput for $ty {
+            fn try_to_hook_output(&self) -> Result<serde_json::Value, super::HookSchemaError> {
+                serde_json::to_value(self).map_err(super::HookSchemaError::OutputSerialization)
+            }
+            fn try_parse_output(output: &[u8]) -> Result<Self, super::HookSchemaError> {
+                if output.is_empty() {
+                    return Ok(Self::default());
+                }
+                serde_json::from_slice(output).map_err(super::HookSchemaError::OutputParse)
+            }
             fn parse_output(output: &[u8]) -> anyhow::Result<Self> {
                 if output.is_empty() {
                     return Ok(Self::default());
@@ -144,8 +214,14 @@ macro_rules! copilot_output_impl {
                     self.additional_context.clone(),
                 ))
             }
+            /// Legacy infallible serialization retained until root 0.6.
+            ///
+            /// Use [`crate::hook_schema::AgentHookOutput::try_to_hook_output`] for typed failure.
+            ///
+            /// # Panics
+            /// Panics if the output cannot be serialized as JSON.
             fn to_hook_output(&self) -> serde_json::Value {
-                serde_json::to_value(self).unwrap()
+                super::legacy_to_hook_output(self)
             }
             fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
                 self
@@ -190,6 +266,12 @@ pub struct CopilotPreToolUseOutput {
 }
 
 impl AgentHookInput for CopilotPreToolUseInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -201,6 +283,19 @@ impl AgentHookInput for CopilotPreToolUseInput {
             self.cwd.clone(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::PreToolUse(p) = event else {
             panic!("wrong event type")
@@ -256,6 +351,12 @@ pub struct CopilotPostToolUseOutput {
 }
 
 impl AgentHookInput for CopilotPostToolUseInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -268,6 +369,19 @@ impl AgentHookInput for CopilotPostToolUseInput {
             self.cwd.clone(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::PostToolUse(p) = event else {
             panic!("wrong event type")
@@ -314,6 +428,12 @@ pub struct CopilotUserPromptSubmitOutput {
 }
 
 impl AgentHookInput for CopilotUserPromptSubmitInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -324,6 +444,19 @@ impl AgentHookInput for CopilotUserPromptSubmitInput {
             self.cwd.clone(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::UserPromptSubmit(p) = event else {
             panic!("wrong event type")
@@ -370,6 +503,12 @@ pub struct CopilotSessionStartOutput {
 }
 
 impl AgentHookInput for CopilotSessionStartInput {
+    fn try_parse_input(payload: &str) -> Result<Self, super::HookSchemaError> {
+        serde_json::from_str(payload).map_err(super::HookSchemaError::InputParse)
+    }
+    fn try_to_string(&self) -> Result<String, super::HookSchemaError> {
+        serde_json::to_string(self).map_err(super::HookSchemaError::InputSerialization)
+    }
     fn parse_input(payload: &str) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(payload)?)
     }
@@ -379,6 +518,19 @@ impl AgentHookInput for CopilotSessionStartInput {
             self.cwd.clone(),
         ))
     }
+    /// Legacy infallible translation retained until root 0.6.
+    ///
+    /// Use [`crate::hook_schema::AgentHookEvent::try_translate_input`] for typed failure.
+    ///
+    /// # Panics
+    /// Panics if `event` has a different canonical event variant.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::panic,
+            reason = "legacy infallible translation retained until root 0.6; use try_translate_input"
+        )
+    )]
     fn from_symposium(event: &symposium::InputEvent) -> Self {
         let symposium::InputEvent::SessionStart(p) = event else {
             panic!("wrong event type")
