@@ -4,23 +4,32 @@
 
 @md/introduction.md
 
-## Documentation
+## Contributor contract
 
-Design documentation is tracked in the mdbook:
+Follow the portable Rust contributor contract for implementation and review:
+
+@md/design/rust-practices.md
+
+Before changing code, read the recurring failure patterns and actual checks:
+
+@md/design/common-issues.md
+@md/design/running-tests.md
+
+Design documentation is tracked in the mdbook. Read the chapters relevant to the
+change and update them when behavior changes:
 
 @md/SUMMARY.md
-
-The module structure and important flows chapters are particularly useful for understanding the codebase:
-
 @md/design/module-structure.md
-
 @md/design/important-flows.md
 
-## Instructions
+Symposium is a Rust Cargo workspace. Validate affected packages and supported
+feature combinations with the commands in the test guide. Keep real-agent tests opt-in and isolate CLI checks
+from the user's home and agent configuration.
 
-Agent MUST follow the following guidance:
+## Collaboration and governance
 
-* **Check common issues first**: Before starting a coding task, review `md/design/common-issues.md` for recurring bug patterns that may apply to your work.
-* **Update design documentation**: Update the mdbook chapters in `md/design` as appropriate so that they are kept current. This will help both you and future agents to remember how things work.
-* **Check that everything builds and don't forget tests**: After making changes, remember to check that the typescript + swift + Rust code builds and to run tests.
-* **Co-authorship**: Include "Co-authored-by" with your agent identifier (e.g., "Claude <claude@anthropic.com>") to indicate AI collaboration.
+Preserve supported SDK, installer, configuration, and hook-protocol contracts.
+Update an applicable active RFD's implementation status with each increment.
+Follow the PR template, including AI disclosure and useful validation evidence.
+Include a `Co-authored-by` trailer with the actual agent identifier (for example,
+`Codex <codex@openai.com>`) in commits created with AI collaboration.

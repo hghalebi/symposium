@@ -1,13 +1,27 @@
 # Code review instructions
 
-## Rust coding practices
+## Rust contributor contract
 
-Watch for these patterns:
+Review against [Rust practices](../md/design/rust-practices.md), the single source
+for this repository's Rust contract, and [common issues](../md/design/common-issues.md).
+Focus comments on observable correctness, supported compatibility, and missing
+validation. In particular, check:
 
-- **Document the destination, not the journey**: Comments and documentation should describe what the code does now, not what it used to do or why it changed. Avoid references to past behavior, removed code, or migration history.
-- **Exhaustive is better**: Prefer exhaustive matches over wildcard (`_`) arms — when new variants are added, the compiler should force a decision. Similarly, prefer destructuring structs (`let Foo { a, b, .. } = x`) over field access (`x.a`, `x.b`) when the code is likely to need updating as fields are added.
-- **Private is better**: Flag items that are more public than necessary. Default to private; use `pub(crate)` or `pub(super)` before `pub`. The library surface of symposium is mostly internal — `symposium-sdk` is the exception.
-- **Focus on the now**: Flag backwards-compatibility shims, re-exports of removed items, `#[deprecated]` stubs, or dead code left "just in case." Symposium is primarily an application; unused abstractions are waste, not investment.
+- New or changed production paths propagate typed errors with sources and context;
+  they do not panic, discard operational failures, or expose sensitive payloads.
+- Boundary validation preserves user files on rejection, hook stdout stays protocol
+  output, and tests use isolated fixtures instead of global agent configuration.
+- Newtypes, enums, and narrow trait bounds encode real requirements. Closed enum
+  matches are exhaustive; struct patterns omit `..` only when new fields must force
+  review. A pattern containing `..` accepts added fields.
+- Visibility serves real callers. Compatibility shims and re-exports remain only
+  for supported consumers or versioning promises; public API changes include a
+  deliberate migration decision.
+- Comments and reference docs describe current behavior and invariants. Preserve
+  useful decision rationale and required migration guidance in the right docs.
+- Cargo performs supported dependency operations. Validation follows the supported
+  package, target, and feature matrix; local, live-agent, and hosted CI evidence
+  remain distinct.
 
 ## RFD compliance
 

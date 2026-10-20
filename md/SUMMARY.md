@@ -73,6 +73,7 @@
     - [`init`](./design/init-user-flow.md)
     - [`sync`](./design/sync-agent-flow.md)
     - [`hook`](./design/hook-flow.md)
+  - [Rust practices](./design/rust-practices.md)
   - [Running tests](./design/running-tests.md)
   - [Writing tests](./design/testing-guidelines.md)
   - [Governance](./design/governance.md)
@@ -89,6 +90,8 @@
   - [Template](./rfds/TEMPLATE/README.md)
   - [Draft: Evaluating agent tasks with and without Symposium](./rfds/skill-evaluation/README.md)
     - [Reference: evaluating agent tasks](./rfds/skill-evaluation/reference.md)
+  - [Draft: Align Symposium's Rust code and contributor guidance](./rfds/rust-engineering-alignment/README.md)
+    - [Proposed contributor guide: Rust practices](./rfds/rust-engineering-alignment/proposed-rust-practices.md)
   - [Accepted](./rfds/accepted.md) <!-- put accepted rfds in this section; the file goes in the rfds directory -->
     - [MCP meta-server](./rfds/mcp-meta-server/README.md)
     - [Registry-centric plugin distribution](./rfds/registry-centric-plugins/README.md)

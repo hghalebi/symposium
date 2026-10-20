@@ -1,6 +1,30 @@
-## What does this PR do?
+## What changed
 
-<!-- Explain the purpose, key logic, etc. -->
+<!-- Describe the resulting behavior and affected files. -->
+
+## Why
+
+<!-- Explain the concrete problem or value. -->
+
+## How
+
+<!-- Explain implementation, compatibility decisions, and material trade-offs.
+List actual checks and results, prediction versus observation, and unverified
+behavior. Distinguish local checks, live-agent testing, and hosted CI. -->
+
+## Learning corner
+
+### Architectural idea
+
+<!-- Teach the boundary or invariant that makes the change work. -->
+
+### Syntax, algorithm, or technique
+
+<!-- Explain one relevant language feature, algorithm, or technique. -->
+
+### Reuse
+
+<!-- State where the principle applies again. Keep teaching proportional. -->
 
 <details>
 <summary>Disclosure questions</summary>
