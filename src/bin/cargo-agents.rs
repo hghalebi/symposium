@@ -15,7 +15,13 @@ use symposium::subcommand_dispatch::dispatch_external;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let mut sym = config::Symposium::from_environment();
+    let mut sym = match config::Symposium::try_from_environment() {
+        Ok(sym) => sym,
+        Err(error) => {
+            eprintln!("cargo agents: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // When invoked as `cargo agents`, cargo passes "agents" as the first arg.
     // Strip it so clap sees the real arguments.
@@ -28,7 +34,13 @@ async fn main() -> ExitCode {
         args
     };
 
-    let cwd = env::current_dir().expect("failed to get current directory");
+    let cwd = match env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            eprintln!("cargo agents: failed to get current directory: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Parse without exiting on error: a help request on a built-in with required args
     // (`crate-info --help`, `plugin --help`) surfaces a parse error that `help_text` recovers.
@@ -73,7 +85,10 @@ async fn main() -> ExitCode {
     // JSON makes the agent discard the whole output. The events still reach
     // the log file; `-v` prints them to stderr when debugging a hook by hand.
     let report_layer = (!is_hook || cli.verbose).then_some(report_layer);
-    sym.init_logging(report_layer);
+    if let Err(error) = sym.try_init_logging(report_layer) {
+        eprintln!("cargo agents: {error}");
+        return ExitCode::FAILURE;
+    }
 
     // Log the command being invoked
     match &cli.command {

@@ -173,7 +173,11 @@ observation in each implementation PR. Update this plan as work lands.
 
 ### Step 1: Establish the portable contract and a truthful baseline
 
-Status: completed locally; hosted checkpoint pending.
+Status: completed locally and on hosted CI.
+
+Checkpoint: `5faf8dda10c9da4ce9f13e76dfc9629b5f5d92b5`;
+[CI passed](https://github.com/hghalebi/symposium/actions/runs/39422495278)
+on Ubuntu, macOS, Windows and musl.
 
 Add the Rust chapter and references listed above, correct test guidance and stale
 aliases after caller search, and align the PR template. Fix the two existing
@@ -196,6 +200,8 @@ The original baseline findings above remain historical evidence.
 
 ### Step 2: Propagate startup and configuration failures
 
+Status: completed locally; hosted checkpoint pending.
+
 Introduce typed configuration/startup errors using `thiserror`. Update
 `Symposium::from_environment`, directory resolution/creation, `logs_dir`, logging
 initialization, and the CLI assembly caller together. Use fallible subscriber
@@ -206,8 +212,21 @@ required, log destination failure, subscriber conflict, and hook stdout isolatio
 Use deterministic filesystem conflicts rather than root-sensitive permission
 assumptions. Update configuration loading and contributor diagnostics docs.
 
-- [ ] Startup and all callers return/report contextual errors without panics.
-- [ ] Existing supported configuration behavior is preserved or explicitly migrated.
+- [x] Maintained startup callers use typed APIs and report failures without panics.
+- [x] Existing supported configuration behavior is preserved or explicitly migrated.
+
+Observed: formatting, workspace compilation, strict Clippy, local workspace tests,
+seven dedicated startup process/compatibility tests, orphan checking and rendered
+mdbook pass. Missing/empty/malformed config keeps defaults; unreadable existing
+config returns a typed error. File-vs-directory and subscriber-conflict tests
+confirm source preservation, unchanged input files and clean hook stdout.
+
+Compatibility decision: additive `try_from_environment`, `try_from_dir`,
+`try_logs_dir` and `try_init_logging` are canonical. Existing infallible public
+entry points retain their signatures and legacy behavior until the root crate's
+0.6 breaking boundary. Their historical assertions are a narrowly tracked
+compatibility debt, not a pattern for new production code. No release metadata
+or package version was changed.
 
 ### Step 3: Validate agent config mutations and safe diagnostics
 
