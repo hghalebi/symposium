@@ -29,7 +29,6 @@ use std::sync::Arc;
 /// `Installation` entries, so the dispatch loop never has to scan the plugin's
 /// installations list again.
 struct ResolvedHook {
-    plugin_name: String,
     hook_name: String,
     format: HookFormat,
     requirements: Vec<Installation>,
@@ -60,7 +59,6 @@ impl ResolvedHook {
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         Ok(Self {
-            plugin_name: parsed_plugin.manifest.name.clone(),
             hook_name: hook.name.clone(),
             format: hook.format.clone(),
             requirements,
@@ -158,12 +156,8 @@ async fn build_spawn_spec(sym: &Symposium, hook: &ResolvedHook) -> anyhow::Resul
     for requirement in &hook.requirements {
         match acquire_installation(sym, requirement, None, None, update).await {
             Ok(a) => acquired.push(a),
-            Err(e) => {
-                tracing::error!(
-                    name = %requirement.name,
-                    error = %e,
-                    "failed to install hook requirement"
-                );
+            Err(_error) => {
+                tracing::error!("failed to install hook requirement");
             }
         }
     }
@@ -328,7 +322,7 @@ fn blocked_response(
     } else {
         reason
     };
-    tracing::info!(?event, %reason, "plugin hook blocked");
+    tracing::info!(?event, reason_len = reason.len(), "plugin hook blocked");
 
     if event == HookEvent::PreToolUse {
         let deny = OutputEvent::PreToolUse(symposium::PreToolUseOutput::deny(reason));
@@ -344,10 +338,15 @@ pub async fn run(sym: &Symposium, agent: HookAgent, event: HookEvent) -> ExitCod
 
     let mut input = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut input) {
-        tracing::warn!(?event, error = %e, "failed to read hook stdin");
+        tracing::warn!(?event, error_kind = ?e.kind(), "failed to read hook stdin");
         return ExitCode::SUCCESS;
     }
-    tracing::trace!(?input, "hook stdin");
+    tracing::trace!(
+        ?agent,
+        ?event,
+        input_len = input.len(),
+        "hook stdin received"
+    );
 
     match execute_hook(sym, agent, event, &input).await {
         Ok(response) => {
@@ -360,32 +359,27 @@ pub async fn run(sym: &Symposium, agent: HookAgent, event: HookEvent) -> ExitCod
             }
             ExitCode::from(response.exit_code)
         }
-        Err(e) => {
-            tracing::warn!(?event, error = %e, "hook failed");
+        Err(_error) => {
+            tracing::warn!(?agent, ?event, input_len = input.len(), "hook failed");
             ExitCode::FAILURE
         }
     }
 }
 
-/// If `SYMPOSIUM_HOOK_TRACE` is set to a file path, append a JSONL entry.
-/// Used for integration testing to check what hooks occur when we invoke the agent.
+/// Append metadata-only JSONL when `SYMPOSIUM_HOOK_TRACE` names a file.
+/// Payloads and stderr remain exclusively on the agent protocol streams.
 fn write_hook_trace(agent: HookAgent, event: HookEvent, input: &str, response: &HookResponse) {
     let Some(path) = std::env::var_os("SYMPOSIUM_HOOK_TRACE") else {
         return;
     };
 
-    let input_val: serde_json::Value =
-        serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
-    let output_val: serde_json::Value =
-        serde_json::from_slice(&response.stdout).unwrap_or(serde_json::Value::Null);
-
     let entry = serde_json::json!({
         "event": event,
         "agent": agent,
-        "input": input_val,
-        "output": output_val,
+        "input": { "byte_len": input.len() },
+        "output": { "byte_len": response.stdout.len() },
         "exit_code": response.exit_code,
-        "stderr": String::from_utf8_lossy(&response.stderr),
+        "stderr_len": response.stderr.len(),
     });
 
     use std::fs::OpenOptions;
@@ -394,10 +388,10 @@ fn write_hook_trace(agent: HookAgent, event: HookEvent, input: &str, response: &
             let mut line = serde_json::to_string(&entry).unwrap();
             line.push('\n');
             if let Err(e) = f.write_all(line.as_bytes()) {
-                tracing::warn!(error = %e, "failed to write hook trace");
+                tracing::warn!(error_kind = ?e.kind(), "failed to write hook trace");
             }
         }
-        Err(e) => tracing::warn!(error = %e, "failed to open hook trace file"),
+        Err(e) => tracing::warn!(error_kind = ?e.kind(), "failed to open hook trace file"),
     }
 }
 
@@ -445,8 +439,8 @@ async fn run_auto_sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, session_start
     };
 
     tracing::debug!("auto-sync running");
-    if let Err(e) = crate::sync::sync(sym, deps, update).await {
-        tracing::warn!(error = %e, "auto-sync during hook failed (continuing)");
+    if let Err(_error) = crate::sync::sync(sym, deps, update).await {
+        tracing::warn!(session_start, "auto-sync during hook failed (continuing)");
         return false;
     }
 
@@ -523,24 +517,24 @@ async fn prewarm_hook_sources(sym: &Symposium, deps: &Arc<WorkspaceDeps>) {
             }
             let resolved = match ResolvedHook::build(parsed, hook) {
                 Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!(plugin = %parsed.manifest.name, hook = %hook.name, error = %e, "prewarm: skipping unbuildable hook");
+                Err(_error) => {
+                    tracing::debug!("prewarm: skipping unbuildable hook");
                     continue;
                 }
             };
             for req in &resolved.requirements {
-                if let Err(e) = refresh_installation_if_present(sym, req, None).await {
-                    tracing::debug!(name = %req.name, error = %e, "prewarm: requirement refresh failed");
+                if let Err(_error) = refresh_installation_if_present(sym, req, None).await {
+                    tracing::debug!("prewarm: requirement refresh failed");
                 }
             }
-            if let Err(e) = refresh_installation_if_present(
+            if let Err(_error) = refresh_installation_if_present(
                 sym,
                 &resolved.command,
                 resolved.hook_executable.as_deref(),
             )
             .await
             {
-                tracing::debug!(plugin = %resolved.plugin_name, hook = %resolved.hook_name, error = %e, "prewarm: command refresh failed");
+                tracing::debug!("prewarm: command refresh failed");
             }
         }
     }
@@ -760,12 +754,7 @@ pub async fn dispatch_plugin_hooks(
     let mut context = JoinedContext::new(event, prior_context);
 
     for hook in hooks {
-        tracing::info!(
-            plugin = %hook.plugin_name,
-            hook = %hook.hook_name,
-            format = ?hook.format,
-            "running plugin hook"
-        );
+        tracing::info!(?event, format = ?hook.format, "running plugin hook");
 
         // Determine stdin for the plugin based on its declared format.
         // After format selection, the only two cases are:
@@ -779,16 +768,16 @@ pub async fn dispatch_plugin_hooks(
         };
         let stdin_str = match hook_input.to_string() {
             Ok(s) => s,
-            Err(e) => {
-                tracing::error!(plugin = %hook.plugin_name, hook = %hook.hook_name, error = %e, "failed to serialize hook input");
+            Err(_error) => {
+                tracing::error!(?event, "failed to serialize hook input");
                 continue;
             }
         };
 
         let spawn_res = match build_spawn_spec(sym, &hook).await {
             Ok(spec) => spawn_from_spec(spec),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to prepare hook command");
+            Err(_error) => {
+                tracing::warn!(?event, "failed to prepare hook command");
                 continue;
             }
         };
@@ -802,22 +791,20 @@ pub async fn dispatch_plugin_hooks(
                 let child_out = match child.wait_with_output() {
                     Ok(o) => o,
                     Err(e) => {
-                        tracing::warn!(error = %e, "failed waiting for hook process");
+                        tracing::warn!(?event, error_kind = ?e.kind(), "failed waiting for hook process");
                         continue;
                     }
                 };
 
-                tracing::trace!(?child_out, "hook finished");
+                tracing::trace!(
+                    ?event,
+                    stdout_len = child_out.stdout.len(),
+                    stderr_len = child_out.stderr.len(),
+                    "hook finished"
+                );
 
                 let exit_code = child_out.status.code();
-                tracing::debug!(
-                    report = %crate::report::ReportEvent::HookDispatched {
-                        plugin: hook.plugin_name.clone(),
-                        hook: hook.hook_name.clone(),
-                        exit_code,
-                        error: None,
-                    },
-                );
+                tracing::debug!(?event, exit_code, "plugin hook dispatched");
                 match exit_code {
                     None | Some(2) => return Err(child_out.stderr),
                     Some(0) if child_out.stdout.is_empty() => continue,
@@ -831,8 +818,8 @@ pub async fn dispatch_plugin_hooks(
                             // Native format — parse as host agent output
                             match host_h.parse_output(&child_out.stdout) {
                                 Ok(o) => (o.to_hook_output(), Some(o.to_symposium())),
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "failed to parse hook output");
+                                Err(_error) => {
+                                    tracing::warn!(?event, "failed to parse hook output");
                                     continue;
                                 }
                             }
@@ -849,8 +836,8 @@ pub async fn dispatch_plugin_hooks(
                                         (v, None)
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "failed to parse hook output");
+                                Err(_error) => {
+                                    tracing::warn!(?event, "failed to parse hook output");
                                     continue;
                                 }
                             }
@@ -859,8 +846,7 @@ pub async fn dispatch_plugin_hooks(
                         merge(&mut output, host_json);
                         if hook_output.as_ref().is_some_and(denies) {
                             tracing::info!(
-                                plugin = %hook.plugin_name,
-                                hook = %hook.hook_name,
+                                ?event,
                                 "plugin hook denied the tool call; later hooks do not run"
                             );
                             return Ok(output);
@@ -876,15 +862,7 @@ pub async fn dispatch_plugin_hooks(
                 }
             }
             Err(e) => {
-                tracing::debug!(
-                    report = %crate::report::ReportEvent::HookDispatched {
-                        plugin: hook.plugin_name.clone(),
-                        hook: hook.hook_name.clone(),
-                        exit_code: None,
-                        error: Some(e.to_string()),
-                    },
-                );
-                tracing::warn!(error = %e, "failed to spawn hook command");
+                tracing::warn!(?event, error_kind = ?e.kind(), "failed to spawn hook command");
             }
         }
     }
@@ -982,7 +960,7 @@ fn dispatched_hooks_for_payload(
     host_agent: HookAgent,
     ctx: &mut crate::predicate::PredicateContext,
 ) -> Vec<ResolvedHook> {
-    tracing::trace!(?input, "matching hooks for payload");
+    tracing::trace!(event = ?input.event(), plugin_count = plugins.len(), "matching hooks for payload");
 
     let mut out = Vec::new();
 
@@ -990,10 +968,7 @@ fn dispatched_hooks_for_payload(
         // Plugin-level predicates gate every hook in the plugin. Evaluated once
         // per plugin per dispatch — keep them cheap.
         if !parsed_plugin.applies(ctx) {
-            tracing::debug!(
-                plugin = %parsed_plugin.manifest.name,
-                "plugin predicates failed, skipping hooks"
-            );
+            tracing::debug!(event = ?input.event(), "plugin predicates failed, skipping hooks");
             continue;
         }
 
@@ -1029,37 +1004,14 @@ fn dispatched_hooks_for_payload(
             // Hook-level predicates are evaluated at dispatch so they pick up
             // live state (file present, tool installed, crate present, …).
             if !hook.predicates.evaluate(ctx) {
-                tracing::debug!(
-                    report = %crate::report::ReportEvent::HookConsidered {
-                        plugin: parsed_plugin.manifest.name.clone(),
-                        hook: hook.name.clone(),
-                        event: format!("{:?}", input.event()),
-                        selected: false,
-                        format: Some(format!("{:?}", hook.format)),
-                        reason: Some("hook predicates not satisfied".into()),
-                    },
-                );
+                tracing::debug!(event = ?input.event(), selected = false, format = ?hook.format, "hook predicates not satisfied");
                 continue;
             }
-            tracing::debug!(
-                report = %crate::report::ReportEvent::HookConsidered {
-                    plugin: parsed_plugin.manifest.name.clone(),
-                    hook: hook.name.clone(),
-                    event: format!("{:?}", input.event()),
-                    selected: true,
-                    format: Some(format!("{:?}", hook.format)),
-                    reason: None,
-                },
-            );
+            tracing::debug!(event = ?input.event(), selected = true, format = ?hook.format, "hook selected");
             match ResolvedHook::build(parsed_plugin, hook) {
                 Ok(dispatched) => out.push(dispatched),
-                Err(e) => {
-                    tracing::warn!(
-                        plugin = %parsed_plugin.manifest.name,
-                        hook = %hook.name,
-                        error = %e,
-                        "failed to resolve hook for dispatch"
-                    );
+                Err(_error) => {
+                    tracing::warn!(event = ?input.event(), "failed to resolve hook for dispatch");
                 }
             }
         } else if parsed_plugin
@@ -1068,16 +1020,7 @@ fn dispatched_hooks_for_payload(
             .iter()
             .any(|h| h.event == input.event())
         {
-            tracing::debug!(
-                report = %crate::report::ReportEvent::HookConsidered {
-                    plugin: parsed_plugin.manifest.name.clone(),
-                    hook: "(none)".into(),
-                    event: format!("{:?}", input.event()),
-                    selected: false,
-                    format: None,
-                    reason: Some("no matching format for this agent".into()),
-                },
-            );
+            tracing::debug!(event = ?input.event(), selected = false, "no matching format for this agent");
         }
     }
 

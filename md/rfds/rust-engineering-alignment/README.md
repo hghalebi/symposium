@@ -200,7 +200,11 @@ The original baseline findings above remain historical evidence.
 
 ### Step 2: Propagate startup and configuration failures
 
-Status: completed locally; hosted checkpoint pending.
+Status: completed locally and on hosted CI.
+
+Checkpoint: `c03e8b29d4ee4e3e3e0eacdfa291bccaef9a2e54`;
+[CI passed](https://github.com/hghalebi/symposium/actions/runs/39423539925)
+on Ubuntu, macOS, Windows and musl.
 
 Introduce typed configuration/startup errors using `thiserror`. Update
 `Symposium::from_environment`, directory resolution/creation, `logs_dir`, logging
@@ -230,6 +234,8 @@ or package version was changed.
 
 ### Step 3: Validate agent config mutations and safe diagnostics
 
+Status: completed locally; hosted checkpoint pending.
+
 Validate JSON shapes at the shared boundary and each agent-specific nested
 container before editing. Preserve unknown valid settings and original bytes on
 rejection. Replace unrestricted input/config/trace logging with safe metadata.
@@ -238,8 +244,20 @@ Tests: scalar/array roots, wrong hook/MCP container shapes, unchanged files afte
 failure, and synthetic secret canaries absent from logs and trace output. Reuse
 registration and protocol tests; update common issues and relevant agent docs.
 
-- [ ] All affected agent adapters reject malformed shapes without panic or data loss.
-- [ ] Logs and optional traces have an explicit safe-content contract.
+- [x] All affected agent adapters reject malformed shapes without panic or data loss.
+- [x] Logs and optional traces have an explicit safe-content contract.
+
+Observed: 77 focused agent tests, eight real-binary privacy tests, formatting,
+workspace compilation, strict Clippy, full local tests, orphan checks and the
+rendered book pass. Registration and removal validate before saving, preserve
+foreign handlers/fields, and distinguish our command tokens from foreign name
+prefixes. Managed MCP transport fields include Antigravity's `serverUrl`.
+
+Persistent hook diagnostics and traces contain metadata only; protocol content
+is unchanged. The CLI recognizes `AgentConfigError` through anyhow contexts and
+renders its content-free outer message rather than parser source chains. A
+same-line malformed-TOML canary proves this through real isolated initialization.
+Original structured error sources remain available to library callers.
 
 ### Step 4: Make hook transport failures explicit
 

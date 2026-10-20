@@ -74,3 +74,35 @@ The test suite runs on `windows-latest`, where CI passes `--no-fail-fast` so tha
 A test that asserts on `ReportEvent`s installs a `ReportLayer` with `tracing::subscriber::set_default`, which is thread-local. tracing caches callsite interest and the global max level process-wide, recomputing both from whichever dispatchers are alive the first time a callsite is reached. Tests run in parallel, so a thread with no subscriber can reach a reporting callsite first and pin it to `Interest::never()` for every thread; the capturing test then drains zero events, which looks like the command reporting nothing. The failure is timing-dependent, so it shows up as a platform-specific flake rather than a reproducible failure.
 
 `install_tracing_baseline` (in `symposium-testlib`) installs a permissive global default subscriber once per test process to keep that cache open, and a thread-local `set_default` still takes precedence over it. `setup_fixture` calls it, and so must any helper that installs its own report layer.
+
+## Invalid agent configuration must not become an empty configuration
+
+Agent settings are user-owned data. A JSON root, `hooks`/MCP container, or
+supported hook event with the wrong shape is an error, not a missing field.
+Registration validates those shapes and preserves the original file bytes on
+rejection. Missing and whitespace-only files still initialize normally. Unknown
+settings and user hook entries are retained, including in Copilot's project
+`symposium.json`; finding one registered event does not skip the other events.
+MCP updates preserve unknown extension fields while reconciling managed
+transport fields and retaining an existing `enabled: false` setting.
+
+Codex MCP registration likewise rejects malformed TOML and non-table
+`mcp_servers` values rather than replacing them with an empty document. Normal
+and inline tables are supported. Configuration errors expose the path and
+expected shape without embedding source values; parser and filesystem sources
+remain attached for structured inspection.
+
+When registration reports a shape error, inspect the indicated JSON pointer (or
+TOML table) and repair it using the agent's supported configuration format.
+Retry the original registration command, then verify the expected hooks or MCP
+servers and unrelated settings. Do not delete the file as a recovery step.
+The registration tests cover invalid input, exact byte preservation, extension
+fields, and repeated registration; run `cargo test --lib agents::` with real-agent
+testing disabled as described in the [test guide](./running-tests.md).
+
+Hook unregistration validates every supported present event before removing
+anything and reports rejected input without rewriting it. It removes Symposium
+handlers individually, preserving other handlers in the same matcher group,
+unknown settings, and unknown events. A dedicated Copilot or Kiro file is deleted
+only when it contains generated defaults and no remaining foreign content;
+otherwise the edited file remains. This also makes repeated removal a no-op.

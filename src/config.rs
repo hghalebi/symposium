@@ -696,14 +696,7 @@ impl Symposium {
             .with(report_layer)
             .init();
 
-        tracing::debug!(
-            config_dir = %self.dirs.config_dir.display(),
-            cache_dir = %self.dirs.cache_dir.display(),
-            log_level = %level,
-            log_file = %log_path.display(),
-            "logging initialized"
-        );
-        tracing::trace!(config = ?self.config, "loaded config");
+        tracing::debug!(log_level = %level, "logging initialized");
     }
 
     /// Initialize logging, returning directory, file, or subscriber failures.
@@ -743,13 +736,7 @@ impl Symposium {
             .try_init()
             .map_err(|source| LoggingError::Subscriber { source })?;
 
-        tracing::debug!(
-            config_dir = %self.dirs.config_dir.display(),
-            cache_dir = %self.dirs.cache_dir.display(),
-            log_level = %level,
-            log_file = %log_path.display(),
-            "logging initialized"
-        );
+        tracing::debug!(log_level = %level, "logging initialized");
         Ok(())
     }
 
@@ -816,7 +803,7 @@ impl Symposium {
             ) {
                 Some(git) => Box::new(git),
                 None => {
-                    tracing::warn!(registry = %name, url = %url, "bad registry URL");
+                    tracing::warn!("bad registry URL");
                     return None;
                 }
             }
@@ -829,7 +816,7 @@ impl Symposium {
             };
             Box::new(crate::pm::PathPm::new(name.clone(), dir))
         } else {
-            tracing::warn!(registry = %name, "registry names neither git nor path");
+            tracing::warn!("registry names neither git nor path");
             return None;
         };
         Some(crate::pm::PmInstance {
@@ -877,8 +864,8 @@ impl Symposium {
             "info" => Level::INFO,
             "warn" => Level::WARN,
             "error" => Level::ERROR,
-            other => {
-                eprintln!("warning: unknown log level '{other}', defaulting to info");
+            _ => {
+                eprintln!("warning: unknown log level, defaulting to info");
                 Level::INFO
             }
         }
@@ -936,8 +923,11 @@ fn load_config_from(config_dir: &Path) -> Config {
     let path = config_dir.join("config.toml");
     match fs::read_to_string(&path) {
         Ok(contents) => toml::from_str::<RawConfig>(&contents)
-            .unwrap_or_else(|e| {
-                eprintln!("warning: failed to parse {}: {e}", path.display());
+            .unwrap_or_else(|_error| {
+                eprintln!(
+                    "warning: failed to parse {}: invalid TOML; using defaults",
+                    path.display()
+                );
                 RawConfig::default()
             })
             .validate(),

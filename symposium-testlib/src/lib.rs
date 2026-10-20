@@ -148,7 +148,13 @@ impl HookStep {
     }
 }
 
-/// One hook invocation's input and output, in canonical form.
+/// One hook invocation, retaining the stable event/agent/input/output shape.
+///
+/// Real-process traces contain only `{"byte_len": N}` in `input` and `output`;
+/// the JSONL record also has `exit_code` and `stderr_len`. They prove occurrence
+/// and sizes without persisting prompts, tool data, plugin output, or reasons.
+/// In-process simulation traces retain synthetic protocol values so context
+/// assertions can inspect them. Live-agent traces do not support those assertions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookTrace {
     pub event: HookEvent,

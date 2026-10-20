@@ -197,8 +197,15 @@ async fn main() -> ExitCode {
                 }
                 ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("Error: {e:#}");
+            Err(error) => {
+                // Parser source displays can contain the user's configuration text.
+                if let Some(config_error) =
+                    error.downcast_ref::<symposium::agents::AgentConfigError>()
+                {
+                    eprintln!("Error: {config_error}");
+                } else {
+                    eprintln!("Error: {error:#}");
+                }
                 ExitCode::FAILURE
             }
         },

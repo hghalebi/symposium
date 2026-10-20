@@ -38,3 +38,49 @@ The payload is parsed first, and the agent's parser can declare it not an occurr
 4. **Respond**: the agent's handler renders the final output as a `HookResponse` (stdout, stderr, exit code). Most agents read everything from stdout; Kiro, whose stdout is plain context, is told to deny a tool through exit 2.
 
 Plugin hooks can respond to agent-specific events (e.g., `pre-tool-use`, `post-tool-use`, `user-prompt-submit` for Claude Code). The available events depend on which agent is in use.
+
+
+## Diagnostic and trace privacy
+
+Hook protocol stdout and stderr carry the agent's response, including intended
+context or denial reasons. Persistent hook diagnostics do not copy those streams
+or the request payload. The hook dispatcher logs fixed operation messages and
+closed metadata such as agent/event/format variants, byte lengths, exit codes,
+and I/O error kinds. It does not log raw parser messages, plugin names, hook
+names, prompts, tool arguments/results, plugin output/stderr, or denial reasons.
+Other subsystems retain their own diagnostic contracts; this is not a blanket
+claim about arbitrary identifiers elsewhere in the application.
+
+When `SYMPOSIUM_HOOK_TRACE` names a file, successful dispatch appends one JSONL
+record with this shape:
+
+```json
+{"event":"PreToolUse","agent":"claude","input":{"byte_len":120},"output":{"byte_len":2},"exit_code":0,"stderr_len":0}
+```
+
+The numeric lengths describe the actual UTF-8 request and response bytes. The
+`input` and `output` keys remain objects for trace consumers, but contain only
+sizes; raw input/output and the previous raw `stderr` field are not persisted.
+There is no raw-payload tracing option. This trace can verify which events
+occurred; inspect synthetic in-process responses in tests to assert context or
+reason contents. The test library keeps its `HookTrace` value fields compatible
+and documents the difference between process metadata and simulation payloads.
+
+Configuration diagnostics similarly avoid full configuration dumps, invalid
+log-level values, invalid registry URLs, and parser messages that can include
+source text. Malformed TOML still warns and uses defaults. Errors returned by
+library APIs retain their sources; persistent diagnostics do not format arbitrary
+source errors. At the binary's library-command failure boundary, an
+`AgentConfigError` wrapped in `anyhow` contexts is identified by type and rendered
+with its own content-free `Display`; its parser source remains available to
+callers but is not recursively printed. Other command errors retain their
+existing detailed diagnostics. This formatting rule does not claim that every
+error type or every subsystem is safe to render recursively.
+
+`tests/hook_diagnostics.rs` runs the real binary with synthetic canaries to verify
+protocol delivery and private diagnostics. Its additional Codex MCP registration
+failure check runs on Unix with an isolated `HOME` and `SYMPOSIUM_HOME`, proves the
+underlying TOML parser would display the canary, and verifies that the CLI does
+not print it or rewrite the original file. Windows uses a known-folder API for
+home discovery, so that home-mutating process check is Unix-only; isolated
+adapter tests still cover configuration validation independently.
