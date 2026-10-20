@@ -157,6 +157,16 @@ jobs:
           printf 'test-agents = []\n' > test-agents.toml
           cargo test --workspace --locked --no-fail-fast ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
+      - name: Diagnose intermittent discovery fixture (temporary)
+        if: matrix.name == 'ubuntu'
+        shell: bash
+        run: |
+          unset SYMPOSIUM_ENABLE_AGENT_TESTING SYMPOSIUM_TEST_AGENT
+          for attempt in {1..40}; do
+            printf 'Parallel library diagnostic attempt %s/40\n' "$attempt"
+            cargo test -p symposium --lib --locked
+          done
+
   library-features:
     name: Library features (${{ matrix.package }}, ${{ matrix.mode }})
     runs-on: ubuntu-latest

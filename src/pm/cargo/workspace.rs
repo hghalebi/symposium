@@ -813,24 +813,31 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         let missing = temp.path().join("missing-cargo");
-        let error = try_find_workspace_root(temp.path(), Some(&missing)).unwrap_err();
-        assert!(matches!(error, WorkspaceError::CargoInvoke { .. }));
+        let result = try_find_workspace_root(temp.path(), Some(&missing));
+        assert!(
+            matches!(&result, Err(WorkspaceError::CargoInvoke { .. })),
+            "expected an invocation failure, got {result:?}"
+        );
+        let error = result.unwrap_err();
         assert!(error.source().unwrap().is::<std::io::Error>());
         let path = cargo_stub(temp.path(), "exit 37");
-        assert!(matches!(
-            try_find_workspace_root(temp.path(), Some(&path)),
-            Err(WorkspaceError::CargoLocate { .. })
-        ));
+        let result = try_find_workspace_root(temp.path(), Some(&path));
+        assert!(
+            matches!(&result, Err(WorkspaceError::CargoLocate { .. })),
+            "expected an unsuccessful discovery status, got {result:?}"
+        );
         let path = cargo_stub(temp.path(), "printf '\\377'");
-        assert!(matches!(
-            try_find_workspace_root(temp.path(), Some(&path)),
-            Err(WorkspaceError::CargoOutput { .. })
-        ));
+        let result = try_find_workspace_root(temp.path(), Some(&path));
+        assert!(
+            matches!(&result, Err(WorkspaceError::CargoOutput { .. })),
+            "expected non-UTF-8 discovery output, got {result:?}"
+        );
         let path = cargo_stub(temp.path(), "printf 'unexpected-output\\n'");
-        assert!(matches!(
-            try_find_workspace_root(temp.path(), Some(&path)),
-            Err(WorkspaceError::InvalidCargoOutput)
-        ));
+        let result = try_find_workspace_root(temp.path(), Some(&path));
+        assert!(
+            matches!(&result, Err(WorkspaceError::InvalidCargoOutput)),
+            "expected an invalid discovery path, got {result:?}"
+        );
     }
 
     #[cfg(unix)]
