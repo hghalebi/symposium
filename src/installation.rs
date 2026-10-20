@@ -87,7 +87,8 @@ pub enum AcquiredRunnable {
 ///
 /// Source and hook overrides participate in one exclusive choice. No-source
 /// paths retain process-current-directory/PATH resolution; there is no plugin
-/// directory rebasing. `update` controls the existing source freshness policy.
+/// directory rebasing or permission changes. Executable preparation is limited
+/// to managed sources; `update` controls the existing source freshness policy.
 pub(crate) async fn acquire_installation(
     sym: &Symposium,
     installation: &Installation,
@@ -151,7 +152,9 @@ pub(crate) async fn acquire_installation(
         }
     };
     run_install_commands(&installation.install_commands).await?;
-    if let Some(AcquiredRunnable::ResolvedExec { path }) = &runnable {
+    if base.is_some()
+        && let Some(AcquiredRunnable::ResolvedExec { path }) = &runnable
+    {
         try_make_executable(path)?;
     }
     Ok(AcquiredInstallation {
@@ -446,6 +449,34 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_source_absolute_executables_preserve_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        let executable = tmp.path().join("user-tool");
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        for mode in [0o644, 0o700, 0o711, 0o555] {
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(mode)).unwrap();
+            let mut install = installation();
+            install.executable = Some(executable.to_str().unwrap().into());
+            let acquired = acquire_installation(&sym, &install, None, None, UpdateLevel::None)
+                .await
+                .unwrap();
+            assert!(acquired.base.is_none());
+            let runnable = resolve_runnable(acquired, "user tool").unwrap();
+            assert!(matches!(&runnable, Runnable::Exec(path) if path == &executable));
+            assert_eq!(
+                std::fs::metadata(&executable).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            if mode == 0o700 {
+                assert!(runnable.spawn(&[] as &[&str]).unwrap().status.success());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn managed_cargo_exec_inference_and_script_use_existing_cache() {
         let tmp = tempfile::tempdir().unwrap();
@@ -456,6 +487,15 @@ mod tests {
         std::fs::create_dir_all(base.join("bin")).unwrap();
         let binary = if cfg!(windows) { "tool.exe" } else { "tool" };
         std::fs::write(base.join("bin").join(binary), b"cached binary").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                base.join("bin").join(binary),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
         std::fs::write(registry.join("current"), "1.0.0").unwrap();
         for (executable, script) in [
             (None, None),
@@ -470,6 +510,18 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(acquired.base.as_ref(), Some(&base));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(base.join("bin").join(binary))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o744
+                );
+            }
             match resolve_runnable(acquired, "cached").unwrap() {
                 Runnable::Exec(path) => assert_eq!(path, base.join("bin").join(binary)),
                 Runnable::Script(path) => assert_eq!(path, base.join("bin/scripts/tool.sh")),
@@ -479,14 +531,48 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn executable_metadata_failure_preserves_the_io_source() {
-        use std::error::Error as _;
+    async fn no_source_paths_defer_filesystem_failures_to_spawn() {
         let tmp = tempfile::tempdir().unwrap();
         let sym = Symposium::try_from_dir(tmp.path()).unwrap();
         let parent = tmp.path().join("not-a-directory");
         std::fs::write(&parent, b"preserve").unwrap();
         let mut install = installation();
         install.executable = Some(parent.join("tool").to_str().unwrap().into());
+        let acquired = acquire_installation(&sym, &install, None, None, UpdateLevel::None)
+            .await
+            .unwrap();
+        let error = resolve_runnable(acquired, "user path")
+            .unwrap()
+            .spawn(&[] as &[&str])
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+        assert_eq!(std::fs::read(parent).unwrap(), b"preserve");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_executable_metadata_failure_preserves_the_io_source() {
+        use std::error::Error as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sym = Symposium::try_from_dir(tmp.path()).unwrap();
+        sym.set_cargo_override(tmp.path().join("cargo-must-not-run"));
+        let registry = sym.cache_dir().join("binaries/test");
+        let base = registry.join("1.0.0");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("tool"), b"cached binary").unwrap();
+        std::fs::write(registry.join("current"), "1.0.0").unwrap();
+        let mut install = installation();
+        install.source = Some(Source::Cargo(CargoSource::new("test")));
+        install.executable = Some("tool".into());
+        // Acquisition sees a complete cache. Setup then makes only the fixture's
+        // bin path non-directory, exercising managed permission preparation.
+        install.install_commands.push(format!(
+            "mv {} {} && printf preserve > {}",
+            shell_path(&bin),
+            shell_path(&base.join("saved-bin")),
+            shell_path(&bin),
+        ));
         let error = acquire_installation(&sym, &install, None, None, UpdateLevel::None)
             .await
             .unwrap_err();
@@ -495,13 +581,17 @@ mod tests {
         let mut found_io = false;
         while let Some(error) = source {
             if let Some(error) = error.downcast_ref::<std::io::Error>() {
-                assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+                assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
                 found_io = true;
             }
             source = error.source();
         }
         assert!(found_io);
-        assert_eq!(std::fs::read(parent).unwrap(), b"preserve");
+        assert_eq!(std::fs::read(&bin).unwrap(), b"preserve");
+        assert_eq!(
+            std::fs::read(base.join("saved-bin/tool")).unwrap(),
+            b"cached binary"
+        );
     }
 
     #[tokio::test]

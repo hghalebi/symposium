@@ -521,13 +521,25 @@ pub fn file_mtime(path: &Path) -> Option<u64> {
 /// Probe a file timestamp while distinguishing absence from an operational error.
 ///
 /// # Errors
-/// Returns the original metadata/modification/range failure; only NotFound is
-/// represented as `Ok(None)`.
+/// Returns the original metadata/modification/range failure. A missing file is
+/// represented as `Ok(None)` only when its nearest existing ancestor is an
+/// accessible directory; an invalid parent or dangling entry remains an error.
 pub fn try_file_mtime(path: &Path) -> Result<Option<u64>, WorkspaceError> {
     let meta = match fs::metadata(path) {
         Ok(meta) => meta,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
+            // Windows also reports NotFound when a parent component is a file.
+            // Confirm genuine absence before allowing a missing timestamp to
+            // participate in a cache freshness comparison.
+            if source.kind() == std::io::ErrorKind::NotFound
+                && missing_file_is_absent(path).map_err(|source| WorkspaceError::Io {
+                    operation: "inspect missing file path ancestors",
+                    path: path.into(),
+                    source,
+                })?
+            {
+                return Ok(None);
+            }
             return Err(WorkspaceError::Io {
                 operation: "read file metadata",
                 path: path.into(),
@@ -547,6 +559,32 @@ pub fn try_file_mtime(path: &Path) -> Result<Option<u64>, WorkspaceError> {
             source,
         })?;
     Ok(Some(duration.as_secs()))
+}
+
+fn missing_file_is_absent(path: &Path) -> std::io::Result<bool> {
+    for ancestor in path.ancestors() {
+        let candidate = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        match fs::symlink_metadata(candidate) {
+            // An existing target whose metadata could not be followed, such as
+            // a dangling symlink, is not an absent file.
+            Ok(_) if ancestor == path => return Ok(false),
+            Ok(_) => {
+                return match fs::metadata(candidate) {
+                    Ok(metadata) => Ok(metadata.is_dir()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                    Err(error) => Err(error),
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
 }
 
 /// Run `cargo metadata` and extract workspace root + direct deps.
@@ -698,16 +736,34 @@ mod tests {
     #[test]
     fn file_mtime_distinguishes_absence_from_a_failed_probe() {
         let temp = tempfile::tempdir().unwrap();
-        assert!(
-            try_file_mtime(&temp.path().join("missing"))
-                .unwrap()
-                .is_none()
-        );
+        for path in [
+            temp.path().join("missing"),
+            temp.path().join("missing/deeper/Cargo.lock"),
+        ] {
+            assert!(try_file_mtime(&path).unwrap().is_none());
+            assert!(missing_file_is_absent(&path).unwrap());
+        }
         let file = temp.path().join("file");
         fs::write(&file, b"present").unwrap();
         assert!(try_file_mtime(&file).unwrap().is_some());
-        let error = try_file_mtime(&file.join("child")).unwrap_err();
-        assert!(error.source().unwrap().is::<std::io::Error>());
+        for path in [file.join("child"), file.join("missing/deeper/Cargo.lock")] {
+            let original = fs::metadata(&path).unwrap_err();
+            let error = try_file_mtime(&path).unwrap_err();
+            let WorkspaceError::Io {
+                operation,
+                path: error_path,
+                source,
+            } = &error
+            else {
+                panic!("expected an I/O error");
+            };
+            assert_eq!(*operation, "read file metadata");
+            assert_eq!(error_path, &path);
+            assert_eq!(source.kind(), original.kind());
+            assert_eq!(source.raw_os_error(), original.raw_os_error());
+            assert!(error.source().unwrap().is::<std::io::Error>());
+            assert!(!missing_file_is_absent(&path).unwrap());
+        }
     }
 
     #[test]

@@ -1372,8 +1372,12 @@ pub fn make_executable(path: &Path) -> anyhow::Result<()> {
     Ok(try_make_executable(path)?)
 }
 
-/// Prepare Unix executable permissions without suppressing metadata failures.
+/// Ensure the owner can execute a managed Unix artifact, preserving its mode.
 ///
+/// Only the owner-execute bit is added when absent. Existing execute, read,
+/// write, group, other, and special permission bits are retained; already
+/// owner-executable files require no permission write. Acquisition runs under
+/// the owner of its managed cache, so no broader execution grant is needed.
 /// Missing paths remain a no-op for compatibility with bare commands resolved
 /// through PATH. Non-Unix platforms do not require executable mode changes.
 ///
@@ -1390,7 +1394,11 @@ pub fn try_make_executable(path: &Path) -> Result<(), InstallError> {
             Err(source) => return Err(install_io("inspect executable permissions", path, source)),
         };
         let mut permissions = metadata.permissions();
-        permissions.set_mode(0o755);
+        let mode = permissions.mode();
+        if mode & 0o100 != 0 {
+            return Ok(());
+        }
+        permissions.set_mode(mode | 0o100);
         std::fs::set_permissions(path, permissions)
             .map_err(|source| install_io("set executable permissions", path, source))?;
     }
@@ -1401,6 +1409,37 @@ pub fn try_make_executable(path: &Path) -> Result<(), InstallError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_preparation_changes_only_the_missing_owner_execute_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("managed-tool");
+        std::fs::write(&path, b"managed tool").unwrap();
+        for (before, after) in [
+            (0o600, 0o700),
+            (0o644, 0o744),
+            (0o660, 0o760),
+            (0o700, 0o700),
+            (0o711, 0o711),
+            (0o555, 0o555),
+        ] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(before)).unwrap();
+            try_make_executable(&path).unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                after
+            );
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o2600)).unwrap();
+        let before = std::fs::metadata(&path).unwrap().permissions().mode();
+        try_make_executable(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode(),
+            before | 0o100
+        );
+    }
 
     #[test]
     fn legacy_unmanaged_resolvers_keep_their_panicking_contract() {

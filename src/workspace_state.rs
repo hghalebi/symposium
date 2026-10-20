@@ -471,25 +471,33 @@ mod tests {
     #[test]
     fn failed_timestamp_probe_is_an_error_and_legacy_freshness_is_false() {
         let tmp = tempfile::tempdir().unwrap();
-        let workspace = tmp.path().join("not-a-directory");
-        fs::write(&workspace, "blocked").unwrap();
-        let mut state = WorkspaceState {
-            last_sync_lock_mtime: Some(123),
-            last_sync_battery_pack_mtime: Some(456),
-            workspace_root: None,
-        };
-        assert!(matches!(
-            state.try_sync_is_fresh(&workspace),
-            Err(WorkspaceStateError::Probe { .. })
-        ));
-        assert!(!state.sync_is_fresh(&workspace));
-        assert!(matches!(
-            state.try_record_sync(&workspace),
-            Err(WorkspaceStateError::Probe { .. })
-        ));
-        state.record_sync(&workspace);
-        assert_eq!(state.last_sync_lock_mtime, Some(123));
-        assert_eq!(state.last_sync_battery_pack_mtime, Some(456));
+        let blocked = tmp.path().join("not-a-directory");
+        fs::write(&blocked, "blocked").unwrap();
+        for workspace in [blocked.clone(), blocked.join("missing/deeper")] {
+            let mut state = WorkspaceState {
+                last_sync_lock_mtime: Some(123),
+                last_sync_battery_pack_mtime: Some(456),
+                workspace_root: None,
+            };
+            let original = fs::metadata(workspace.join("Cargo.lock")).unwrap_err();
+            let error = state.try_sync_is_fresh(&workspace).unwrap_err();
+            let WorkspaceStateError::Probe { source, .. } = error else {
+                panic!("expected a timestamp probe error");
+            };
+            let crate::pm::WorkspaceError::Io { source, .. } = *source else {
+                panic!("expected an I/O error");
+            };
+            assert_eq!(source.kind(), original.kind());
+            assert_eq!(source.raw_os_error(), original.raw_os_error());
+            assert!(!state.sync_is_fresh(&workspace));
+            assert!(matches!(
+                state.try_record_sync(&workspace),
+                Err(WorkspaceStateError::Probe { .. })
+            ));
+            state.record_sync(&workspace);
+            assert_eq!(state.last_sync_lock_mtime, Some(123));
+            assert_eq!(state.last_sync_battery_pack_mtime, Some(456));
+        }
     }
 
     #[cfg(unix)]

@@ -277,7 +277,7 @@ fi
     }
 
     #[test]
-    fn executable_preparation_sets_permissions_and_preserves_bare_command_lookup() {
+    fn executable_preparation_adds_owner_execute_and_preserves_bare_command_lookup() {
         let tmp = tempfile::tempdir().unwrap();
         let executable = tmp.path().join("tool");
         fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
@@ -285,7 +285,7 @@ fi
         try_make_executable(&executable).unwrap();
         assert_eq!(
             fs::metadata(&executable).unwrap().permissions().mode() & 0o777,
-            0o755
+            0o700
         );
         let bare_command = Path::new("symposium-command-not-in-current-directory");
         assert!(!bare_command.exists());

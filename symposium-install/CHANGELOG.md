@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   option-like Cargo Git sources; `./-repository` remains a valid relative source.
   Unix executable preparation now
   distinguishes absent commands from metadata and permission failures.
+- Add only missing owner execute permission to managed Unix artifacts, preserving
+  existing modes and avoiding permission writes for already executable files.
 - Preserve native operating-system paths in Cargo `--root` arguments, including
   the binstall fallback. Keep previous version caches until installation succeeds;
   optional cache maintenance and fallback failures have visible diagnostics.

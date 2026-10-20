@@ -1361,10 +1361,15 @@ fn validate_hook_entries(
 }
 
 fn has_hook_command(entry: &Value, key: &str) -> bool {
+    has_hook_command_prefix(entry, key, "cargo-agents hook")
+        || has_hook_command_prefix(entry, key, "symposium hook")
+}
+
+fn has_hook_command_prefix(entry: &Value, key: &str, prefix: &str) -> bool {
     entry
         .get(key)
         .and_then(Value::as_str)
-        .and_then(|command| command.strip_prefix("cargo-agents hook"))
+        .and_then(|command| command.strip_prefix(prefix))
         .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(char::is_whitespace))
 }
 
@@ -1379,15 +1384,63 @@ fn ensure_hook_entry(
     let pointer = format!("{parent_pointer}/{event}");
     let entries = json_array_entry_mut(hooks, event, path, &pointer)?;
     validate_hook_entries(entries, path, &pointer, shape)?;
-    let already_registered = entries.iter().any(|entry| match shape {
+    let mut already_registered = entries.iter().any(|entry| match shape {
+        HookEntryShape::Grouped => {
+            entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_some_and(|hooks| {
+                    hooks
+                        .iter()
+                        .any(|hook| has_hook_command_prefix(hook, "command", "cargo-agents hook"))
+                })
+        }
+        HookEntryShape::Flat(key) => has_hook_command_prefix(entry, key, "cargo-agents hook"),
+    });
+    let command_key = match shape {
+        HookEntryShape::Grouped => "command",
+        HookEntryShape::Flat(key) => key,
+    };
+    let generated_command = match shape {
         HookEntryShape::Grouped => entry
             .get("hooks")
             .and_then(Value::as_array)
-            .is_some_and(|hooks| hooks.iter().any(|hook| has_hook_command(hook, "command"))),
-        HookEntryShape::Flat(key) => has_hook_command(entry, key),
-    });
+            .and_then(|hooks| hooks.first())
+            .and_then(|hook| hook.get(command_key)),
+        HookEntryShape::Flat(_) => entry.get(command_key),
+    }
+    .and_then(Value::as_str)
+    .ok_or_else(|| config_shape(path, &pointer, "generated hook command"))?;
+    let mut changed = false;
+    // Replace the renamed binary in place so foreign handler and group settings survive.
+    let mut reconcile = |handlers: &mut Vec<Value>| {
+        if !already_registered
+            && let Some(legacy) = handlers
+                .iter_mut()
+                .find(|hook| has_hook_command_prefix(hook, command_key, "symposium hook"))
+        {
+            legacy[command_key] = Value::String(generated_command.to_owned());
+            already_registered = true;
+            changed = true;
+        }
+        let before = handlers.len();
+        handlers.retain(|hook| !has_hook_command_prefix(hook, command_key, "symposium hook"));
+        changed |= before != handlers.len();
+    };
+    match shape {
+        HookEntryShape::Grouped => {
+            for registered in entries.iter_mut() {
+                let handlers = registered
+                    .get_mut("hooks")
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| config_shape(path, &pointer, "hook array"))?;
+                reconcile(handlers);
+            }
+        }
+        HookEntryShape::Flat(_) => reconcile(entries),
+    }
     if already_registered {
-        return Ok(false);
+        return Ok(changed);
     }
     entries.push(entry);
     Ok(true)
@@ -1725,6 +1778,144 @@ mod tests {
             }
             (case.unregister)(&target, &Output::quiet());
             assert_eq!(first, fs::read_to_string(&file).unwrap());
+        }
+    }
+
+    #[test]
+    fn hook_command_ownership_requires_complete_tokens() {
+        for prefix in ["cargo-agents hook", "symposium hook"] {
+            for suffix in ["", " claude pre-tool-use", "\tkiro pre-tool-use"] {
+                assert!(has_hook_command(
+                    &json!({"command": format!("{prefix}{suffix}")}),
+                    "command"
+                ));
+            }
+            for suffix in ["-custom --keep", "er --keep", "/other"] {
+                assert!(!has_hook_command(
+                    &json!({"command": format!("{prefix}{suffix}")}),
+                    "command"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn historical_hook_commands_migrate_and_cleanup_without_touching_foreign_settings() {
+        for case in hook_registrations() {
+            for (register_first, has_current) in [(false, false), (true, false), (true, true)] {
+                let tmp = tempfile::tempdir().unwrap();
+                let target = tmp.path().join(case.target);
+                let file = tmp.path().join(case.file);
+                (case.register)(&target, &Output::quiet()).unwrap();
+                let mut original: Value =
+                    serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+                original["unknown"] = json!({"preserve": [1, 2]});
+                original[case.container]["FutureEvent"] = json!({"preserve": true});
+                let key = match case.shape {
+                    HookEntryShape::Grouped => "command",
+                    HookEntryShape::Flat(key) => key,
+                };
+                let current = match case.shape {
+                    HookEntryShape::Grouped => {
+                        original[case.container][case.event][0]["hooks"][0].clone()
+                    }
+                    HookEntryShape::Flat(_) => original[case.container][case.event][0].clone(),
+                };
+                let mut historical = current.clone();
+                historical[key] = json!("symposium hook");
+                historical["legacy-extension"] = json!({"preserve": true});
+                let mut duplicate = current.clone();
+                duplicate[key] = json!("symposium hook historical-agent historical-event");
+                let foreign: Vec<Value> = [
+                    "symposium hook-custom --keep",
+                    "symposium hooker --keep",
+                    "cargo-agents hook-custom --keep",
+                    "symposium-other hook --keep",
+                ]
+                .map(|command| {
+                    let mut handler = json!({"vendor": true});
+                    handler[key] = json!(command);
+                    handler
+                })
+                .into();
+                let mut handlers = vec![historical.clone(), duplicate];
+                handlers.extend(foreign.iter().cloned());
+                if has_current {
+                    handlers.push(current.clone());
+                }
+                match case.shape {
+                    HookEntryShape::Grouped => {
+                        original[case.container][case.event][0]["vendor"] = json!({"keep": true});
+                        original[case.container][case.event][0]["hooks"] = json!(handlers);
+                    }
+                    HookEntryShape::Flat(_) => {
+                        original[case.container][case.event] = json!(handlers)
+                    }
+                }
+                fs::write(&file, original.to_string()).unwrap();
+                if register_first {
+                    (case.register)(&target, &Output::quiet()).unwrap();
+                    let first = fs::read_to_string(&file).unwrap();
+                    let registered: Value = serde_json::from_str(&first).unwrap();
+                    let handlers = match case.shape {
+                        HookEntryShape::Grouped => {
+                            &registered[case.container][case.event][0]["hooks"]
+                        }
+                        HookEntryShape::Flat(_) => &registered[case.container][case.event],
+                    }
+                    .as_array()
+                    .unwrap();
+                    assert_eq!(
+                        handlers
+                            .iter()
+                            .filter(|handler| has_hook_command_prefix(
+                                handler,
+                                key,
+                                "cargo-agents hook"
+                            ))
+                            .count(),
+                        1,
+                        "{}",
+                        case.file
+                    );
+                    assert!(!handlers.iter().any(|handler| has_hook_command_prefix(
+                        handler,
+                        key,
+                        "symposium hook"
+                    )));
+                    if !has_current {
+                        historical[key] = current[key].clone();
+                        assert_eq!(handlers[0], historical);
+                    }
+                    (case.register)(&target, &Output::quiet()).unwrap();
+                    assert_eq!(first, fs::read_to_string(&file).unwrap(), "{}", case.file);
+                }
+                (case.unregister)(&target, &Output::quiet());
+                let first = fs::read_to_string(&file).unwrap();
+                let removed: Value = serde_json::from_str(&first).unwrap();
+                assert_eq!(removed["unknown"], original["unknown"]);
+                assert_eq!(
+                    removed[case.container]["FutureEvent"],
+                    original[case.container]["FutureEvent"]
+                );
+                match case.shape {
+                    HookEntryShape::Grouped => {
+                        assert_eq!(
+                            removed[case.container][case.event][0]["vendor"],
+                            json!({"keep": true})
+                        );
+                        assert_eq!(
+                            removed[case.container][case.event][0]["hooks"],
+                            json!(foreign)
+                        );
+                    }
+                    HookEntryShape::Flat(_) => {
+                        assert_eq!(removed[case.container][case.event], json!(foreign))
+                    }
+                }
+                (case.unregister)(&target, &Output::quiet());
+                assert_eq!(first, fs::read_to_string(&file).unwrap(), "{}", case.file);
+            }
         }
     }
 

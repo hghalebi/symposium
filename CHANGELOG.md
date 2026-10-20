@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handle survives. Keep identity derivation and persisted telemetry formats stable.
 - Evaluate owned hook matchers through typed errors while retaining the SDK's
   legacy invalid-matcher behavior and native permission-denial responses.
+- Preserve permissions on no-source executable paths, and add only missing owner
+  execute permission to managed artifacts without rewriting an executable mode.
+- Migrate historical `symposium hook` entries to current commands during
+  registration and remove both owned spellings during cleanup, preserving
+  foreign handlers and settings.
 
 ## [0.5.1](https://github.com/symposium-dev/symposium/compare/symposium-v0.5.0...symposium-v0.5.1) - 2026-10-01
 

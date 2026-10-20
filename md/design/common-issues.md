@@ -115,6 +115,12 @@ unknown settings, and unknown events. A dedicated Copilot or Kiro file is delete
 only when it contains generated defaults and no remaining foreign content;
 otherwise the edited file remains. This also makes repeated removal a no-op.
 
+Both complete owned prefixes, `cargo-agents hook` and historical `symposium hook`,
+participate in cleanup. Registration migrates a historical handler to the current
+generated command and removes historical duplicates while retaining unrelated
+handler/group fields. Names such as `symposium hook-custom` are foreign commands;
+ownership checks require a token boundary, not just a shared text prefix.
+
 
 ## Typed errors and safe diagnostics carry different information
 
@@ -178,3 +184,13 @@ env -u SYMPOSIUM_ENABLE_AGENT_TESTING -u SYMPOSIUM_TEST_AGENT \
 This reproduces the handle-lifetime mechanism deterministically. A particular
 concurrent fork causing a full-suite failure remains an inference; a passing
 isolated test does not establish that handle lifetime matches guard lifetime.
+
+## Shared build directories can retain checkout-specific helper paths
+
+`xtask` embeds its workspace location through `CARGO_MANIFEST_DIR`. Sharing a
+target directory with another worktree can retain a helper pointing at that
+checkout after it is removed. A missing `md/SUMMARY.md` with the old checkout in
+the backtrace identifies this build-artifact problem. From the current checkout,
+run `cargo clean -p xtask`, then `cargo run --locked -p xtask -- md-orphan-check`.
+This rebuilds only the affected package; do not rewrite the book or remove its
+checks to hide a stale helper.
