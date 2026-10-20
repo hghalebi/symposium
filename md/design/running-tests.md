@@ -18,14 +18,18 @@ test bodies do not run without the enable gate, so passing this suite proves loc
 behavior only. `--no-fail-fast` lets Cargo report failures in later test binaries.
 
 Workspace feature unification can hide minimal-library failures. When changing
-SDK or installer APIs or features, also run these standalone checks and library
-tests:
+SDK or installer APIs or features, also run compilation, Clippy, and library
+tests for each standalone configuration:
 
 ```sh
 cargo check -p symposium-sdk --lib --locked --no-default-features
 cargo check -p symposium-sdk --lib --locked --no-default-features --features clap
 cargo check -p symposium-install --lib --locked --no-default-features
 cargo check -p symposium-install --lib --locked --no-default-features --features clap
+cargo clippy -p symposium-sdk --lib --locked --no-default-features -- -D warnings
+cargo clippy -p symposium-sdk --lib --locked --no-default-features --features clap -- -D warnings
+cargo clippy -p symposium-install --lib --locked --no-default-features -- -D warnings
+cargo clippy -p symposium-install --lib --locked --no-default-features --features clap -- -D warnings
 env -u SYMPOSIUM_ENABLE_AGENT_TESTING -u SYMPOSIUM_TEST_AGENT \
   cargo test -p symposium-sdk --lib --locked --no-default-features
 env -u SYMPOSIUM_ENABLE_AGENT_TESTING -u SYMPOSIUM_TEST_AGENT \
@@ -40,7 +44,8 @@ Use supported feature combinations rather than assuming `--all-features` is vali
 Run focused checks first, then the required workspace suite. For documentation:
 
 ```sh
-cargo xtask md-orphan-check
+cargo run --locked -p xtask -- md-orphan-check
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 mdbook build
 git diff --check
 ```
@@ -48,6 +53,37 @@ git diff --check
 Book rendering requires the `mdbook` and `mdbook-mermaid` tools configured by
 `book.toml`; report missing tools separately from source-check results. Do not
 remove a preprocessor to make a local check pass.
+
+## CI coverage
+
+The `.github/workflows/ci.yml` workflow defines these checks for pull requests
+targeting `main` and pushes to `main`:
+
+| Check | Runner or configuration | Commands |
+|-------|-------------------------|----------|
+| Compilation | `ubuntu-latest` and `macos-15-intel` | `cargo check --workspace --all-targets --locked` |
+| Formatting | Independent job on `ubuntu-latest` | `cargo fmt --all -- --check` |
+| Clippy | Independent job on `ubuntu-latest` | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
+| Workspace tests | `ubuntu-latest`, `macos-15-intel`, `windows-latest`, and Ubuntu targeting `x86_64-unknown-linux-musl` | `cargo test --workspace --locked --no-fail-fast`, adding `--target x86_64-unknown-linux-musl` for musl |
+| Standalone libraries | `ubuntu-latest`; SDK and installer, each with minimal features and with `clap` | The four `--lib --no-default-features` configurations above, each compiled, linted with warnings denied, and tested |
+| Documentation | `ubuntu-latest` | Locked orphan and warnings-denied Rustdoc checks, `mdbook build`, and `git diff --check` |
+
+The workspace test step removes both `SYMPOSIUM_ENABLE_AGENT_TESTING` and
+`SYMPOSIUM_TEST_AGENT`, then writes `test-agents = []` to the local test
+configuration. The standalone-library step also removes both variables before
+its check, Clippy, and test commands. Real-agent tests remain opt-in. The musl
+job installs `musl-tools`; Windows keeps the `sh` setup described below.
+
+The documentation job installs `mdbook` **0.5.2** and `mdbook-mermaid` **0.17.1**
+with `cargo install --locked` into a job-local tools directory. It checks for
+orphaned Markdown and builds public Rustdoc with warnings denied before rendering
+the configured book. This is a pull-request
+documentation gate; the workflow has only `contents: read` permission and does
+not deploy the book.
+
+This matrix describes configured coverage. A hosted pass requires the workflow
+results for the exact commit; local checks do not establish that the runner or
+target matrix passed.
 
 ## Isolate CLI smoke tests
 

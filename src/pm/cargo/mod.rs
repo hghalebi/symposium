@@ -33,7 +33,7 @@ const SEARCH_PAGE_SIZE: u64 = 10;
 
 /// The cargo transport, bound to one workspace's [`WorkspaceDeps`] resolver.
 ///
-/// Holds the resolver as an [`Arc`] so the transport in a [`PmRegistry`] and any
+/// Holds the resolver as an [`Arc`] so the transport in a [`PmRegistry`](super::PmRegistry) and any
 /// ad-hoc [`CargoPm`] built for crate loading share one lazily-run, cached
 /// `cargo metadata` — the in-process stand-in for a per-workspace PM process.
 pub struct CargoPm {

@@ -25,7 +25,7 @@ use tokio::process::Command;
 /// dispatch (name lookup) and help rendering (audience grouping).
 ///
 /// `plugins` is the resolved active set from
-/// [`plugins::active_plugins`](crate::plugins::active_plugins) — registry plugins
+/// [`plugins::active_plugins`] — registry plugins
 /// plus crate-sourced ones — so a crate plugin's subcommands are dispatchable
 /// exactly like a registry plugin's.
 pub fn applicable_subcommands<'a>(

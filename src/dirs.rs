@@ -1,7 +1,7 @@
 //! Resolved symposium directory paths.
 //!
 //! Plugin binaries (hooks, predicates, subcommands) use [`SymposiumDirs`] to
-//! locate cache directories and construct [`WorkspaceDeps`](crate::pm::WorkspaceDeps)
+//! locate cache directories and construct [`WorkspaceDeps`]
 //! with the correct cargo override and disk-cache path.
 
 use std::env;

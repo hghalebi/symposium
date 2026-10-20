@@ -38,9 +38,9 @@ Similarly, a registry's runtime source becomes one explicit `Git | Path`
 alternative after raw TOML validation. The persisted format remains compatible;
 invalid both/neither inputs receive a deliberate documented error policy.
 
-The proposed contributor chapter is [Rust practices](./proposed-rust-practices.md).
-During implementation it will become `md/design/rust-practices.md`; agent and
-review instructions will point to that single portable source.
+The portable contributor chapter is [Rust practices](../../design/rust-practices.md).
+Agent and review instructions point to that single source; the original proposed
+chapter now redirects there.
 
 ## Detailed plans
 
@@ -462,6 +462,15 @@ regressions reacquire immediately while retaining the duplicate. Attribution to
 a particular concurrent fork remains an inference. Compatibility review found
 and repaired the previous-version return-value issue before this checkpoint.
 
+Subsequent hosted Windows tests exposed timestamp probes under a regular-file
+parent: Windows reports `NotFound` where Unix reports `NotADirectory`. The final
+checkpoint distinguishes a genuinely absent path from an invalid ancestor
+instead of weakening the freshness regression. Final PR review also identified
+unnecessary chmod on no-source executables and historical hook spelling during
+registration/removal. The final checkpoint preserves external modes, prepares
+only missing managed owner-execute capability, and migrates/removes legacy
+handlers while preserving foreign fields and exact command-token boundaries.
+
 #### Versioned compatibility exceptions
 
 The production roots deny explicit unwrap/expect/panic/todo/unimplemented/
@@ -488,6 +497,10 @@ not every `try_*` API makes every optional failure fatal.
 
 ### Step 8: Enforce the verified contract in CI
 
+Status: local implementation and matrix checks pass; final hosted qualification is pending.
+Step 7 checkpoint: `5249b2b451993dd82cdaca60eef9ce9012ce9707`;
+compatibility follow-up: `c42e6dd9c452edd892edcde5cfdb4fbd387cdb8b`.
+
 After debt is repaired, add workspace-wide locked checks, warnings-denied Clippy,
 and explicit SDK/installer standalone default/`clap` coverage. Retain Ubuntu,
 macOS, musl and Windows testing. Use source-aware lint scope for production
@@ -499,8 +512,36 @@ Run mdbook/orphan validation on PRs using the existing book toolchain without
 adding deployment authority. CI must exercise an actual typed boundary regression,
 not merely verify that contributor prose contains policy words.
 
-- [ ] All required checks pass locally and on the exact pushed commit when implemented.
-- [ ] PR bodies, review gates, and docs reconciliation follow the global GitHub lifecycle.
+- [x] Required formatting, locked workspace checks, strict Clippy, tests and documentation checks pass locally.
+- [x] All four standalone SDK/installer configurations pass check, Clippy and library tests.
+- [ ] The exact final pushed commit passes the expanded hosted matrix.
+- [ ] Final PR validation evidence and review status are reconciled.
+
+Observed locally: 1,317 workspace tests pass with zero failures and one opt-in
+network test ignored. All 12 standalone library gates pass after the final
+compatibility repairs. Public Rustdoc also
+builds with warnings denied after six broken/redundant links are corrected.
+The activated workflow passes YAML/structure, four-feature-matrix and 26 rendered
+Bash syntax checks; it expands to 13 jobs. `actionlint` is unavailable, so actual
+GitHub execution is still required to validate the workflow and action upgrades.
+
+CI retains Ubuntu, macOS, Windows and musl tests. The macOS jobs use the supported
+`macos-15-intel` pool after repeated ARM runner-allocation failures; local Apple
+Silicon evidence is separate. Checkout/cache use current Node-24 action majors.
+Independent formatting, Clippy, feature and documentation jobs preserve their
+own evidence even if another job waits. Permissions are only `contents: read`;
+book rendering and Rustdoc checks add no deployment or publishing authority.
+No configured required check names referenced the old macOS label at activation;
+branch protections and rules were inspected without changing repository settings.
+
+The built CLI passes eight isolated journey checks: help, project-scoped setup,
+local manifest validation, Claude/Kiro/Antigravity native denials, ambiguous
+registry refusal with unchanged bytes, and native startup denial before plugin
+execution. Actual logs and traces retain byte counts without synthetic private
+arguments, plugin streams, reasons or source URLs. No real agent or user home
+was used. The first ambiguous-source fixture accidentally duplicated a TOML key
+and exercised the documented malformed-config fallback; parsing the corrected
+fixture first establishes that the rerun reaches source validation.
 
 ### Validation commands and evidence
 
@@ -549,4 +590,7 @@ to the corresponding implementation steps.
 - [x] Audit contributor/CI guidance, error boundaries, and type/trait models.
 - [x] Draft this plan and proposed portable Rust contributor chapter.
 - [x] Record local tests, Clippy failures, and documentation-check/toolchain results.
-- [ ] Implementation steps 1–8; commits, pushes, hosted CI and release qualification.
+- [x] Implement steps 1–8 in validated local checkpoints and commit each increment.
+- [ ] Complete final exact-commit hosted qualification and PR closeout.
+
+Release publishing and merging remain outside this implementation scope.

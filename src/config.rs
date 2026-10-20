@@ -712,7 +712,7 @@ impl Symposium {
         }
     }
 
-    /// Create an [`InstallContext`] for use with `symposium-install` functions.
+    /// Create an [`InstallContext`](symposium_install::InstallContext) for installation.
     pub fn install_context(&self) -> symposium_install::InstallContext {
         let ctx = symposium_install::InstallContext::new(self.dirs.cache_dir.clone());
         match &self.dirs.cargo_override {
@@ -723,7 +723,7 @@ impl Symposium {
 
     /// The active package-manager set: the fixed ecosystem transports plus one
     /// [`PathPm`](crate::pm::PathPm) per configured registry
-    /// ([`registries`](Self::registries)) over its content directory —
+    /// ([`registry_instances`](Self::registry_instances)) over its content directory —
     /// including git registries, whose repository is unpacked into the cache
     /// before it is read. Each instance is named for its registry, since that
     /// name is what its plugins are attributed to.

@@ -700,7 +700,7 @@ impl PmRegistry {
 
 /// The workspace's dependency set as package ids — every PM's `list_deps`
 /// unioned. This is what `depends-on` predicates evaluate against
-/// ([`crate::predicate::PredicateContext`]). Failures are logged and yield an
+/// (the internal predicate context). Failures are logged and yield an
 /// empty list so predicate evaluation degrades to "no deps" rather than
 /// aborting the caller.
 /// Legacy best-effort adapter retained through root 0.6. Use
