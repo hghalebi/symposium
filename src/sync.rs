@@ -1210,6 +1210,7 @@ mod tests {
     }
 
     fn isolated_symposium(root: &Path) -> Symposium {
+        symposium_testlib::install_tracing_baseline();
         let mut sym = Symposium::try_from_dir(root).unwrap();
         sym.config.defaults.symposium_recommendations = false;
         sym.config.defaults.user_plugins = false;

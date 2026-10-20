@@ -784,6 +784,7 @@ mod tests {
     /// The report events emitted while validating the stub's plugin under `kind`.
     async fn reports_for_invalid_plugin(kind: PluginKind) -> Vec<serde_json::Value> {
         use tracing_subscriber::layer::SubscriberExt;
+        symposium_testlib::install_tracing_baseline();
         let (layer, handle) =
             crate::report::ReportLayer::new(crate::report::ReportMode::Json, tracing::Level::DEBUG);
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
