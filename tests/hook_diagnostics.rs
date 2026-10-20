@@ -87,7 +87,7 @@ impl Fixture {
         .unwrap();
         let script_path = script.to_string_lossy().replace('\\', "/");
         std::fs::write(
-            plugin.join("symposium.toml"),
+            plugin.join("Symposium.toml"),
             format!(
                 "name = \"diagnostic-probe\"\ndepends-on = [\"*\"]\n\
                  [[hooks]]\nname = \"probe\"\nevent = {event:?}\n\
